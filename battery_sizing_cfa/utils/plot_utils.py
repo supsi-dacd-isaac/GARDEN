@@ -23,4 +23,4 @@ def plot_results(x_pv, E_bat_kWh, P_battery, SOC_kWh, PV_base, L, price):
     )
     # set fig dimensions
     fig.update_layout(width=1000, height=400)
-    fig.show()
+    return fig
