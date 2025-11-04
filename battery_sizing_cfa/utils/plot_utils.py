@@ -21,6 +21,11 @@ def plot_results(x_pv, E_bat_kWh, P_battery, SOC_kWh, PV_base, L, price):
         yaxis_title='Power (kW)',
         hovermode='x unified',
     )
+    # set white background
+    fig.update_layout(plot_bgcolor='white')
+    # set white template
+    fig.update_layout(template='plotly_white')
+
     # set fig dimensions
     fig.update_layout(width=1000, height=400)
     return fig

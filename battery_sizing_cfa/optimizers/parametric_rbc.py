@@ -1,6 +1,6 @@
 import numpy as np
 from numba import njit
-
+from numba import prange
 
 @njit
 def rbc(
@@ -257,3 +257,124 @@ def rbc_thresholds(
         p_grid[t] = pt + p_batt[t]
 
     return soc, p_batt, p_grid
+
+
+
+@njit
+def _get_thr(lower_threshold, upper_threshold, b, t, T):
+    # Returns (lt, ut) for batch b, time t, handling scalar, (T,), or (B,T)
+    if lower_threshold.ndim == 1:
+        if lower_threshold.size == 1:
+            lt = lower_threshold[0]
+        else:  # (T,)
+            lt = lower_threshold[t]
+    else:  # (B,T)
+        lt = lower_threshold[b, t]
+
+    if upper_threshold.ndim == 1:
+        if upper_threshold.size == 1:
+            ut = upper_threshold[0]
+        else:  # (T,)
+            ut = upper_threshold[t]
+    else:  # (B,T)
+        ut = upper_threshold[b, t]
+    return lt, ut
+
+
+@njit(parallel=True, fastmath=True)
+def rbc_thresholds_batched_parallel(
+    p_tot,                 # (B, T)
+    capacity_kwh=100.0,
+    soc_start=0.5,
+    soc_min=0.10,
+    soc_max=0.99,
+    p_charge_max=50.0,
+    p_discharge_max=50.0,
+    eta_ch=0.95,
+    eta_dis=0.95,
+    dt_hours=1.0,
+    lowerT=None,          # (B, T) pre-expanded
+    upperT=None,          # (B, T) pre-expanded
+    do_not_charge_from_grid=False
+):
+    B, T = p_tot.shape
+    soc   = np.empty((B, T), dtype=np.float64)
+    p_bat = np.zeros((B, T), dtype=np.float64)
+    p_grid= np.zeros((B, T), dtype=np.float64)
+
+    E_min_hard = soc_min * capacity_kwh
+    E_max      = soc_max * capacity_kwh
+
+    if dt_hours <= 0.0:
+        for b in prange(B):
+            for t in range(T):
+                soc[b, t] = soc_start
+                p_bat[b, t]= 0.0
+                p_grid[b,t]= p_tot[b,t]
+        return soc, p_bat, p_grid
+
+    # Parallelize over series
+    for b in prange(B):
+        E = soc_start * capacity_kwh
+        for t in range(T):
+            lt = lowerT[b, t]
+            ut = upperT[b, t]
+            pt = p_tot[b, t]
+
+            if pt > ut:
+                desired = pt - ut
+                if desired < 0.0:
+                    desired = 0.0
+
+                if E > E_min_hard:
+                    p_by_energy = (E - E_min_hard) * eta_dis / dt_hours
+                else:
+                    p_by_energy = 0.0
+
+                P = desired
+                if P > p_discharge_max:
+                    P = p_discharge_max
+                if P > p_by_energy:
+                    P = p_by_energy
+
+                p_bat[b, t] = -P
+                E -= (P / eta_dis) * dt_hours
+
+            elif pt < lt:
+                if do_not_charge_from_grid and pt < 0.0:
+                    surplus = -pt
+                else:
+                    diff = lt - pt
+                    surplus = diff if diff > 0.0 else 0.0
+
+                if E < E_max:
+                    p_by_room = (E_max - E) / (eta_ch * dt_hours)
+                else:
+                    p_by_room = 0.0
+
+                P = surplus
+                if P > p_charge_max:
+                    P = p_charge_max
+                if P > p_by_room:
+                    P = p_by_room
+
+                p_bat[b, t] = P
+                E += (P * eta_ch) * dt_hours
+
+            else:
+                p_bat[b, t] = 0.0
+
+            # clamp energy and write outputs
+            if E < E_min_hard:
+                E = E_min_hard
+            if E > E_max:
+                E = E_max
+
+            if capacity_kwh > 0.0:
+                soc[b, t] = E / capacity_kwh
+            else:
+                soc[b, t] = soc_start
+
+            p_grid[b, t] = pt + p_bat[b, t]
+
+    return soc, p_bat, p_grid

@@ -1,9 +1,12 @@
 import numpy as np
 from battery_sizing_cfa.cost_functions.lcoe import lcoe_from_results
-from battery_sizing_cfa.cost_functions.peak_shaving import peak_shaving_cost_from_results
+from battery_sizing_cfa.cost_functions.peak_shaving import peak_shaving_cost_from_results, day_max_cost_from_results, daily_maxima
+from battery_sizing_cfa.cost_functions.utils import block_nes_grad_with_h_parallel, build_block_basis, cvar_from_daily_losses, cvar_weighted_mean, frac_rolling_quantile
 import pandas as pd
 from battery_sizing_cfa.optimizers.parametric_rbc import rbc, rbc_thresholds
+
 from battery_sizing_cfa.utils.fun_utils import rolling_inverted_quantile_np
+from numba import njit
 
 def rbc_opt_fun(sampled_pars, L, PV_base, price, export_price, specs, noise_level=0, **kwargs):
 
@@ -54,10 +57,12 @@ def rbc_opt_fun(sampled_pars, L, PV_base, price, export_price, specs, noise_leve
     return lcoe_simulation
 
 
-def rbc_peak_shaving(sampled_pars, L, price, specs):
-    lower_threshold = pd.Series(L).rolling(window=sampled_pars['n_hours'], min_periods=1).quantile(sampled_pars['lower_q']).to_numpy()
-    upper_threshold = pd.Series(L).rolling(window=sampled_pars['n_hours'], min_periods=1).quantile(sampled_pars['higher_q']).to_numpy()
+def rbc_peak_shaving(sampled_pars, L, price, specs, return_adv=False, h=None):
+    #lower_threshold = pd.Series(L).rolling(window=int(sampled_pars['n_hours']), min_periods=1).quantile(sampled_pars['lower_q']).to_numpy()
+    #upper_threshold = pd.Series(L).rolling(window=int(sampled_pars['n_hours']), min_periods=1).quantile(sampled_pars['higher_q']).to_numpy()
 
+    lower_threshold = frac_rolling_quantile(L, W_star=sampled_pars['n_hours'], q=sampled_pars['lower_q'])
+    upper_threshold = frac_rolling_quantile(L, W_star=sampled_pars['n_hours'], q=sampled_pars['higher_q'])
 
     price_high = price == np.max(price)
     p_battery = specs.get('c_bat_E_kwh', 1.0) * specs.get('energy_ratio', 1.0)
@@ -76,7 +81,17 @@ def rbc_peak_shaving(sampled_pars, L, price, specs):
                                          lower_threshold=lower_threshold,
                                          upper_threshold=upper_threshold)
 
+    d_losses = daily_maxima(p_grid, h)
+
+    peak_cost = cvar_from_daily_losses(d_losses, specs.get('alpha_cvar', 0.9))
+
+
+
     if specs.get('adversarial_perturbation', False):
+        adversarial_budget = specs.get('adversarial_budget', 10)
+        L_adv = L.copy()
+
+        """
         # retrieve per-timestep peak shaving cost
         peak_cost_base_t = (L + p_batt)**2
 
@@ -98,22 +113,32 @@ def rbc_peak_shaving(sampled_pars, L, price, specs):
                                              lower_threshold=lower_threshold,
                                              upper_threshold=upper_threshold)
 
-        peak_cost_plus_t = (L_plus + p_batt_plus)**2
-        peak_cost_derivative = (peak_cost_plus_t - peak_cost_base_t) / (L * 1e-2 + 1e-2)
-        # sort by magnitude of increment
-        sorted_indices = np.argsort(-np.abs(peak_cost_derivative))
-        # add perturbations in order of impact until adversarial budget is exhausted
-        adversarial_budget = specs.get('adversarial_budget', 10)
-        """
-        m=50
-        sigma=0.1
-        vals = []
-        xis = []
-        for _ in range(m):
-            xi = np.random.randn(*L.shape)
-            Lp = L + sigma * xi
-            soc_p, p_batt_p, _ = rbc_thresholds(
-                Lp, price_high,
+        peak_cost_plus_t = (L_plus + p_batt_plus) ** 2
+
+        grads = (peak_cost_plus_t - peak_cost_base_t) / (L * 1e-2 + 1e-2)
+        sorted_indices = np.argsort(-grads)
+        for a in range(adversarial_budget):
+            idx = sorted_indices[a]
+            L_adv[idx] += specs.get('adversarial_magnitude', 1e-1) * np.sign(grads[idx])
+        
+
+        U = build_block_basis(len(L), block_len=specs.get('adversarial_block_size', 24), stride=24, normalize=False)
+        grads = block_nes_grad_with_h_parallel(
+            L=L,
+            h=h,
+            lower_thr=lower_threshold,
+            upper_thr=upper_threshold,
+            specs=specs,
+            U=U,
+            sigma=0.3,
+            tau=0.5,  # softmax temperature
+            day_len=24  # or leave None and use h wrap detection
+        )
+        sorted_indices = np.argsort(-grads)
+        L_adv[sorted_indices[:adversarial_budget]] += specs.get('adversarial_magnitude', 1e-1) * np.sign(grads[sorted_indices[:adversarial_budget]])
+
+        
+        f = lambda x: day_max_cost_from_results((x + rbc_thresholds(x, price_high,
                 capacity_kwh=specs.get('c_bat_E_kwh', 1.0),
                 soc_start=specs.get('soc_start', 0.5),
                 soc_min=specs.get('soc_min', 0.1),
@@ -125,22 +150,14 @@ def rbc_peak_shaving(sampled_pars, L, price, specs):
                 dt_hours=1.0,
                 noise_level=0,
                 lower_threshold=lower_threshold,
-                upper_threshold=upper_threshold,
-            )
-            # pick your scalar objective; here: sum of squared grid power proxy
-            val = ((Lp + p_batt_p) ** 2).mean()
-            vals.append(val);
-            xis.append(xi)
-        vals = np.array(vals);
-        xis = np.stack(xis, axis=0)
-        vals = (vals - vals.mean()) / (vals.std() + 1e-8)  # variance reduction
-        g_hat = (vals[:, None] * xis).mean(axis=0) / sigma
-        """
-        # 10% increase per selected timestep
-        L_adv = L.copy()
-        for a in range(adversarial_budget):
-            idx = sorted_indices[a]
-            L_adv[idx] *= 1.0 + 1e-1 * np.sign(peak_cost_derivative[idx])
+                upper_threshold=upper_threshold
+            )[1]), h=h)
+
+        grads = nes_grad_orthogonal(f, L_adv, sigma=0.3, m=int(50), seed=0)
+
+        sorted_indices = np.argsort(-grads)
+        L_adv[sorted_indices[0]] + specs.get('adversarial_magnitude', 1e-1) * np.sign(grads[sorted_indices[0]])
+        
 
 
         soc_plus, p_batt, p_grid = rbc_thresholds(L_adv,  # array [T], + = net consumption, - = net production (surplus)
@@ -157,6 +174,37 @@ def rbc_peak_shaving(sampled_pars, L, price, specs):
                                              noise_level=0,
                                              lower_threshold=lower_threshold,
                                              upper_threshold=upper_threshold)
+        """
 
-    peak_cost = peak_shaving_cost_from_results(p_grid)
-    return peak_cost
+
+    if return_adv:
+        return peak_cost, L_adv
+    else:
+        return peak_cost
+
+
+def nes_grad_orthogonal(f, x, sigma=0.3, m=128, seed=0):
+    """
+    f: callable(x)-> scalar loss
+    x: (T,) vector
+    sigma: perturbation scale (units of x)
+    m: number of directions
+    """
+    T = x.size
+    rng = np.random.default_rng(seed)
+    # Build T x m matrix with orthonormal columns via QR
+    A = rng.standard_normal((T, m))
+    Q, _ = np.linalg.qr(A)                # Q: T x m with orthonormal columns
+    U = Q                                 # directions u_i are columns of U
+
+    # Antithetic sampling
+    f_plus = np.empty(m, dtype=float)
+    f_minus = np.empty(m, dtype=float)
+    for i in range(m):
+        u = U[:, i]
+        f_plus[i]  = f(x + sigma * u)
+        f_minus[i] = f(x - sigma * u)
+
+    # (1/(2σm)) Σ (f+ - f-) u
+    g = (U @ (f_plus - f_minus)) / (2.0 * sigma * m)
+    return g
