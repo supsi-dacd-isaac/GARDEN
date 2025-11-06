@@ -4,6 +4,7 @@ from battery_sizing_cfa.cost_functions.peak_shaving import peak_shaving_cost_fro
 from battery_sizing_cfa.cost_functions.utils import block_nes_grad_with_h_parallel, build_block_basis, cvar_from_daily_losses, cvar_weighted_mean, frac_rolling_quantile
 import pandas as pd
 from battery_sizing_cfa.optimizers.parametric_rbc import rbc, rbc_thresholds
+from scipy.optimize import differential_evolution
 
 from battery_sizing_cfa.utils.fun_utils import rolling_inverted_quantile_np
 from numba import njit
@@ -21,7 +22,6 @@ def rbc_opt_fun(sampled_pars, L, PV_base, price, export_price, specs, noise_leve
 
     price_high = price == np.max(price)
     p_battery = e_batt*specs['energy_ratio']
-
 
 
     # Calculate LCOE for the simulation results
@@ -181,6 +181,30 @@ def rbc_peak_shaving(sampled_pars, L, price, specs, return_adv=False, h=None):
         return peak_cost, L_adv
     else:
         return peak_cost
+
+
+
+def optimize_pv_battery_rbc(L, PV_base, price, export_price, specs, lims):
+
+    bounds = [
+        (0, 3 * lims['x_pv']),  # x_pv
+        (0, 3 * lims["E_bat_kWh"]),  # E_bat_kWh
+        (0, 100),  # p_threshold
+        (0, 1)  # soc_min_price
+    ]
+
+    result = differential_evolution(
+        rbc_peak_shaving,
+        bounds,
+        args=(L, PV_base, price, export_price, specs),
+        init='random',
+        strategy='best1bin',
+        maxiter=100,
+        popsize=15,
+        tol=0.01,
+        polish=False
+    )
+
 
 
 def nes_grad_orthogonal(f, x, sigma=0.3, m=128, seed=0):

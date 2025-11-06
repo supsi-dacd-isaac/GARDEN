@@ -32,7 +32,7 @@ bounds = [
 
 
 
-series = 8
+series = 9
 n_tr = 365*24
 n_te = 365*24
 adv_max = 0.99
@@ -75,7 +75,7 @@ for num, ad in enumerate(np.linspace(0, adv_max, trials)):
         init='random',
         strategy='best1bin',
         maxiter=100,
-        popsize=50,
+        popsize=20,
         tol=0.01,
         polish=False,
         integrality=(False, False, False)
