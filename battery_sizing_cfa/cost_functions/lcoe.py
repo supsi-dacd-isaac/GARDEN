@@ -10,7 +10,7 @@ def lcoe_from_results(
     E_bat_kWh,
     P_bat_max_kW,
     c_PV_kw,
-    c_bat_E_kwh,
+    c_bat_E_kWh,
     c_bat_P_kw,
     peak_tariff_per_MW_period,
     peak_period_steps,
@@ -62,7 +62,7 @@ def lcoe_from_results(
 
     # Capex (annualized)
     capex = (c_PV_kw * x_pv * PV_base_peak # kW * $/kW
-             + c_bat_E_kwh * E_bat_kWh      # kWh * $/kWh
+             + c_bat_E_kWh * E_bat_kWh      # kWh * $/kWh
              + c_bat_P_kw  * P_bat_max_kW) # kW * $/kW
     capex_annual = crf * capex
 
@@ -104,7 +104,7 @@ def lcoe_from_results(
         # Peak tariff is in $/MW, peak is in MW, so multiply directly
         # The optimization was converting kW peak to MW for the tariff,
         # and period_peaks_MW from the optimization results is already in MW.
-        peak_cost = sum(peak_tariffs[p] * period_peaks_MW[p] for p in range(P))
+        peak_cost = sum(peak_tariffs[p] * period_peaks_MW[p] for p in range(np.minimum(P, len(period_peaks_MW))))
 
 
     # replicate operating costs across the year
