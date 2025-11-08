@@ -21,6 +21,7 @@ dependencies = [
     "notebook>=7.4.5",
     "numba>=0.62.0",
     "plotly>=6.3.0",
+    "pvlib>=0.13.1",
     "pyomo>=6.9.4",
     "pyqt6>=6.9.1",
     "pyside6>=6.9.2",
