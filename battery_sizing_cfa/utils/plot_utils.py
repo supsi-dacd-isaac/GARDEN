@@ -32,7 +32,7 @@ def plot_results(x_pv, E_bat_kWh, P_battery, SOC_kWh, PV_base, L, price):
     fig.update_layout(width=1000, height=400)
     return fig
 
-def plot_rbc_vs_mpc_diagnostics(x_test, results, series, billing_peak_period_str):
+def plot_rbc_vs_mpc_diagnostics(x_test, results, series, billing_peak_period_str, sizing_method):
     p_grid_rbc = results['profiles']['rbc']
     p_grid_mpc =  results['profiles']['mpc']
     p_grid_mpc_opt = results['profiles']['mpc_opt']
@@ -70,7 +70,7 @@ def plot_rbc_vs_mpc_diagnostics(x_test, results, series, billing_peak_period_str
     # despine the plot
     sns.despine()
     plt.title('Daily Maxima Distribution Comparison')
-    plt.savefig("battery_sizing_cfa/figs/rbc_vs_mpc_daily_maxima_{}_billed_{}.pdf".format(series, billing_peak_period_str))
+    plt.savefig("battery_sizing_cfa/figs/rbc_vs_mpc_daily_maxima_{}_{}_billed_{}.pdf".format(series, sizing_method, billing_peak_period_str))
     plt.close('all')
 
 
@@ -116,7 +116,7 @@ def extract_day_max_quantiles_over_meters(results, normalize_quantiles=True, nor
     # despine
     sns.despine()
     billing_peak_period_str = specs['billing_peak_period_str']
-    plt.savefig("battery_sizing_cfa/figs/daily_max_quantiles_distribution_{}.pdf".format(billing_peak_period_str))
+    plt.savefig("battery_sizing_cfa/figs/daily_max_quantiles_distribution_sizing_{}_{}.pdf".format(specs['sizing_method'], billing_peak_period_str))
 
     return day_max_quantiles
 
