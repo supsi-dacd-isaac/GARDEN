@@ -3,6 +3,7 @@ from battery_sizing_cfa.cost_functions.lcoe import lcoe_from_results
 from battery_sizing_cfa.cost_functions.peak_shaving import peak_shaving_cost_from_results, day_max_cost_from_results, daily_maxima
 from battery_sizing_cfa.cost_functions.utils import block_nes_grad_with_h_parallel, build_block_basis, cvar_from_daily_losses, cvar_weighted_mean, frac_rolling_quantile
 import pandas as pd
+from copy import copy
 from battery_sizing_cfa.optimizers.parametric_rbc import rbc, rbc_thresholds
 from scipy.optimize import differential_evolution
 
@@ -22,7 +23,7 @@ def rbc_opt_fun(sampled_pars, L, PV_base, price, export_price, specs, noise_leve
 
     price_high = price == np.max(price)
     p_battery = e_batt*specs['energy_ratio']
-
+    peak_period_steps = specs.get('peak_period_steps', 24)
 
     # Calculate LCOE for the simulation results
     soc_sim, p_batt_sim, p_grid_sim = rbc(
@@ -50,14 +51,48 @@ def rbc_opt_fun(sampled_pars, L, PV_base, price, export_price, specs, noise_leve
       P_bat_max_kW=p_battery, # Use battery power capacity from optimization
       P_net_kW=p_grid_sim, # Use the net load from the simulation
       # For peak costs in simulation, we need to find the peak import in MW for each period
-      period_peaks_MW=[np.max(p_grid_sim[i*24:(i+1)*24])/1000.0 for i in range(N//24) if len(p_grid_sim[i*24:(i+1)*24]) > 0],
+      period_peaks_MW=[np.max(p_grid_sim[i*peak_period_steps:(i+1)*peak_period_steps])/1000.0 for i in range(N//peak_period_steps) if len(p_grid_sim[i*peak_period_steps:(i+1)*peak_period_steps]) > 0],
       **specs
     )
 
     return lcoe_simulation
 
 
-def rbc_peak_shaving(sampled_pars, L, price, specs, return_adv=False, h=None):
+def optimize_lcoe_rbc(sampled_pars, L, PV_base, price, export_price, specs, h=None, noise_level=0, **kwargs):
+    specs_temp = copy(specs)
+    specs_temp['E_bat_kWh'] = sampled_pars['E_bat_kWh']
+
+    N = len(L)
+    # Calculate LCOE for the simulation results
+    peak_period_steps = specs_temp.get('peak_period_steps', 24)
+    L_eff = L - sampled_pars['pv_level'] * PV_base
+    soc_sim, p_batt_sim, p_grid_sim = rbc_peak_shaving(sampled_pars, L_eff, price, specs_temp, return_adv=False, h=h, return_ts=True)
+    P_bat_max_kW = sampled_pars['E_bat_kWh'] * specs_temp['energy_ratio']
+    lcoe_simulation = lcoe_from_results(
+      L=L,
+      PV_base=PV_base,
+      price=price,
+      export_price=export_price,
+      x_pv=sampled_pars['pv_level'],  # Use the PV size from optimization
+      E_bat_kWh= sampled_pars['E_bat_kWh'], # Use battery energy capacity from optimization
+      P_bat_max_kW= P_bat_max_kW, # Use battery power capacity from optimization
+      P_net_kW=p_grid_sim, # Use the net load from the simulation
+      # For peak costs in simulation, we need to find the peak import in MW for each period
+      period_peaks_MW=[np.max(p_grid_sim[i*peak_period_steps:(i+1)*peak_period_steps])/1000.0 for i in range(N//peak_period_steps) if len(p_grid_sim[i*peak_period_steps:(i+1)*peak_period_steps]) > 0],
+      Delta_t = specs['Delta_t'],
+      c_PV_kw = specs['c_PV_kw'],
+      c_bat_E_kWh  = specs['c_bat_E_kWh'],
+      c_bat_P_kw = specs['c_bat_P_kw'],
+      peak_tariff_per_MW_period = specs['peak_tariff_per_MW_period'],
+      peak_period_steps = specs['peak_period_steps'],
+      discount_rate =specs['discount_rate'],
+      lifetime_years = specs['lifetime_years'],
+      replicate_periods = specs['replicate_periods'])
+
+    return lcoe_simulation
+
+
+def rbc_peak_shaving(sampled_pars, L, price, specs, return_adv=False, h=None, return_ts=False):
     #lower_threshold = pd.Series(L).rolling(window=int(sampled_pars['n_hours']), min_periods=1).quantile(sampled_pars['lower_q']).to_numpy()
     #upper_threshold = pd.Series(L).rolling(window=int(sampled_pars['n_hours']), min_periods=1).quantile(sampled_pars['higher_q']).to_numpy()
 
@@ -65,10 +100,10 @@ def rbc_peak_shaving(sampled_pars, L, price, specs, return_adv=False, h=None):
     upper_threshold = frac_rolling_quantile(L, W_star=sampled_pars['n_hours'], q=sampled_pars['higher_q'])
 
     price_high = price == np.max(price)
-    p_battery = specs.get('c_bat_E_kwh', 1.0) * specs.get('energy_ratio', 1.0)
+    p_battery = specs.get('E_bat_kWh', 1.0) * specs.get('energy_ratio', 1.0)
     soc, p_batt, p_grid = rbc_thresholds(L,  # array [T], + = net consumption, - = net production (surplus)
                                          price_high,  # array [T] of 0/1 (unused here, kept for signature compatibility)
-                                         capacity_kwh=specs.get('c_bat_E_kwh', 1.0),  # usable capacity [kWh]
+                                         capacity_kwh=specs.get('E_bat_kWh', 1.0),  # usable capacity [kWh]
                                          soc_start=specs.get('soc_start', 0.5),  # initial SOC in [0,1]
                                          soc_min=specs.get('soc_min', 0.1),  # hard minimum SOC (never go below)
                                          soc_max=specs.get('soc_max', 0.99),  # hard maximum SOC (never exceed)
@@ -91,119 +126,13 @@ def rbc_peak_shaving(sampled_pars, L, price, specs, return_adv=False, h=None):
         adversarial_budget = specs.get('adversarial_budget', 10)
         L_adv = L.copy()
 
-        """
-        # retrieve per-timestep peak shaving cost
-        peak_cost_base_t = (L + p_batt)**2
-
-        # repeat with marginal increments of the profile to retrieve d(cost)/d(profile)
-        L_plus = L*(1.0 + 1e-2) + 1e-2
-
-        soc_plus, p_batt_plus, p_grid_plus = rbc_thresholds(L_plus,  # array [T], + = net consumption, - = net production (surplus)
-                                             price_high,  # array [T] of 0/1 (unused here, kept for signature compatibility)
-                                             capacity_kwh=specs.get('c_bat_E_kwh', 1.0),  # usable capacity [kWh]
-                                             soc_start=specs.get('soc_start', 0.5),  # initial SOC in [0,1]
-                                             soc_min=specs.get('soc_min', 0.1),  # hard minimum SOC (never go below)
-                                             soc_max=specs.get('soc_max', 0.99),  # hard maximum SOC (never exceed)
-                                             p_charge_max=p_battery,  # max charge power [kW]
-                                             p_discharge_max=p_battery,  # max discharge power [kW]
-                                             eta_ch=specs.get('eta_ch', 0.99),  # charging efficiency
-                                             eta_dis=specs.get('eta_dis', 0.99),  # discharging efficiency
-                                             dt_hours=1.0,  # time step [h]
-                                             noise_level=0,
-                                             lower_threshold=lower_threshold,
-                                             upper_threshold=upper_threshold)
-
-        peak_cost_plus_t = (L_plus + p_batt_plus) ** 2
-
-        grads = (peak_cost_plus_t - peak_cost_base_t) / (L * 1e-2 + 1e-2)
-        sorted_indices = np.argsort(-grads)
-        for a in range(adversarial_budget):
-            idx = sorted_indices[a]
-            L_adv[idx] += specs.get('adversarial_magnitude', 1e-1) * np.sign(grads[idx])
-        
-
-        U = build_block_basis(len(L), block_len=specs.get('adversarial_block_size', 24), stride=24, normalize=False)
-        grads = block_nes_grad_with_h_parallel(
-            L=L,
-            h=h,
-            lower_thr=lower_threshold,
-            upper_thr=upper_threshold,
-            specs=specs,
-            U=U,
-            sigma=0.3,
-            tau=0.5,  # softmax temperature
-            day_len=24  # or leave None and use h wrap detection
-        )
-        sorted_indices = np.argsort(-grads)
-        L_adv[sorted_indices[:adversarial_budget]] += specs.get('adversarial_magnitude', 1e-1) * np.sign(grads[sorted_indices[:adversarial_budget]])
-
-        
-        f = lambda x: day_max_cost_from_results((x + rbc_thresholds(x, price_high,
-                capacity_kwh=specs.get('c_bat_E_kwh', 1.0),
-                soc_start=specs.get('soc_start', 0.5),
-                soc_min=specs.get('soc_min', 0.1),
-                soc_max=specs.get('soc_max', 0.99),
-                p_charge_max=p_battery,
-                p_discharge_max=p_battery,
-                eta_ch=specs.get('eta_ch', 0.99),
-                eta_dis=specs.get('eta_dis', 0.99),
-                dt_hours=1.0,
-                noise_level=0,
-                lower_threshold=lower_threshold,
-                upper_threshold=upper_threshold
-            )[1]), h=h)
-
-        grads = nes_grad_orthogonal(f, L_adv, sigma=0.3, m=int(50), seed=0)
-
-        sorted_indices = np.argsort(-grads)
-        L_adv[sorted_indices[0]] + specs.get('adversarial_magnitude', 1e-1) * np.sign(grads[sorted_indices[0]])
-        
-
-
-        soc_plus, p_batt, p_grid = rbc_thresholds(L_adv,  # array [T], + = net consumption, - = net production (surplus)
-                                             price_high,  # array [T] of 0/1 (unused here, kept for signature compatibility)
-                                             capacity_kwh=specs.get('c_bat_E_kwh', 1.0),  # usable capacity [kWh]
-                                             soc_start=specs.get('soc_start', 0.5),  # initial SOC in [0,1]
-                                             soc_min=specs.get('soc_min', 0.1),  # hard minimum SOC (never go below)
-                                             soc_max=specs.get('soc_max', 0.99),  # hard maximum SOC (never exceed)
-                                             p_charge_max=p_battery,  # max charge power [kW]
-                                             p_discharge_max=p_battery,  # max discharge power [kW]
-                                             eta_ch=specs.get('eta_ch', 0.99),  # charging efficiency
-                                             eta_dis=specs.get('eta_dis', 0.99),  # discharging efficiency
-                                             dt_hours=1.0,  # time step [h]
-                                             noise_level=0,
-                                             lower_threshold=lower_threshold,
-                                             upper_threshold=upper_threshold)
-        """
-
-
+    if return_ts:
+        return soc, p_batt, p_grid
     if return_adv:
         return peak_cost, L_adv
     else:
         return peak_cost
 
-
-
-def optimize_pv_battery_rbc(L, PV_base, price, export_price, specs, lims):
-
-    bounds = [
-        (0, 3 * lims['x_pv']),  # x_pv
-        (0, 3 * lims["E_bat_kWh"]),  # E_bat_kWh
-        (0, 100),  # p_threshold
-        (0, 1)  # soc_min_price
-    ]
-
-    result = differential_evolution(
-        rbc_peak_shaving,
-        bounds,
-        args=(L, PV_base, price, export_price, specs),
-        init='random',
-        strategy='best1bin',
-        maxiter=100,
-        popsize=15,
-        tol=0.01,
-        polish=False
-    )
 
 
 

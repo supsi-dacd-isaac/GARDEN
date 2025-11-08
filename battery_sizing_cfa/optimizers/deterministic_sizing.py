@@ -2,7 +2,7 @@ import pyomo.environ as pyo
 import numpy as np
 from typing import Optional, Dict, Any
 
-def optimize_pv_battery(
+def optimize_lcoe_prescient(
     L: np.ndarray,
     PV_base: np.ndarray,
     price: np.ndarray,
@@ -10,7 +10,7 @@ def optimize_pv_battery(
     Delta_t: float = 1.0,
     # CapEx (nameplate)
     c_PV_kw: float = 800.0,
-    c_bat_E_kwh: float = 150.0,
+    c_bat_E_kWh: float = 150.0,
     c_bat_P_kw: float = 250.0,
     # Efficiencies
     eta_ch: float = 0.95,
@@ -191,7 +191,7 @@ def optimize_pv_battery(
 
     def total_annual_cost_rule(m):
         capex = (c_PV_kw * m.x_pv * m.PV_peak # kW * $/kW
-                 + c_bat_E_kwh * m.E_bat      # kWh * $/kWh
+                 + c_bat_E_kWh * m.E_bat      # kWh * $/kWh
                  + c_bat_P_kw  * m.P_bat_max) # kW * $/kW
         capex_annual = crf * capex
         # Convert kW to MW for price calculation ($/MWh * MWh)

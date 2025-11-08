@@ -8,7 +8,7 @@ from battery_sizing_cfa.cost_functions.peak_shaving import daily_maxima, day_max
 zlims = (58, 65)
 data = pd.read_pickle("battery_sizing_cfa/datasets/portugal/portugal.pk")
 
-specs = {'c_bat_E_kwh': 20.0,
+specs = {'c_bat_E_kWh': 20.0,
          'energy_ratio': 1.0,
          'eta_ch': 0.95,
          'eta_dis': 0.95,
@@ -131,12 +131,12 @@ for num, ad in enumerate(np.linspace(0, 200, 40)):
 
     print("Best q_low = {:0.2f}, q_high = {:0.2f}, n_hours = {:f}".format(best_q_low, best_q_high, best_n))
 
-    p_battery = specs.get('c_bat_E_kwh', 1.0) * specs.get('energy_ratio', 1.0)
+    p_battery = specs.get('E_bat_kWh', 1.0) * specs.get('energy_ratio', 1.0)
 
     soc, p_batt, p_grid = rbc_thresholds(
         L_te,                     # net consumption array
         L_te * 0,                 # placeholder PV flag (kept for signature)
-        capacity_kwh=specs.get('c_bat_E_kwh', 1.0),
+        capacity_kwh=specs.get('E_bat_kWh', 1.0),
         soc_start=specs.get('soc_start', 0.5),
         soc_min=specs.get('soc_min', 0.1),
         soc_max=specs.get('soc_max', 0.99),

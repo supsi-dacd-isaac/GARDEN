@@ -54,7 +54,7 @@ def peak_shaving_solver(T, eta_ch=0.95, eta_dis=0.9, E_max=10.0, E_min=0.0, P_ma
     # Decision variables
     p_pos = cp.Variable(T, nonneg=True, name='p_pos')    # charging power
     p_neg = cp.Variable(T, nonneg=True, name='p_neg')    # discharging power
-    E = cp.Variable(T, name='E')                     # state of charge
+    E = cp.Variable(T+1, name='E')                     # state of charge
 
     p_load = cp.Parameter(T, name='p_load')  # net load profile
     E_init = cp.Parameter(nonneg=True, name='E_init')
@@ -63,7 +63,7 @@ def peak_shaving_solver(T, eta_ch=0.95, eta_dis=0.9, E_max=10.0, E_min=0.0, P_ma
     # Energy balance constraints
     #constraints = [E[0] == E_init + eta_ch * p_pos[0] - (1/eta_dis) * p_neg[0]]
     constraints = [E[0] == E_init]
-    for t in range(1, T):
+    for t in range(1, T+1):
         constraints += [
             E[t] == E[t-1] + eta_ch * p_pos[t-1] - (1/eta_dis) * p_neg[t-1]
         ]
