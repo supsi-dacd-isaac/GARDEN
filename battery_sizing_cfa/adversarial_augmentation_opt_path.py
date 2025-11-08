@@ -32,26 +32,28 @@ bounds = [
 
 
 
-series = 9
+series = 10
 n_tr = 365*24
 n_te = 365*24
-adv_max = 0.99
+adv_max = 0.95
 L_tr = data.iloc[:n_tr, series].values/np.std(data.iloc[:n_tr, series])  # Load and PV generation data
 L_te = data.iloc[n_tr:n_tr+n_te, series].values/np.std(data.iloc[:n_tr, series]) # Load and PV generation data
+specs['E_bat_kWh'] = np.mean(L_tr)*5
+
+
 
 fig, ax = plt.subplots(2, 1, figsize=(15, 4), layout='constrained')
 ax[0].plot(L_tr, label='p train', linewidth=1)
 ax[1].plot(L_te, label='p test', linewidth=1)
 plt.savefig("battery_sizing_cfa/figs/tr_te_profiles_{}.png".format(series), dpi=100, bbox_inches="tight")
-plt.close('all')
-
+plt.show()
 hour_index_tr = data.index[:n_tr].hour.values
 hour_index_te = data.index[n_tr:n_tr+n_te].hour.values
 price_tr = np.array([40 if (t%24) in range(18,24) else 20 for t in range(n_tr)])  # $/MWh
 price_te = np.array([40 if (t%24) in range(18,24) else 20 for t in range(n_te)])  # $/MWh
 
 
-trials = 10
+trials = 6
 score_tr = np.full((trials), np.nan)
 score_te = np.full((trials), np.nan)
 opt_pars = np.full((trials, 3), np.nan)
@@ -59,7 +61,7 @@ score_te_daily = []
 
 rbc_peak_shaving_wrap = lambda x, L_tr, price, specs: rbc_peak_shaving({'lower_q':x[0], 'higher_q':x[1], 'n_hours':x[2]}, L_tr, price, specs, h=hour_index_tr)
 
-for num, ad in enumerate(np.linspace(0, adv_max, trials)):
+for num, ad in enumerate([0, 0.5, 0.7, 0.8, 0.9, 0.95]):
     specs['alpha_cvar'] = ad
 
     t_tot = 0
@@ -92,15 +94,34 @@ for num, ad in enumerate(np.linspace(0, adv_max, trials)):
     #upper_threshold = pd.Series(np.concat([L_tr, L_te])).rolling(window=int(best_n), min_periods=1).quantile(best_q_high).to_numpy()[-len(L_te):]
     L_all = np.concatenate([L_tr, L_te])
     lt_all = frac_rolling_quantile(L_all, W_star=best_n, q=best_q_low)
-    lower_threshold = lt_all[-len(L_te):]
+    lower_threshold_tr = lt_all[:len(L_tr)]
+    lower_threshold_te = lt_all[-len(L_te):]
     ut_all = frac_rolling_quantile(L_all, W_star=best_n, q=best_q_high)
-    upper_threshold = ut_all[-len(L_te):]
+    upper_threshold_tr = ut_all[:len(L_tr)]
+    upper_threshold_te = ut_all[-len(L_te):]
 
     print("Best q_low = {:0.2f}, q_high = {:0.2f}, n_hours = {:0.2f}".format(best_q_low, best_q_high, best_n))
 
     p_battery = specs.get('E_bat_kWh', 1.0) * specs.get('energy_ratio', 1.0)
 
-    soc, p_batt, p_grid = rbc_thresholds(
+    _, _, p_grid_tr = rbc_thresholds(
+        L_tr,                     # net consumption array
+        L_tr * 0,                 # placeholder PV flag (kept for signature)
+        capacity_kwh=specs.get('E_bat_kWh', 1.0),
+        soc_start=specs.get('soc_start', 0.5),
+        soc_min=specs.get('soc_min', 0.1),
+        soc_max=specs.get('soc_max', 0.99),
+        p_charge_max=p_battery,
+        p_discharge_max=p_battery,
+        eta_ch=specs.get('eta_ch', 0.99),
+        eta_dis=specs.get('eta_dis', 0.99),
+        dt_hours=1.0,
+        noise_level=0,
+        lower_threshold=lower_threshold_tr,
+        upper_threshold=upper_threshold_tr
+    )
+
+    soc, p_batt, p_grid_te = rbc_thresholds(
         L_te,                     # net consumption array
         L_te * 0,                 # placeholder PV flag (kept for signature)
         capacity_kwh=specs.get('E_bat_kWh', 1.0),
@@ -113,26 +134,34 @@ for num, ad in enumerate(np.linspace(0, adv_max, trials)):
         eta_dis=specs.get('eta_dis', 0.99),
         dt_hours=1.0,
         noise_level=0,
-        lower_threshold=lower_threshold,
-        upper_threshold=upper_threshold
+        lower_threshold=lower_threshold_te,
+        upper_threshold=upper_threshold_te
     )
 
-    daily_max_base = daily_maxima(p_grid, hour_index_te)
+    daily_max_base_tr = daily_maxima(p_grid_tr, hour_index_te)
+    daily_max_detr_tr = daily_maxima(p_grid_tr - pd.Series(p_grid_tr).rolling(24*30, min_periods=1).mean(), hour_index_te)
+
+    daily_max_base = daily_maxima(p_grid_te, hour_index_te)
+    daily_max_detr = daily_maxima(p_grid_te - pd.Series(p_grid_te).rolling(24*30, min_periods=1).mean(), hour_index_te)
     score_te[num] = cvar_from_daily_losses(daily_max_base, specs['alpha_cvar'])
-    score_te_daily.append(daily_maxima(p_grid, hour_index_te))
+    score_te_daily.append(daily_maxima(p_grid_te, hour_index_te))
+
     fig, ax = plt.subplots(1, 1, figsize=(15, 4))
     ax.plot(L_te, label='p')
     ax.plot(L_te+p_batt, label='p controlled')
     for spine in ("top", "right"):
         ax.spines[spine].set_visible(False)
-    plt.title('adversarial budget: {:03f}, of:{:0.2e}'.format(ad, np.mean(p_grid**2)))
+    plt.title('adversarial budget: {:03f}, of:{:0.2e}'.format(ad, np.mean(p_grid_te**2)))
     plt.legend(loc='upper right')
     out = f"battery_sizing_cfa/figs/adv_sols_{series}_{ad:03f}.png"
     plt.savefig(out, dpi=100, bbox_inches="tight")
     plt.close('all')
 
 
+    plt.hist(daily_max_base_tr, bins=30, alpha=0.5, label='base')
+    plt.hist(daily_max_detr_tr, bins=30, alpha=0.5, label='detr')
     plt.hist(daily_max_base, bins=30, alpha=0.5, label='base')
+    plt.hist(daily_max_detr, bins=30, alpha=0.5, label='detr')
     if num==0:
         xlims_dm = plt.xlim()
         ylims_dm = plt.ylim()

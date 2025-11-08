@@ -130,7 +130,7 @@ def optimize_policy_and_run(df_tr, df_te, y_hat_te, specs, control='rbc'):
                                                                                L_tr, price,
                                                                                {'alpha_cvar': x[3], **specs},
                                                                                h=hour_index_tr)
-        alpha_cvar_low_limit = 0.9 if control == 'rbc_adv' else 0
+        alpha_cvar_low_limit = 0.95 if control == 'rbc_adv' else 0
         alpha_cvar_up_limit = 1 if control == 'rbc_adv' else 0
         bounds = [
             (0, 0.9),  # lower_q
@@ -191,7 +191,7 @@ def optimize_policy_and_run(df_tr, df_te, y_hat_te, specs, control='rbc'):
     return p_grid
 
 
-def compare_methods(df, sizing_method='one_shot', specs=None, target_name='p_load', H=24, train_ratio=0.8, series=0, billing_peak_period_str=None):
+def compare_methods(df, sizing_method='prescient', specs=None, target_name='p_load', H=24, train_ratio=0.8, series=0, billing_peak_period_str=None):
     print('training forecaster...')
     y_hat_te, y_perfect_te, x_train, x_test, y_train, y_test = get_forecasts(df, H=H, train_ratio=train_ratio)
 
@@ -204,8 +204,8 @@ def compare_methods(df, sizing_method='one_shot', specs=None, target_name='p_loa
         export_price = np.ones_like(L) * 10  # $/MWh
         E_bat_kWh, P_bat_max_kW, x_pv, lcoe_sizing, res_opt_sizing = rbc_sizing(L, PV_base, price, export_price, specs, h=h)
     else:
-        print('deterministic optimal sizing on {} days...'.format(specs['hours_one_shot_sizing'] // 24))
-        L = x_train.loc[:, target_name].values[:specs['hours_one_shot_sizing']]
+        print('deterministic optimal sizing on {} days...'.format(specs['hours_prescient_sizing'] // 24))
+        L = x_train.loc[:, target_name].values[:specs['hours_prescient_sizing']]
         PV_base = np.zeros_like(L)  # Placeholder for PV generation profile
         price = np.ones_like(L) * 20  # $/MWh
         export_price = np.ones_like(L) * 10  # $/MWh
@@ -325,7 +325,7 @@ def compare_methods(df, sizing_method='one_shot', specs=None, target_name='p_loa
 # load spanish data
 
 
-hours_one_shot_sizing = 24*30
+hours_prescient_sizing = 24*30
 train_ratio = 0.5
 
 specs = {'eta_ch': 0.95,
@@ -339,8 +339,8 @@ specs = {'eta_ch': 0.95,
          'c_PV_kw':200,
          'c_bat_E_kWh':120,
          'c_bat_P_kw':50,
-         'hours_one_shot_sizing': hours_one_shot_sizing,
-         'replicate_periods': int(np.ceil(24*365/(hours_one_shot_sizing))),
+         'hours_prescient_sizing': hours_prescient_sizing,
+         'replicate_periods': int(np.ceil(24*365/(hours_prescient_sizing))),
          'Delta_t':1.0,
          'discount_rate':0.06,
          'lifetime_years':15.0,
@@ -348,7 +348,7 @@ specs = {'eta_ch': 0.95,
          'sizing_method':'prescient'
          }
 
-sizing_method = 'one_shot'
+
 data = pd.read_pickle("battery_sizing_cfa/datasets/portugal/portugal.pk")
 
 def run(data, n_profiles, sizing_method, specs, train_ratio):
@@ -374,17 +374,17 @@ def run(data, n_profiles, sizing_method, specs, train_ratio):
 # First, run with daily peak periods, use one-shot sizing
 
 #specs.update({'peak_period_steps':24})
-#run(data, n_profiles=100, sizing_method='one_shot', specs=specs, train_ratio=train_ratio)
-#plt.show()
+run(data, n_profiles=100, sizing_method='prescient', specs=specs, train_ratio=train_ratio)
+plt.show()
 
 # Then, run with monthly peak periods, use RBC sizing
 specs.update({'peak_period_steps':24*30,
               'peak_tariff_per_MW_period':500*30,
-              #'replicate_periods': int(np.ceil(24*365/(hours_one_shot_sizing)))})
-              'replicate_periods': int(np.ceil(24*365/(24*365 * train_ratio))),
+              'replicate_periods': int(np.ceil(24*365/(hours_prescient_sizing))),
+              #'replicate_periods': int(np.ceil(24*365/(24*365 * train_ratio))),
               'billing_peak_period_str':'monthly'})
 
-run(data, n_profiles=100, sizing_method='one_shot', specs=specs, train_ratio=train_ratio)
+run(data, n_profiles=100, sizing_method='prescient', specs=specs, train_ratio=train_ratio)
 plt.show()
 
 
@@ -392,7 +392,7 @@ plt.show()
 specs['sizing_method'] = 'rbc_peak_shaving'
 specs.update({'peak_period_steps':24*30,
               'peak_tariff_per_MW_period':500*30,
-              #'replicate_periods': int(np.ceil(24*365/(hours_one_shot_sizing)))})
+              #'replicate_periods': int(np.ceil(24*365/(hours_prescient_sizing)))})
               'replicate_periods': int(np.ceil(24*365/(24*365 * train_ratio))),
               'billing_peak_period_str':'monthly'})
 

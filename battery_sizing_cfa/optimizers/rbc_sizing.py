@@ -93,9 +93,6 @@ def optimize_lcoe_rbc(sampled_pars, L, PV_base, price, export_price, specs, h=No
 
 
 def rbc_peak_shaving(sampled_pars, L, price, specs, return_adv=False, h=None, return_ts=False):
-    #lower_threshold = pd.Series(L).rolling(window=int(sampled_pars['n_hours']), min_periods=1).quantile(sampled_pars['lower_q']).to_numpy()
-    #upper_threshold = pd.Series(L).rolling(window=int(sampled_pars['n_hours']), min_periods=1).quantile(sampled_pars['higher_q']).to_numpy()
-
     lower_threshold = frac_rolling_quantile(L, W_star=sampled_pars['n_hours'], q=sampled_pars['lower_q'])
     upper_threshold = frac_rolling_quantile(L, W_star=sampled_pars['n_hours'], q=sampled_pars['higher_q'])
 
@@ -116,11 +113,11 @@ def rbc_peak_shaving(sampled_pars, L, price, specs, return_adv=False, h=None, re
                                          lower_threshold=lower_threshold,
                                          upper_threshold=upper_threshold)
 
-    d_losses = daily_maxima(p_grid, h)
-
-    peak_cost = cvar_from_daily_losses(d_losses, specs.get('alpha_cvar', 0.9))
-
-
+    if specs.get('alpha_cvar', 0.9)>0:
+        d_losses = daily_maxima(p_grid - pd.Series(p_grid).rolling(24*7, min_periods=1).mean().values, h)
+        peak_cost = np.mean(np.sort(d_losses)[-np.maximum(int(len(d_losses)*(1-specs.get('alpha_cvar', 0.9))), 1):])
+    else:
+        peak_cost = np.mean(daily_maxima(p_grid,h))
 
     if specs.get('adversarial_perturbation', False):
         adversarial_budget = specs.get('adversarial_budget', 10)

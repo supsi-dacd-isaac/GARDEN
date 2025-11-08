@@ -26,11 +26,11 @@ def optimize_peak_shaving(p_load, p_pv,
     prob.parameters()[1].value = E_init
     # Solve
     prob.solve(solver=cp.GUROBI, verbose=False, warm_start=True)
-    p_batt = prob.variables()[0].value
+    p_batt = prob.variables()[0].value - prob.variables()[1].value
     E = prob.variables()[1].value
     return {
-        "p_batt": p_batt.value,
-        "E": E.value,
+        "p_batt": p_batt,
+        "E": E,
         "objective": prob.value,
         "status": prob.status,
     }
