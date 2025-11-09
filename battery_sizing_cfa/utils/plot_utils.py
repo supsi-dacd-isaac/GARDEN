@@ -116,16 +116,148 @@ def extract_day_max_quantiles_over_meters(results, normalize_quantiles=True, nor
     # despine
     sns.despine()
     billing_peak_period_str = specs['billing_peak_period_str']
-    plt.savefig("battery_sizing_cfa/figs/daily_max_quantiles_distribution_sizing_{}_{}.pdf".format(specs['sizing_method'], billing_peak_period_str))
+    plt.savefig("battery_sizing_cfa/figs/daily_max_quantiles_distribution_sizing_{}_{}.png".format(specs['sizing_method'], billing_peak_period_str))
 
     return day_max_quantiles
 
+def analyze_sizing(results, specs):
+    sizings = pd.Series({k: r['E_bat_kWh'] for k, r in results.items()}, name='{}_{}'.format(specs['sizing_method'], specs['billing_peak_period_str']))
+    return sizings
+
+def analyze_lcoes(results, specs):
+    lcoes = pd.DataFrame({k: pd.Series(r['lcoe']) for k, r in results.items()})
+    lcoes_sizing = pd.Series({k: r['lcoe_sizing'] for k, r in results.items()}, name='lcoe_sizing')
+    lcoes = pd.concat([lcoes.T, lcoes_sizing], axis=1).T
+
+    # Prepare data once
+    plot_data = lcoes.T.melt(ignore_index=False).reset_index().rename(
+        columns={'index': 'series', 'value': 'lcoe_value', 'variable': 'controller'}
+    )
+
+    # Create mapping: series → lcoe_sizing value
+    sizing_map = plot_data[plot_data['controller'] == 'lcoe_sizing'].set_index('series')['lcoe_value']
+
+    # PLOT SETUP
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 6), layout='constrained')
+
+    # PLOT 1: Full original distribution
+    sns.boxenplot(data=plot_data, x='controller', y='lcoe_value', hue='controller', ax=ax1)
+    ax1.set_title('LCOE Distributions', fontweight='bold')
+    ax1.set_ylabel('LCOE ($/MWh)')
+    sns.despine(ax=ax1)
+
+    # PLOT 2: Normalized data
+    # Filter out lcoe_sizing and divide by corresponding sizing values
+    norm_data = plot_data[plot_data['controller'] != 'lcoe_sizing'].copy()
+    norm_data['lcoe_value'] = norm_data.apply(
+        lambda row: row['lcoe_value'] / sizing_map[row['series']], axis=1
+    )
+
+    sns.boxenplot(data=norm_data, x='controller', y='lcoe_value', hue='controller', ax=ax2)
+    ax2.set_title('Normalized (relative to LCOE Sizing)', fontweight='bold')
+    ax2.set_ylabel('LCOE Ratio')
+    ax2.set_ylim(0., 2)
+
+    sns.despine(ax=ax2)
+
+    # Shared formatting
+    for ax in [ax1, ax2]:
+        ax.set_xlabel('Sizing Method')
+
+    plt.savefig("battery_sizing_cfa/figs/lcoe_sizing_comparison_{}_{}.pdf".format(specs['sizing_method'], specs['billing_peak_period_str']))
+    plt.close('all')
 
 def analyze_results_mpc_vs_rbc(res_path, specs):
     import pickle
     with open(res_path, 'rb') as f:
         results = pickle.load(f)
 
-    extract_day_max_quantiles_over_meters(results, specs=specs)
+    day_max_quantiles_df =  extract_day_max_quantiles_over_meters(results, specs=specs, normalize_quantiles=True, normalize_with_opt_mpc=True)
+    analyze_lcoes(results, specs)
+    sizings = analyze_sizing(results, specs)
+
+    return day_max_quantiles_df, sizings
+
+if __name__ == "__main__":
+    hours_prescient_sizing = 24 * 30
+    specs = {'eta_ch': 0.95,
+             'eta_dis': 0.95,
+             'soc_min': 0,
+             'soc_max': 1,
+             'soc_start': 0.2,
+             'peak_tariff_per_MW_period': 500,
+             'energy_ratio': 1.0,
+             'peak_period_steps': 24,
+             'c_PV_kw': 200,
+             'c_bat_E_kWh': 120,
+             'c_bat_P_kw': 50,
+             'hours_prescient_sizing': hours_prescient_sizing,
+             'replicate_periods': int(np.ceil(24 * 365 / (hours_prescient_sizing))),
+             'Delta_t': 1.0,
+             'discount_rate': 0.06,
+             'lifetime_years': 15.0,
+             'billing_peak_period_str': 'daily',
+             'sizing_method': 'prescient'
+             }
+    from os.path import join
+    res_path = "battery_sizing_cfa/results/"
+    mp_tuples = (('prescient', 'monthly'), ('rbc_peak_shaving', 'monthly'), ('prescient', 'daily'))
+    dmq_dfs = {}
+    sizing = {}
+    for method, period in mp_tuples:
+        file_path = 'rbc_vs_mpc_results_{}_peaks_billed_{}.pk'.format(method, period)
+        specs.update({'sizing_method': method, 'billing_peak_period_str': period})
+        key = '{}_{}'.format(method, period)
+        dmq_dfs[key], sizing[key]  = analyze_results_mpc_vs_rbc(join(res_path, file_path), specs=specs)
+
+    dmq_dfs_comb = pd.concat(dmq_dfs.values(), keys=dmq_dfs.keys(), names=['method_period'], axis=0)
+    dmq_dfs_comb.drop('prescient_daily', inplace=True)
+    dmq_dfs_comb = dmq_dfs_comb.rename(index={'prescient_monthly': 'A', 'rbc_peak_shaving_monthly': 'B'})
+    dmq_dfs_comb = dmq_dfs_comb.reset_index(drop=False)
+
+    dmq_dfs_comb['quantile_third'] = dmq_dfs_comb.apply(
+        lambda row: f"{row['controller']}-{row['method_period']}", axis=1
+    )
+
+    plt.figure(figsize=(14, 6))
+
+    # Define same color with different alpha values for each controller
+    # Adjust RGB values as needed (here: steel blue)
+    controllers = dmq_dfs_comb['quantile_third'].unique()
+    colors = plt.get_cmap('tab10', len(controllers))
+    palette = {ctrl: np.clip(np.array(colors(i%dmq_dfs_comb['controller'].nunique())[:-1]) * (1 + 0.5*(i//dmq_dfs_comb['controller'].nunique())),0, 1) for i, ctrl in enumerate(controllers)}
+
+    # Create the plot
+    sns.boxenplot(
+        data=dmq_dfs_comb,
+        x='quantile',
+        y='value',
+        hue='quantile_third',
+        dodge=0.6,  # Controls separation: 0=overlapping, 1=full separation
+        palette=palette,
+        linewidth=1.2,
+        width=0.8   # Controls box width within each group
+    )
+
+    # Formatting
+    plt.xticks(rotation=45, ha='right')
+    plt.xlabel('Quantile')
+    plt.ylabel('Normalized peaks')
+    plt.title('Normalized Quantile distributions across meters')
+    plt.legend(title='Controller', ncol=2)
+    plt.tight_layout()
+    plt.semilogy()
+
+    plt.savefig("battery_sizing_cfa/figs/daily_max_quantiles_distribution_all_methods.pdf")
+
+
+    sizing_df = pd.DataFrame(sizing).iloc[:, :-1]
+    # boxenplot of sizing results
+    plt.figure(figsize=(8, 6), layout='constrained')
+    sns.boxenplot(data=sizing_df, palette='Set2', linewidth=1.2)
+    plt.ylabel('Battery Energy Capacity (kWh)')
+    plt.title('Battery Sizing Comparison Across Methods')
+    sns.despine()
+    plt.savefig("battery_sizing_cfa/figs/battery_sizing_comparison_all_methods.pdf")
 
 

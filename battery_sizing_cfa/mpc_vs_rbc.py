@@ -278,6 +278,7 @@ def compare_methods(df, sizing_method='prescient', specs=None, target_name='p_lo
             'rbc_adv': p_grid_rbc_adv,
             'mpc': p_grid_mpc,
             'mpc_opt': p_grid_mpc_opt,
+            'no_battery': x_test.loc[:, target_name].values + x_pv * PV_base_te
         },
         'E_bat_kWh': E_bat_kWh,
         'P_bat_max_kW': P_bat_max_kW,
