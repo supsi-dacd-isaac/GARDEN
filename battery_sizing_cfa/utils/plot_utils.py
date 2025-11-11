@@ -3,6 +3,9 @@ import plotly.graph_objects as go
 import matplotlib.pyplot as plt
 import seaborn as sns
 import pandas as pd
+from battery_sizing_cfa.cost_functions.peak_shaving import daily_maxima
+from sklearn.externals.array_api_extra import nunique
+
 
 def plot_results(x_pv, E_bat_kWh, P_battery, SOC_kWh, PV_base, L, price):
     N = len(L)
@@ -50,7 +53,6 @@ def plot_rbc_vs_mpc_diagnostics(x_test, results, series, billing_peak_period_str
         for j, k in enumerate(results['profiles'].keys()):
             a.plot(x_test.index.values[w], results['profiles'][k][w], label=k, alpha=1, linewidth=0.5, color=colors(j+1))
         a.set_ylabel('Power')
-        a.set_title('Grid Power Profiles on Test Set')
         a.legend(fontsize='small', loc='upper right', ncol=2)
         a.set_xlabel('Time')
 
@@ -96,8 +98,8 @@ def extract_day_max_quantiles_over_meters(results, normalize_quantiles=True, nor
     # Optional: dict mapping method -> DataFrame (columns = meter_ids)
     if normalize_with_opt_mpc:
         day_max_quantiles = {
-            method: df_multi.xs(method, axis=1, level='method').copy() / df_multi.xs('mpc_opt', axis=1, level='method').copy()
-            for method in df_multi.columns.get_level_values('method').unique() if method != 'mpc_opt'
+            method: df_multi.xs(method, axis=1, level='method').copy() / df_multi.xs('no_battery', axis=1, level='method').copy()
+            for method in df_multi.columns.get_level_values('method').unique() if method != 'no_battery'
         }
     else:
         day_max_quantiles = {
@@ -135,37 +137,96 @@ def analyze_lcoes(results, specs):
     )
 
     # Create mapping: series → lcoe_sizing value
-    sizing_map = plot_data[plot_data['controller'] == 'lcoe_sizing'].set_index('series')['lcoe_value']
+    normalizing_kex = 'no_battery'
+    sizing_map = plot_data[plot_data['controller'] == normalizing_kex].set_index('series')['lcoe_value']
 
     # PLOT SETUP
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 6), layout='constrained')
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(6, 3.5), layout='constrained')
 
     # PLOT 1: Full original distribution
-    sns.boxenplot(data=plot_data, x='controller', y='lcoe_value', hue='controller', ax=ax1)
+    n = plot_data['controller'].nunique()
+    colors = plt.get_cmap('tab10', n)
+    palette = {ctrl: np.clip(np.array(colors(i%n)[:-1]) * (1 + 0.5*(i//n)),0, 1) for i, ctrl in enumerate(plot_data['controller'].unique())}
+
+    sns.boxenplot(data=plot_data, x='controller', y='lcoe_value', hue='controller', ax=ax1, showfliers=False, palette=palette)
     ax1.set_title('LCOE Distributions', fontweight='bold')
     ax1.set_ylabel('LCOE ($/MWh)')
+
     sns.despine(ax=ax1)
 
     # PLOT 2: Normalized data
     # Filter out lcoe_sizing and divide by corresponding sizing values
-    norm_data = plot_data[plot_data['controller'] != 'lcoe_sizing'].copy()
+    norm_data = plot_data[plot_data['controller'] != normalizing_kex].copy()
     norm_data['lcoe_value'] = norm_data.apply(
         lambda row: row['lcoe_value'] / sizing_map[row['series']], axis=1
     )
 
-    sns.boxenplot(data=norm_data, x='controller', y='lcoe_value', hue='controller', ax=ax2)
-    ax2.set_title('Normalized (relative to LCOE Sizing)', fontweight='bold')
+    sns.boxenplot(data=norm_data, x='controller', y='lcoe_value', hue='controller', ax=ax2, showfliers=True, palette=palette)
+    ax2.set_title('Norm. with LCOE BaU', fontweight='bold')
     ax2.set_ylabel('LCOE Ratio')
-    ax2.set_ylim(0., 2)
+    ax2.set_ylim(0.5, 1.2)
+    ax2.hlines(1.0, *ax2.get_xlim(), color='red', linestyle='--', linewidth=1)
+    # tilt x labels
+    for tick in ax2.get_xticklabels():
+        tick.set_rotation(45)
+        tick.set_horizontalalignment('right')
+    for tick in ax1.get_xticklabels():
+        tick.set_rotation(45)
+        tick.set_horizontalalignment('right')
 
     sns.despine(ax=ax2)
 
     # Shared formatting
     for ax in [ax1, ax2]:
-        ax.set_xlabel('Sizing Method')
+        ax.set_xlabel('')
+
+    # remove '_' from xticklabels
+    [ax.set_xticklabels([label.get_text().replace('_', ' ') for label in ax.get_xticklabels()]) for ax in [ax1, ax2]]
 
     plt.savefig("battery_sizing_cfa/figs/lcoe_sizing_comparison_{}_{}.pdf".format(specs['sizing_method'], specs['billing_peak_period_str']))
     plt.close('all')
+
+def ts_plots(results, specs):
+    fig, ax = plt.subplots(1, 1, figsize=(5, 5))
+    palette = lambda x: plt.get_cmap('tab10')(2*(x+1)%6)
+
+    df = pd.DataFrame({k: r['profiles']['no_battery'] for k, r in results.items()}).iloc[:, np.arange(1, 14, 2)]
+    colors = [palette(i) for i in range(df.shape[1])]
+
+    (df/1e3).plot(subplots=True,legend=False,linewidth=0.5, ax=ax,alpha=0.9, color=colors)
+
+    # remove all xticklabels but the last axis
+    [a.set_xticklabels([]) for a in fig.axes[:-1]]
+    # adjust plot to remove vertical gaps
+    plt.subplots_adjust(wspace=0, hspace=0, top=0.99, bottom=0.1, left=0.13, right=0.99)
+    plt.xlabel('Time (h)')
+    [a.set_ylabel('P (MW)') for a in fig.axes]
+    plt.savefig("battery_sizing_cfa/figs/no_battery_profiles_{}_{}.pdf".format(specs['sizing_method'], specs['billing_peak_period_str']))
+
+    # show effect of applying moving average on the peaks
+    fig, ax = plt.subplots(2,1 , figsize=(5, 3), layout='constrained')
+    s_index = 5
+    s = pd.Series(results[s_index]['profiles']['no_battery'])
+    s_detr = pd.Series(s-s.rolling(24*7, min_periods=1).mean())/s.rolling(24*7, min_periods=1).std()
+
+    ax[0].plot(s, linewidth=.5, color=colors[0])
+    # plot daily maxima using pd grouping
+    d_maxima = s.groupby(np.arange(len(s))//24).max()
+    max_locations = d_maxima.index * 24 + d_maxima.index.map(lambda x: s[x*24:(x+1)*24].idxmax()%24)
+    # plot the 10% worst peaks
+    worse_indexes = np.argsort(d_maxima)[-int(0.1*len(d_maxima)):]
+    ax[0].scatter(max_locations[worse_indexes], s[max_locations].values[worse_indexes], color='red', label='Daily Maxima', s=10, marker='*')
+
+    ax[1].plot(s_detr, linewidth=.5, color=colors[1])
+    d_maxima = s_detr.groupby(np.arange(len(s_detr))//24).max()
+    max_locations = d_maxima.index * 24 + d_maxima.index.map(lambda x: s[x*24:(x+1)*24].idxmax()%24)
+    # plot the 10% worst peaks
+    worse_indexes = np.argsort(d_maxima)[-int(0.1*len(d_maxima)):]
+    ax[1].scatter(max_locations[worse_indexes], s_detr[max_locations].values[worse_indexes], color='red', label='Daily Maxima', s=10, marker='*')
+    ax[1].set_xlabel('Time (h)')
+    ax[0].set_ylabel('P (kW)')
+    ax[1].set_ylabel('Normalized P (-)')
+    plt.savefig("battery_sizing_cfa/figs/moving_average_effect_on_peaks_{}_{}.pdf".format(specs['sizing_method'], specs['billing_peak_period_str']))
 
 def analyze_results_mpc_vs_rbc(res_path, specs):
     import pickle
@@ -175,6 +236,8 @@ def analyze_results_mpc_vs_rbc(res_path, specs):
     day_max_quantiles_df =  extract_day_max_quantiles_over_meters(results, specs=specs, normalize_quantiles=True, normalize_with_opt_mpc=True)
     analyze_lcoes(results, specs)
     sizings = analyze_sizing(results, specs)
+    ts_plots(results, specs)
+
 
     return day_max_quantiles_df, sizings
 
@@ -250,14 +313,56 @@ if __name__ == "__main__":
 
     plt.savefig("battery_sizing_cfa/figs/daily_max_quantiles_distribution_all_methods.pdf")
 
+    # do the same image but split it in two (lower quantiles and higher quantiles)
+    fig, ax = plt.subplots(2, 1, figsize=(5, 6), layout='constrained')
+    lower_quantiles = dmq_dfs_comb['quantile'].unique()[:3]
+    higher_quantiles = dmq_dfs_comb['quantile'].unique()[3:]
+    sns.boxenplot(
+        data=dmq_dfs_comb[dmq_dfs_comb['quantile'].isin(lower_quantiles)],
+        x='quantile',
+        y='value',
+        hue='quantile_third',
+        dodge=0.6,
+        palette=palette,
+        linewidth=1.2,
+        width=0.8,
+        ax=ax[0],
+        showfliers=False
+    )
+    ax[0].set_title('Lower Quantiles')
+    ax[0].set_ylabel('Normalized peaks')
+    ax[0].legend_.remove()
+    sns.boxenplot(
+        data=dmq_dfs_comb[dmq_dfs_comb['quantile'].isin(higher_quantiles)],
+        x='quantile',
+        y='value',
+        hue='quantile_third',
+        dodge=0.6,
+        palette=palette,
+        linewidth=1.2,
+        width=0.8,
+        ax=ax[1],
+        showfliers=False
+    )
+    ax[1].set_title('Higher Quantiles')
+    ax[1].set_ylabel('Normalized peaks')
+    ax[1].legend(title='Controller', ncol=2, loc='upper left', fontsize='small')
+    plt.xticks(rotation=45, ha='right')
+
+    plt.savefig("battery_sizing_cfa/figs/daily_max_quantiles_distribution_all_methods_split.pdf")
+
+
 
     sizing_df = pd.DataFrame(sizing).iloc[:, :-1]
     # boxenplot of sizing results
-    plt.figure(figsize=(8, 6), layout='constrained')
+    plt.figure(figsize=(6, 4), layout='constrained')
     sns.boxenplot(data=sizing_df, palette='Set2', linewidth=1.2)
     plt.ylabel('Battery Energy Capacity (kWh)')
     plt.title('Battery Sizing Comparison Across Methods')
+    # xtick labels setting
+    plt.gca().set_xticklabels(['A', 'B'])
     sns.despine()
+    plt.semilogy()
     plt.savefig("battery_sizing_cfa/figs/battery_sizing_comparison_all_methods.pdf")
 
 

@@ -92,7 +92,7 @@ def optimize_lcoe_rbc(sampled_pars, L, PV_base, price, export_price, specs, h=No
     return lcoe_simulation
 
 
-def rbc_peak_shaving(sampled_pars, L, price, specs, return_adv=False, h=None, return_ts=False):
+def rbc_peak_shaving(sampled_pars, L, price, specs, return_adv=False, h=None, return_ts=False, stratified_cvar=True):
     lower_threshold = frac_rolling_quantile(L, W_star=sampled_pars['n_hours'], q=sampled_pars['lower_q'])
     upper_threshold = frac_rolling_quantile(L, W_star=sampled_pars['n_hours'], q=sampled_pars['higher_q'])
 
@@ -114,8 +114,45 @@ def rbc_peak_shaving(sampled_pars, L, price, specs, return_adv=False, h=None, re
                                          upper_threshold=upper_threshold)
 
     if specs.get('alpha_cvar', 0.9)>0:
-        d_losses = daily_maxima(p_grid - pd.Series(p_grid).rolling(24*7, min_periods=1).mean().values, h)
-        peak_cost = np.mean(np.sort(d_losses)[-np.maximum(int(len(d_losses)*(1-specs.get('alpha_cvar', 0.9))), 1):])
+
+        if stratified_cvar:
+            # stratified CVaR: compute CVaR per month, then average
+            d_losses = daily_maxima(p_grid, h)
+            worst_days = []
+            for m in np.arange(0, len(d_losses), 30):
+                month_worst_k = np.sort(d_losses[m:m + 30])[
+                -np.maximum(int(30 * (1 - specs.get('alpha_cvar', 0.9))), 1):]
+                worst_days.append(month_worst_k)
+            peak_cost = np.mean(np.concatenate(worst_days))
+        else:
+            d_losses = daily_maxima(p_grid - pd.Series(p_grid).rolling(24 * 7, min_periods=1).mean().values, h)
+            peak_cost = np.mean(
+                np.sort(d_losses)[-np.maximum(int(len(d_losses) * (1 - specs.get('alpha_cvar', 0.9))), 1):])
+
+        if False:
+            import matplotlib.pyplot as plt
+            d_maxima = pd.Series(p_grid).groupby(np.arange(len(p_grid)) // 24).max()
+            max_locations = d_maxima.index * 24 + d_maxima.index.map(
+                lambda x: pd.Series(p_grid)[x * 24:(x + 1) * 24].idxmax() % 24)
+            # plot the 10% worst peaks
+            worse_indexes = np.argsort(d_maxima)[-int(0.1 * len(d_maxima)):]
+
+
+            p_grid_norm = pd.Series(p_grid_norm)
+            d_maxima = p_grid_norm.groupby(np.arange(len(p_grid_norm))//24).max()
+            max_locations_norm = d_maxima.index * 24 + d_maxima.index.map(lambda x: p_grid_norm[x*24:(x+1)*24].idxmax()%24)
+            # plot the 10% worst peaks
+            worse_indexes_norm = np.argsort(d_maxima)[-int(0.1*len(d_maxima)):]
+
+
+            fig, ax = plt.subplots(1, 1, figsize=(10, 5), sharex=True)
+            ax.plot(pd.Series(p_grid))
+            ax.scatter(max_locations_norm[worse_indexes_norm], pd.Series(p_grid)[max_locations].values[worse_indexes_norm], color='red',
+                          label='Daily Maxima', s=20, marker='*')
+            ax.scatter(max_locations[worse_indexes], pd.Series(p_grid)[max_locations].values[worse_indexes], color='green',
+                          label='Daily Maxima', s=20, marker='o', alpha=0.3)
+            plt.show()
+
     else:
         peak_cost = np.mean(daily_maxima(p_grid,h))
 

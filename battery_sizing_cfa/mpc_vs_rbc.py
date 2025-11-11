@@ -61,8 +61,10 @@ def get_forecasts(df, H=24, train_ratio=0.2):
     ax[0].plot(y_test.values[:, 0], label='test', alpha=1, linewidth=0.5)
     ax[0].legend()
 
-    ax[1].plot(np.mean(np.abs(y_train.values - preds_tr), axis=0) / np.mean(np.abs(y_train.values)), label='Train')
-    ax[1].plot(np.mean(np.abs(y_test.values - preds), axis=0) / np.mean(np.abs(y_test.values)), label='Test')
+    norm_mae_tr = np.mean(np.abs(y_train.values - preds_tr), axis=0) / np.mean(np.abs(y_train.values))
+    norm_mae_te = np.mean(np.abs(y_test.values - preds), axis=0) / np.mean(np.abs(y_test.values))
+    ax[1].plot(norm_mae_tr, label='Train')
+    ax[1].plot(norm_mae_te, label='Test')
     ax[1].legend()
 
     ax[1].set_xlabel('Forecast Horizon (hours)')
@@ -77,7 +79,7 @@ def get_forecasts(df, H=24, train_ratio=0.2):
     plt.show()
     preds = np.vstack([preds_tr[-1], preds[:-1]])
     perfect_preds = np.vstack([y_train.values[-1], y_test.values[:-1]])
-    return preds, perfect_preds, x_train, x_test, y_train, y_test
+    return preds, perfect_preds, x_train, x_test, y_train, y_test, norm_mae_tr.mean(), norm_mae_te.mean()
 
 def rbc_sizing(L, PV_base, price, export_price, specs, h):
     def rbc_peak_shaving_wrap(x, L, PV_base, price, export_price, specs, h):
@@ -193,7 +195,7 @@ def optimize_policy_and_run(df_tr, df_te, y_hat_te, specs, control='rbc'):
 
 def compare_methods(df, sizing_method='prescient', specs=None, target_name='p_load', H=24, train_ratio=0.8, series=0, billing_peak_period_str=None):
     print('training forecaster...')
-    y_hat_te, y_perfect_te, x_train, x_test, y_train, y_test = get_forecasts(df, H=H, train_ratio=train_ratio)
+    y_hat_te, y_perfect_te, x_train, x_test, y_train, y_test, norm_mae_tr, norm_mae_te = get_forecasts(df, H=H, train_ratio=train_ratio)
 
     if sizing_method == 'rbc_peak_shaving':
         from battery_sizing_cfa.optimizers.rbc_sizing import rbc_peak_shaving
@@ -283,7 +285,9 @@ def compare_methods(df, sizing_method='prescient', specs=None, target_name='p_lo
         'E_bat_kWh': E_bat_kWh,
         'P_bat_max_kW': P_bat_max_kW,
         'x_pv': x_pv,
-        'sizing_method':sizing_method
+        'sizing_method':sizing_method,
+        'norm_mae_tr': norm_mae_tr,
+        'norm_mae_te': norm_mae_te
     }
 
     results['costs_daily_max'] = {k: day_max_cost_from_results(v, h=x_test.index.hour) for k, v in results['profiles'].items()}
