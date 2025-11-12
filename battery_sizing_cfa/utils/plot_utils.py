@@ -77,7 +77,7 @@ def plot_rbc_vs_mpc_diagnostics(x_test, results, series, billing_peak_period_str
 
 
 
-def extract_day_max_quantiles_over_meters(results, normalize_quantiles=True, normalize_with_opt_mpc=True, specs=None):
+def extract_day_max_quantiles_over_meters(results, normalize_quantiles=True, normalize_with_key="mpc_opt", specs=None):
 
     # obtain a multicolumn dataframe: index = quantiles, columns = meter ids, column level 1 = method (rbc, mpc, mpc_opt)
     quantile_levels = [5, 25, 50, 75, 95, 99]
@@ -96,10 +96,10 @@ def extract_day_max_quantiles_over_meters(results, normalize_quantiles=True, nor
     df_multi.columns = pd.MultiIndex.from_tuples(df_multi.columns, names=['meter_id', 'method'])
 
     # Optional: dict mapping method -> DataFrame (columns = meter_ids)
-    if normalize_with_opt_mpc:
+    if normalize_with_key is not None:
         day_max_quantiles = {
-            method: df_multi.xs(method, axis=1, level='method').copy() / df_multi.xs('no_battery', axis=1, level='method').copy()
-            for method in df_multi.columns.get_level_values('method').unique() if method != 'no_battery'
+            method: df_multi.xs(method, axis=1, level='method').copy() / df_multi.xs(normalize_with_key, axis=1, level='method').copy()
+            for method in df_multi.columns.get_level_values('method').unique() if method != normalize_with_key
         }
     else:
         day_max_quantiles = {
@@ -233,11 +233,15 @@ def analyze_results_mpc_vs_rbc(res_path, specs):
     with open(res_path, 'rb') as f:
         results = pickle.load(f)
 
-    day_max_quantiles_df =  extract_day_max_quantiles_over_meters(results, specs=specs, normalize_quantiles=True, normalize_with_opt_mpc=True)
+    day_max_quantiles_df =  extract_day_max_quantiles_over_meters(results, specs=specs, normalize_quantiles=True, normalize_with_key='mpc_opt')
     analyze_lcoes(results, specs)
     sizings = analyze_sizing(results, specs)
     ts_plots(results, specs)
 
+    nMAE = pd.concat([pd.Series({k: r['norm_mae_tr'] for k, r in results.items()}, name='nMAE tr'), pd.Series({k: r['norm_mae_te'] for k, r in results.items()}, name='nMAE te')], axis=1)
+
+    sns.boxenplot(data=nMAE)
+    plt.show()
 
     return day_max_quantiles_df, sizings
 
@@ -273,6 +277,9 @@ if __name__ == "__main__":
         key = '{}_{}'.format(method, period)
         dmq_dfs[key], sizing[key]  = analyze_results_mpc_vs_rbc(join(res_path, file_path), specs=specs)
 
+    # drop mpc_opt from dmq_dfs
+    dmq_dfs = {k: v[v['controller'] != 'no_battery'] for k, v in dmq_dfs.items()}
+
     dmq_dfs_comb = pd.concat(dmq_dfs.values(), keys=dmq_dfs.keys(), names=['method_period'], axis=0)
     dmq_dfs_comb.drop('prescient_daily', inplace=True)
     dmq_dfs_comb = dmq_dfs_comb.rename(index={'prescient_monthly': 'A', 'rbc_peak_shaving_monthly': 'B'})
@@ -287,8 +294,9 @@ if __name__ == "__main__":
     # Define same color with different alpha values for each controller
     # Adjust RGB values as needed (here: steel blue)
     controllers = dmq_dfs_comb['quantile_third'].unique()
-    colors = plt.get_cmap('tab10', len(controllers))
-    palette = {ctrl: np.clip(np.array(colors(i%dmq_dfs_comb['controller'].nunique())[:-1]) * (1 + 0.5*(i//dmq_dfs_comb['controller'].nunique())),0, 1) for i, ctrl in enumerate(controllers)}
+    n_ctrl = len(controllers)
+    colors = plt.get_cmap('tab10', 6)
+    palette = {ctrl: np.clip(np.array(colors(i%3)[:-1]) * (1 + 0.9*(i//3)),0, 1) for i, ctrl in enumerate(controllers)}
 
     # Create the plot
     sns.boxenplot(
@@ -314,41 +322,60 @@ if __name__ == "__main__":
     plt.savefig("battery_sizing_cfa/figs/daily_max_quantiles_distribution_all_methods.pdf")
 
     # do the same image but split it in two (lower quantiles and higher quantiles)
-    fig, ax = plt.subplots(2, 1, figsize=(5, 6), layout='constrained')
+    # --- Figure with a thin top row for the legend ---
+    fig = plt.figure(figsize=(5, 6), layout="constrained")
+    gs = fig.add_gridspec(nrows=3, ncols=1, height_ratios=[0.12, 1, 1])  # top band for legend
+
+    ax_leg = fig.add_subplot(gs[0])
+    ax1 = fig.add_subplot(gs[1])
+    ax2 = fig.add_subplot(gs[2])
+    axes = [ax1, ax2]
+
     lower_quantiles = dmq_dfs_comb['quantile'].unique()[:3]
     higher_quantiles = dmq_dfs_comb['quantile'].unique()[3:]
+
+    # --- First subplot ---
     sns.boxenplot(
         data=dmq_dfs_comb[dmq_dfs_comb['quantile'].isin(lower_quantiles)],
-        x='quantile',
-        y='value',
-        hue='quantile_third',
-        dodge=0.6,
-        palette=palette,
-        linewidth=1.2,
-        width=0.8,
-        ax=ax[0],
-        showfliers=False
+        x='quantile', y='value', hue='quantile_third',
+        dodge=0.6, palette=palette, linewidth=1.2, width=0.8,
+        ax=ax1, showfliers=False
     )
-    ax[0].set_title('Lower Quantiles')
-    ax[0].set_ylabel('Normalized peaks')
-    ax[0].legend_.remove()
+    ax1.set_ylabel('Normalized peaks')
+    ax1.legend_.remove()
+
+    # --- Second subplot ---
     sns.boxenplot(
         data=dmq_dfs_comb[dmq_dfs_comb['quantile'].isin(higher_quantiles)],
-        x='quantile',
-        y='value',
-        hue='quantile_third',
-        dodge=0.6,
-        palette=palette,
-        linewidth=1.2,
-        width=0.8,
-        ax=ax[1],
-        showfliers=False
+        x='quantile', y='value', hue='quantile_third',
+        dodge=0.6, palette=palette, linewidth=1.2, width=0.8,
+        ax=ax2, showfliers=False
     )
-    ax[1].set_title('Higher Quantiles')
-    ax[1].set_ylabel('Normalized peaks')
-    ax[1].legend(title='Controller', ncol=2, loc='upper left', fontsize='small')
-    plt.xticks(rotation=45, ha='right')
+    ax2.set_ylabel('Normalized peaks')
+    ax2.legend_.remove()
 
+    # --- One horizontal legend in its own axis ---
+    handles, labels = ax1.get_legend_handles_labels()
+    ax_leg.axis("off")
+    ax_leg.legend(
+        handles, labels,
+        title='Controller', ncol=min(6, len(labels)),
+        loc='center', frameon=False,
+        fontsize='small', title_fontsize='small',
+        handlelength=1.0, handletextpad=0.4, columnspacing=0.8
+    )
+
+    # Rotate x-ticks for BOTH subplots
+    for a in axes:
+        a.tick_params(axis='x', rotation=45)
+    import matplotlib.ticker as mticker
+
+    for a in axes:
+        a.yaxis.set_major_locator(mticker.MultipleLocator(0.1))  # tick every 0.05
+        a.yaxis.set_major_formatter(mticker.FormatStrFormatter('%.2f'))
+    # despine both subplots
+    for a in axes:
+        sns.despine(ax=a)
     plt.savefig("battery_sizing_cfa/figs/daily_max_quantiles_distribution_all_methods_split.pdf")
 
 
