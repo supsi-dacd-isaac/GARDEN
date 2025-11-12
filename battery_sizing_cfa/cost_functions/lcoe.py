@@ -20,6 +20,7 @@ def lcoe_from_results(
     P_net_kW=None,
     period_peaks_MW=None, # This should be in MW to match the tariff unit
     peak_tariff_profile=None, # override peak_tariff_per_MW_period
+    installation_fixed_costs=200,
     **kwargs
 ):
     """
@@ -64,6 +65,10 @@ def lcoe_from_results(
     capex = (c_PV_kw * x_pv * PV_base_peak # kW * $/kW
              + c_bat_E_kWh * E_bat_kWh      # kWh * $/kWh
              + c_bat_P_kw  * P_bat_max_kW) # kW * $/kW
+
+    if E_bat_kWh>0 or x_pv>0:
+        capex += installation_fixed_costs
+
     capex_annual = crf * capex
 
     # Opex (annualized)

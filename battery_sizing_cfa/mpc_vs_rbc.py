@@ -14,6 +14,7 @@ from battery_sizing_cfa.optimizers.rbc_sizing import rbc_peak_shaving, optimize_
 from battery_sizing_cfa.optimizers.peak_shaver import mpc_peak_shaving
 from battery_sizing_cfa.cost_functions.peak_shaving import daily_maxima, day_max_cost_from_results
 from battery_sizing_cfa.utils.plot_utils import plot_rbc_vs_mpc_diagnostics, analyze_results_mpc_vs_rbc
+import concurrent.futures
 
 def build_covariates(df, H):
     """Build covariates DataFrame from datetime index."""
@@ -46,7 +47,7 @@ def get_forecasts(df, H=24, train_ratio=0.2):
     x, y = build_covariates(df, H=H)
     x_train, x_test = train_test_split(x, train_ratio=train_ratio)
     y_train, y_test = train_test_split(y, train_ratio=train_ratio)
-    m = LGBMRegressor(n_estimators=100, learning_rate=0.1, force_row_wise=True,verbose=-1)
+    m = LGBMRegressor(n_estimators=100, learning_rate=0.1, force_row_wise=True,verbose=-1, n_jobs=1)
     preds = [y_test.iloc[:, 0].values.ravel()]  # first step is just the true value shifted
     preds_tr = [y_train.iloc[:, 0].values.ravel()]
     for step in range(1, H):
@@ -94,7 +95,7 @@ def rbc_sizing(L, PV_base, price, export_price, specs, h):
         (0, 0.9),  # lower_q
         (0.1, 1),  # higher_q
         (5, 24 * 7),  # n_hours
-        (10.0, 500.0)  # E_bat_kWh
+        (0, 500.0)  # E_bat_kWh
     ]
     result = differential_evolution(
         rbc_peak_shaving_wrap,
@@ -108,8 +109,11 @@ def rbc_sizing(L, PV_base, price, export_price, specs, h):
         polish=False,
         integrality=(False, False, False)
     )
+    # cap results from the optimization: if battery size is small put it to 0
+    if result.x[3]<1.0:
+        result.x[3]=0.0
 
-    return  result.x[3], result.x[3]/specs.get('energy_ratio', 1.0), 0, result.fun, result
+    return  result.x[3], result.x[3]*specs.get('energy_ratio', 1.0), 0, result.fun, result
 
 def prescient_sizing(L, PV_base, price, export_price, specs):
     res = optimize_lcoe_prescient(
@@ -214,6 +218,8 @@ def compare_methods(df, sizing_method='prescient', specs=None, target_name='p_lo
         E_bat_kWh, P_bat_max_kW, x_pv, lcoe_sizing = prescient_sizing(L, PV_base, price, export_price, specs)
 
     print('sized battery: {:.2f} kWh, {:.2f} kW, pv size: {:.2f} kW'.format(E_bat_kWh, P_bat_max_kW, x_pv))
+    if E_bat_kWh <=0:
+        print('BATTERY SIZE IS 00000000000000000000000000000000000000000000000000000')
     specs.update({'E_bat_kWh': E_bat_kWh, 'energy_ratio': P_bat_max_kW / E_bat_kWh  if P_bat_max_kW>0 else 0, 'x_pv': x_pv})
 
 
@@ -295,16 +301,16 @@ def compare_methods(df, sizing_method='prescient', specs=None, target_name='p_lo
 
     replicate_periods = 365*24//(len(x_test))
     pps = specs['peak_period_steps']
-    price_te = np.ones_like(L_te) * 20
-    export_price_te = np.ones_like(L_te) * 10
+    price_te = np.ones_like(L_te) * specs['import_price_static']
+    export_price_te = np.ones_like(L_te) * specs['export_price_static']
     results['lcoe'] = {k: lcoe_from_results(
       L=L_te,
       PV_base=PV_base_te,
       price=price_te,
       export_price=export_price_te,
-      x_pv=specs['x_pv'],  # Use the PV size from optimization
-      E_bat_kWh= specs['E_bat_kWh'], # Use battery energy capacity from optimization
-      P_bat_max_kW= P_bat_max_kW, # Use battery power capacity from optimization
+      x_pv=specs['x_pv'] if k is not 'no_battery' else 0,  # Use the PV size from optimization
+      E_bat_kWh= specs['E_bat_kWh'] if k is not 'no_battery' else 0, # Use battery energy capacity from optimization
+      P_bat_max_kW= P_bat_max_kW if k is not 'no_battery' else 0, # Use battery power capacity from optimization
       P_net_kW=v, # Use the net load from the simulation
       # For peak costs in simulation, we need to find the peak import in MW for each period
       period_peaks_MW=[np.max(v[i*pps:(i+1)*pps])/1000.0 for i in range(len(v)//pps) if len(v[i*pps:(i+1)*pps]) > 0],
@@ -316,7 +322,9 @@ def compare_methods(df, sizing_method='prescient', specs=None, target_name='p_lo
       peak_period_steps = pps,
       discount_rate =specs['discount_rate'],
       lifetime_years = specs['lifetime_years'],
-      replicate_periods = replicate_periods) for k, v in results['profiles'].items()}
+      replicate_periods = replicate_periods,
+      installation_fixed_costs = specs.get('installation_fixed_costs', 200))
+      for k, v in results['profiles'].items()}
 
 
     plot_rbc_vs_mpc_diagnostics(x_test, results, series, billing_peak_period_str, sizing_method)
@@ -345,27 +353,48 @@ specs = {'eta_ch': 0.97,
          'c_bat_E_kWh':120,
          'c_bat_P_kw':50,
          'hours_prescient_sizing': hours_prescient_sizing,
-         'replicate_periods': int(np.ceil(24*365/(hours_prescient_sizing))),
+         'replicate_periods': int(np.floor(24*365/(hours_prescient_sizing))),
          'Delta_t':1.0,
          'discount_rate':0.06,
          'lifetime_years':15.0,
          'billing_peak_period_str':'daily',
          'sizing_method':'prescient',
          'import_price_static':200,
-         'export_price_static':50
+         'export_price_static':50,
+         'installation_fixed_costs':1000
          }
 
 
 def run(data, n_profiles, sizing_method, specs, train_ratio):
     results = {}
-    for series in range(n_profiles):
-        print('Processing series {}'.format(series))
-        t0 = time()
-        df = data.iloc[:24*365, [series]]  # select one series
-        df.rename(columns={series: 'p_load'}, inplace=True)
-        results[series] = compare_methods(df, sizing_method=sizing_method, specs=copy(specs), target_name='p_load',
-                                          train_ratio=train_ratio, H=24, series=series, billing_peak_period_str=specs['billing_peak_period_str'])
-        print('Series {} processed in {:.2f} seconds'.format(series, time()-t0))
+    # Parallelize per-series processing using multiple processes
+    with concurrent.futures.ProcessPoolExecutor(max_workers=52) as executor:
+        future_map = {}
+        for series in range(n_profiles):
+            print('Processing series {}'.format(series))
+            t0 = time()
+            df = data.iloc[:24*365, [series]].copy()  # select one series
+            df.rename(columns={series: 'p_load'}, inplace=True)
+            # submit job
+            fut = executor.submit(
+                compare_methods,
+                df,
+                sizing_method,
+                copy(specs),
+                'p_load',
+                24,
+                train_ratio,
+                series,
+                specs['billing_peak_period_str']
+            )
+            future_map[fut] = (series, t0)
+        for fut in concurrent.futures.as_completed(future_map):
+            series, t0 = future_map[fut]
+            try:
+                results[series] = fut.result()
+                print('Series {} processed in {:.2f} seconds'.format(series, time()-t0))
+            except Exception as e:
+                print(f'Series {series} failed: {e}')
     # save results to file
 
     res_path = "battery_sizing_cfa/results/rbc_vs_mpc_results_{}_peaks_billed_{}.pk".format(sizing_method, specs['billing_peak_period_str'])
@@ -388,12 +417,12 @@ data = data / 4.0 # BEWARE! THIS IS SUPER SPECIFIC TO THE PORTUGAL DATASET!!!
 
 # Then, run with monthly peak periods, use RBC sizing
 
+
 specs.update({'peak_period_steps':24*30,
               'peak_tariff_per_MW_period':5750,
-              'replicate_periods': int(np.ceil(24*365/(hours_prescient_sizing))),
+              'replicate_periods': int(np.floor(24*365/(hours_prescient_sizing))),
               #'replicate_periods': int(np.ceil(24*365/(24*365 * train_ratio))),
               'billing_peak_period_str':'monthly'})
-
 run(data, n_profiles=100, sizing_method='prescient', specs=specs, train_ratio=train_ratio)
 plt.show()
 
@@ -402,7 +431,7 @@ specs['sizing_method'] = 'rbc_peak_shaving'
 specs.update({'peak_period_steps':24*30,
               'peak_tariff_per_MW_period':5750,
               #'replicate_periods': int(np.ceil(24*365/(hours_prescient_sizing)))})
-              'replicate_periods': int(np.ceil(24*365/(24*365 * train_ratio))),
+              'replicate_periods': int(np.floor(24*365/(24*365 * train_ratio))),
               'billing_peak_period_str':'monthly'})
 
 run(data, n_profiles=100, sizing_method='rbc_peak_shaving', specs=specs, train_ratio=train_ratio)

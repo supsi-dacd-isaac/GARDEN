@@ -87,7 +87,8 @@ def optimize_lcoe_rbc(sampled_pars, L, PV_base, price, export_price, specs, h=No
       peak_period_steps = specs['peak_period_steps'],
       discount_rate =specs['discount_rate'],
       lifetime_years = specs['lifetime_years'],
-      replicate_periods = specs['replicate_periods'])
+      replicate_periods = specs['replicate_periods'],
+      installation_fixed_costs = specs.get('installation_fixed_costs', 200))
 
     return lcoe_simulation
 

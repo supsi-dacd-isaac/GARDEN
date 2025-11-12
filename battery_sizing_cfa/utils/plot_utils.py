@@ -164,7 +164,7 @@ def analyze_lcoes(results, specs):
     sns.boxenplot(data=norm_data, x='controller', y='lcoe_value', hue='controller', ax=ax2, showfliers=True, palette=palette)
     ax2.set_title('Norm. with LCOE BaU', fontweight='bold')
     ax2.set_ylabel('LCOE Ratio')
-    ax2.set_ylim(0.5, 1.2)
+    #ax2.set_ylim(0.5, 1.2)
     ax2.hlines(1.0, *ax2.get_xlim(), color='red', linestyle='--', linewidth=1)
     # tilt x labels
     for tick in ax2.get_xticklabels():
@@ -269,6 +269,7 @@ if __name__ == "__main__":
     from os.path import join
     res_path = "battery_sizing_cfa/results/"
     mp_tuples = (('prescient', 'monthly'), ('rbc_peak_shaving', 'monthly'), ('prescient', 'daily'))
+    mp_tuples = (('prescient', 'monthly'), ('rbc_peak_shaving', 'monthly'))
     dmq_dfs = {}
     sizing = {}
     for method, period in mp_tuples:
@@ -281,7 +282,7 @@ if __name__ == "__main__":
     dmq_dfs = {k: v[v['controller'] != 'no_battery'] for k, v in dmq_dfs.items()}
 
     dmq_dfs_comb = pd.concat(dmq_dfs.values(), keys=dmq_dfs.keys(), names=['method_period'], axis=0)
-    dmq_dfs_comb.drop('prescient_daily', inplace=True)
+    #dmq_dfs_comb.drop('prescient_daily', inplace=True)
     dmq_dfs_comb = dmq_dfs_comb.rename(index={'prescient_monthly': 'A', 'rbc_peak_shaving_monthly': 'B'})
     dmq_dfs_comb = dmq_dfs_comb.reset_index(drop=False)
 
@@ -380,7 +381,7 @@ if __name__ == "__main__":
 
 
 
-    sizing_df = pd.DataFrame(sizing).iloc[:, :-1]
+    sizing_df = pd.DataFrame(sizing)
     # boxenplot of sizing results
     plt.figure(figsize=(6, 4), layout='constrained')
     sns.boxenplot(data=sizing_df, palette='Set2', linewidth=1.2)

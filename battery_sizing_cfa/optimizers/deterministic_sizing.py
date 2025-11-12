@@ -30,6 +30,8 @@ def optimize_lcoe_prescient(
     replicate_periods: float = 1.0,   # how many times the provided horizon repeats per year
     solver_options: Optional[Dict[str, Any]] = None,
     energy_ratio:float= 0.5,  # P_bat_max / E_bat (1/h)
+    installation_fixed_costs = 200,
+    X_PV_ABS_MAX: float = 100.0,  # absolute upper bound for PV oversize factor to tighten big-M
     **kwargs
 ) -> Dict[str, Any]:
 
@@ -69,9 +71,11 @@ def optimize_lcoe_prescient(
     m.T = pyo.RangeSet(0, N-1)
 
     # Vars (sizing)
-    m.x_pv      = pyo.Var(bounds=(0, None))             # oversize factor [-]
+    m.x_pv      = pyo.Var(bounds=(0, X_PV_ABS_MAX))      # oversize factor [-]
     m.E_bat     = pyo.Var(bounds=(0, E_BAT_ABS_MAX))    # [kWh]
     m.P_bat_max = pyo.Var(bounds=(0, P_BAT_ABS_MAX))    # [kW]
+    # Binary install indicator: 1 if any capacity is installed (PV or battery)
+    m.z_install = pyo.Var(domain=pyo.Binary)
 
     # Vars (ops)
     m.P_ch   = pyo.Var(m.T, bounds=(0, P_BAT_ABS_MAX))  # [kW]
@@ -79,6 +83,10 @@ def optimize_lcoe_prescient(
     # m.P_curt = pyo.Var(m.T, bounds=(0, None))           # [kW] # Removed
     m.SOC    = pyo.Var(m.T, bounds=(0, E_BAT_ABS_MAX))  # [kWh]
     m.y      = pyo.Var(m.T, domain=pyo.Binary)          # mode: 1=discharge, 0=charge
+
+    # Link install binary to sizing vars (big-M)
+    m.install_link_bat = pyo.Constraint(expr=m.E_bat   <= E_BAT_ABS_MAX * m.z_install)
+    m.install_link_pv  = pyo.Constraint(expr=m.x_pv    <= X_PV_ABS_MAX * m.z_install)
 
     # Params
     m.L        = pyo.Param(m.T, initialize={t: float(L[t]) for t in range(N)})
@@ -192,7 +200,8 @@ def optimize_lcoe_prescient(
     def total_annual_cost_rule(m):
         capex = (c_PV_kw * m.x_pv * m.PV_peak # kW * $/kW
                  + c_bat_E_kWh * m.E_bat      # kWh * $/kWh
-                 + c_bat_P_kw  * m.P_bat_max) # kW * $/kW
+                 + c_bat_P_kw  * m.P_bat_max  # kW * $/kW
+                 + installation_fixed_costs * m.z_install)  # fixed cost if any install
         capex_annual = crf * capex
         # Convert kW to MW for price calculation ($/MWh * MWh)
         opex_energy = sum(price_import[t] * (m.P_imp[t]/1000.0) * Delta_t for t in m.T) \
