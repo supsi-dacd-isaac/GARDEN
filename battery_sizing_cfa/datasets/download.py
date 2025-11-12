@@ -86,3 +86,15 @@ pd.read_pickle(data_paths['portugal']).ffill().bfill().to_pickle('datasets/portu
 pd.read_pickle(data_paths['rolle'])['P_mean'].ffill().bfill().to_pickle('datasets/rolle/power.pk')
 pd.read_pickle(data_paths['london'])['power'].ffill().bfill().to_pickle('datasets/london/power.pk')
 
+# ---------------------------------- Swiss DSO case -----------------------------------------
+df_power = pd.read_parquet("/ssd2/incentivize/scenarios/consumption_all_limit_injection_000_standard.parquet")
+df_solar = pd.read_parquet("/ssd2/incentivize/scenarios/pv_production_all_limit_injection_000_standard_0.00.parquet")
+df_stats = pd.read_parquet("/ssd2/incentivize/scenarios/energy_stats_all_limit_injection_000_standard_0.00.parquet")
+common_cols = df_power.columns.intersection(df_solar.columns).intersection(df_stats.index)
+df_power = df_power[common_cols].rename(columns={col: i for i, col in enumerate(common_cols)})
+df_solar = df_solar[common_cols].rename(columns={col: i for i, col in enumerate(common_cols)})
+df_stats = df_stats.loc[common_cols].rename(index={col: i for i, col in enumerate(common_cols)})
+
+df_power.to_pickle('battery_sizing_cfa/datasets/swiss_dso/power.pk')
+df_solar.to_pickle('battery_sizing_cfa/datasets/swiss_dso/solar.pk')
+df_stats.to_pickle('battery_sizing_cfa/datasets/swiss_dso/stats.pk')
