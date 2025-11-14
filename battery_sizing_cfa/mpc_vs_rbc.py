@@ -50,7 +50,9 @@ def get_forecasts(df, H=24, train_ratio=0.2):
     m = LGBMRegressor(n_estimators=100, learning_rate=0.1, force_row_wise=True,verbose=-1, n_jobs=1)
     preds = [y_test.iloc[:, 0].values.ravel()]  # first step is just the true value shifted
     preds_tr = [y_train.iloc[:, 0].values.ravel()]
-    for step in range(1, H):
+    preds = []  # first step is just the true value shifted
+    preds_tr = []
+    for step in range(0, H):
         m.fit(x_train, y_train.values[:, step])
         preds.append(m.predict(x_test))
         preds_tr.append(m.predict(x_train))
@@ -368,7 +370,7 @@ specs = {'eta_ch': 0.97,
 def run(data, n_profiles, sizing_method, specs, train_ratio):
     results = {}
     # Parallelize per-series processing using multiple processes
-    with concurrent.futures.ProcessPoolExecutor(max_workers=52) as executor:
+    with concurrent.futures.ProcessPoolExecutor(max_workers=1) as executor:
         future_map = {}
         for series in range(n_profiles):
             print('Processing series {}'.format(series))

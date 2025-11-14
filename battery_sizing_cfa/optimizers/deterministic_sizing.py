@@ -31,7 +31,7 @@ def optimize_lcoe_prescient(
     solver_options: Optional[Dict[str, Any]] = None,
     energy_ratio:float= 0.5,  # P_bat_max / E_bat (1/h)
     installation_fixed_costs = 200,
-    X_PV_ABS_MAX: float = 100.0,  # absolute upper bound for PV oversize factor to tighten big-M
+    X_PV_ABS_MAX: float = 10000.0,  # absolute upper bound for PV oversize factor to tighten big-M
     **kwargs
 ) -> Dict[str, Any]:
 
@@ -41,14 +41,6 @@ def optimize_lcoe_prescient(
     price = np.asarray(price, float)
     N = len(L)
     assert PV_base.shape == (N,) and price.shape == (N,)
-    PV_base_peak = float(np.max(PV_base))
-    if PV_base_peak <= 0 and any(PV_base > 0) and c_PV_kw > 0:
-         # Only raise error if there's PV capacity and PV_base is all zero or negative.
-         # If c_PV_kw is 0, PV_base_peak doesn't matter for capex.
-         if np.max(PV_base) <= 0 and c_PV_kw > 0:
-              raise ValueError("PV_base_peak must be > 0 if PV_base has positive values and c_PV_kw > 0")
-         else:
-              PV_base_peak = 0.0 # Set to 0 if no PV is sized
 
 
     # ---- periodization for peak charges ----
@@ -93,7 +85,6 @@ def optimize_lcoe_prescient(
     m.PV_base  = pyo.Param(m.T, initialize={t: float(PV_base[t]) for t in range(N)})
     m.pi       = pyo.Param(m.T, initialize={t: float(price[t]) for t in range(N)}) # $/MWh
     m.pi_export = pyo.Param(m.T, initialize={t: float(export_price[t]) for t in range(N)}) # $/MWh
-    m.PV_peak  = pyo.Param(initialize=PV_base_peak) # kW
 
 
     # -----------------------------------------------------------------
@@ -198,7 +189,7 @@ def optimize_lcoe_prescient(
 
 
     def total_annual_cost_rule(m):
-        capex = (c_PV_kw * m.x_pv * m.PV_peak # kW * $/kW
+        capex = (c_PV_kw * m.x_pv  # kW * $/kW
                  + c_bat_E_kWh * m.E_bat      # kWh * $/kWh
                  + c_bat_P_kw  * m.P_bat_max  # kW * $/kW
                  + installation_fixed_costs * m.z_install)  # fixed cost if any install
@@ -224,6 +215,22 @@ def optimize_lcoe_prescient(
     used_solver, res = None, None
 
     try:
+        # use gurobi
+        solver = pyo.SolverFactory("gurobi")
+        if solver_options:
+            if "time_limit" in solver_options:
+                try: solver.options["TimeLimit"] = solver_options["time_limit"]
+                except: pass
+            if "threads" in solver_options:
+                try: solver.options["Threads"] = solver_options["threads"]
+                except: pass
+            if "mip_gap" in solver_options:
+                try: solver.options["MIPGap"] = solver_options["mip_gap"]
+                except: pass
+        res = solver.solve(m)
+        used_solver = "gurobi"
+
+    except:
         from pyomo.contrib.appsi.solvers.highs import Highs as AppsiHighs
         opt = AppsiHighs()
         if solver_options:
@@ -241,8 +248,7 @@ def optimize_lcoe_prescient(
         # opt.options['time_limit'] = 200
         res = opt.solve(m)
         used_solver = "appsi_highs"
-    except Exception as e:
-        print("[appsi_highs] fallback:", e)
+
 
     if used_solver is None:
         import shutil
@@ -288,7 +294,6 @@ def optimize_lcoe_prescient(
         "x_pv": v(m.x_pv),
         "E_bat_kWh": v(m.E_bat), # kWh
         "P_bat_max_kW": v(m.P_bat_max), # kW
-        "PV_base_peak_kW": PV_base_peak, # kW
         "series": {
             "P_net_kW":   np.array([v(m.P_net[t])  for t in m.T]), # kW
             "P_ch_kW":    np.array([v(m.P_ch[t])   for t in m.T]), # kW

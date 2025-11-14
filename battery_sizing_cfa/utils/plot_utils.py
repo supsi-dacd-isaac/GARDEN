@@ -36,9 +36,7 @@ def plot_results(x_pv, E_bat_kWh, P_battery, SOC_kWh, PV_base, L, price):
     return fig
 
 def plot_rbc_vs_mpc_diagnostics(x_test, results, series, billing_peak_period_str, sizing_method):
-    p_grid_rbc = results['profiles']['rbc']
-    p_grid_mpc =  results['profiles']['mpc']
-    p_grid_mpc_opt = results['profiles']['mpc_opt']
+
     target_name = results['target_name']
 
     fig, ax = plt.subplots(6, 1, figsize=(12, 8), layout='constrained')
@@ -75,6 +73,13 @@ def plot_rbc_vs_mpc_diagnostics(x_test, results, series, billing_peak_period_str
     plt.savefig("battery_sizing_cfa/figs/rbc_vs_mpc_daily_maxima_{}_{}_billed_{}.pdf".format(series, sizing_method, billing_peak_period_str))
     plt.close('all')
 
+
+    # compute daily costs
+    profiles = pd.DataFrame(results['profiles'], index=x_test.index)
+    df_costs = pd.DataFrame({p:np.maximum(profiles[p], 0)*x_test['import_price_profile'] -np.maximum(-profiles[p], 0)*x_test['export_price_profile'] for p in profiles.columns})
+    daily_costs = df_costs.groupby(df_costs.index.date).sum()/1000
+    sns.boxenplot(daily_costs)
+    plt.show()
 
 
 def extract_day_max_quantiles_over_meters(results, normalize_quantiles=True, normalize_with_key="mpc_opt", specs=None):

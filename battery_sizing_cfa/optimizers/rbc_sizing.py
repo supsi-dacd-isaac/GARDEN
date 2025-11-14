@@ -1,10 +1,10 @@
 import numpy as np
 from battery_sizing_cfa.cost_functions.lcoe import lcoe_from_results
-from battery_sizing_cfa.cost_functions.peak_shaving import peak_shaving_cost_from_results, day_max_cost_from_results, daily_maxima
+from battery_sizing_cfa.cost_functions.peak_shaving import peak_shaving_cost_from_results, day_max_cost_from_results, daily_maxima, daily_mean
 from battery_sizing_cfa.cost_functions.utils import block_nes_grad_with_h_parallel, build_block_basis, cvar_from_daily_losses, cvar_weighted_mean, frac_rolling_quantile
 import pandas as pd
 from copy import copy
-from battery_sizing_cfa.optimizers.parametric_rbc import rbc, rbc_thresholds
+from battery_sizing_cfa.optimizers.parametric_rbc import rbc, rbc_thresholds, rbc_thresholds_dyn_price
 from scipy.optimize import differential_evolution
 
 from battery_sizing_cfa.utils.fun_utils import rolling_inverted_quantile_np
@@ -66,7 +66,12 @@ def optimize_lcoe_rbc(sampled_pars, L, PV_base, price, export_price, specs, h=No
     # Calculate LCOE for the simulation results
     peak_period_steps = specs_temp.get('peak_period_steps', 24)
     L_eff = L - sampled_pars['pv_level'] * PV_base
-    soc_sim, p_batt_sim, p_grid_sim = rbc_peak_shaving(sampled_pars, L_eff, price, specs_temp, return_adv=False, h=h, return_ts=True)
+    if specs['tariff_scheme'] == 'peak_shaving':
+        soc_sim, p_batt_sim, p_grid_sim = rbc_peak_shaving(sampled_pars, L_eff, price, specs_temp, return_adv=False, h=h, return_ts=True)
+    elif specs['tariff_scheme'] == 'dynamic_pricing':
+        soc_sim, p_batt_sim, p_grid_sim = rbc_dyn_price(sampled_pars, L_eff, price, specs_temp, return_adv=False, h=h, return_ts=True)
+    else:
+        raise ValueError("Unknown tariff_scheme: {}".format(specs['tariff_scheme']))
     P_bat_max_kW = sampled_pars['E_bat_kWh'] * specs_temp['energy_ratio']
     lcoe_simulation = lcoe_from_results(
       L=L,
@@ -169,6 +174,86 @@ def rbc_peak_shaving(sampled_pars, L, price, specs, return_adv=False, h=None, re
         return peak_cost
 
 
+
+def rbc_dyn_price(sampled_pars, L, price, specs, return_adv=False, h=None, return_ts=False, stratified_cvar=True):
+    lower_threshold = frac_rolling_quantile(L, W_star=sampled_pars['n_hours'], q=sampled_pars['lower_q'])
+    upper_threshold = frac_rolling_quantile(L*price, W_star=sampled_pars['n_hours'], q=sampled_pars['higher_q'])
+
+    p_battery = specs.get('E_bat_kWh', 1.0) * specs.get('energy_ratio', 1.0)
+    soc, p_batt, p_grid = rbc_thresholds_dyn_price(L,  # array [T], + = net consumption, - = net production (surplus)
+                                         price,  # array [T] of 0/1 (unused here, kept for signature compatibility)
+                                         capacity_kwh=specs.get('E_bat_kWh', 1.0),  # usable capacity [kWh]
+                                         soc_start=specs.get('soc_start', 0.5),  # initial SOC in [0,1]
+                                         soc_min=specs.get('soc_min', 0.1),  # hard minimum SOC (never go below)
+                                         soc_max=specs.get('soc_max', 0.99),  # hard maximum SOC (never exceed)
+                                         p_charge_max=p_battery,  # max charge power [kW]
+                                         p_discharge_max=p_battery,  # max discharge power [kW]
+                                         eta_ch=specs.get('eta_ch', 0.99),  # charging efficiency
+                                         eta_dis=specs.get('eta_dis', 0.99),  # discharging efficiency
+                                         dt_hours=1.0,  # time step [h]
+                                         noise_level=0,
+                                         lower_threshold=lower_threshold,
+                                         upper_threshold=upper_threshold)
+
+    if specs.get('alpha_cvar', 0.9)>0:
+        cost_t = np.maximum(L, 0) * price
+        cost = np.mean(np.sort(cost_t)[-np.maximum(int(len(cost_t) * (1 - specs.get('alpha_cvar', 0.9))), 1):])
+        #p_max_daily = daily_maxima(price, h)
+        #d_losses = daily_mean(cost_t*(price == max(price)), h)
+        #cost = np.sort(d_losses)[-np.maximum(int(len(d_losses) * (1 - specs.get('alpha_cvar', 0.9))), 1):]
+        #cost = np.mean(cost)
+
+        # if stratified_cvar:
+        #     # stratified CVaR: compute CVaR per month, then average
+        #     d_losses = daily_mean(L[price==max(price)]*max(price), h)
+        #     worst_days = []
+        #     for m in np.arange(0, len(d_losses), 30):
+        #         month_worst_k = np.sort(d_losses[m:m + 30])[
+        #         -np.maximum(int(30 * (1 - specs.get('alpha_cvar', 0.9))), 1):]
+        #         worst_days.append(month_worst_k)
+        #     peak_cost = np.mean(np.concatenate(worst_days))
+        # else:
+        #     d_losses = daily_mean(p_grid - pd.Series(p_grid).rolling(24 * 7, min_periods=1).mean().values, h)
+        #     peak_cost = np.mean(
+        #         np.sort(d_losses)[-np.maximum(int(len(d_losses) * (1 - specs.get('alpha_cvar', 0.9))), 1):])
+
+        if False:
+            import matplotlib.pyplot as plt
+            d_maxima = pd.Series(p_grid).groupby(np.arange(len(p_grid)) // 24).max()
+            max_locations = d_maxima.index * 24 + d_maxima.index.map(
+                lambda x: pd.Series(p_grid)[x * 24:(x + 1) * 24].idxmax() % 24)
+            # plot the 10% worst peaks
+            worse_indexes = np.argsort(d_maxima)[-int(0.1 * len(d_maxima)):]
+
+
+            p_grid_norm = pd.Series(p_grid_norm)
+            d_maxima = p_grid_norm.groupby(np.arange(len(p_grid_norm))//24).max()
+            max_locations_norm = d_maxima.index * 24 + d_maxima.index.map(lambda x: p_grid_norm[x*24:(x+1)*24].idxmax()%24)
+            # plot the 10% worst peaks
+            worse_indexes_norm = np.argsort(d_maxima)[-int(0.1*len(d_maxima)):]
+
+
+            fig, ax = plt.subplots(1, 1, figsize=(10, 5), sharex=True)
+            ax.plot(pd.Series(p_grid))
+            ax.scatter(max_locations_norm[worse_indexes_norm], pd.Series(p_grid)[max_locations].values[worse_indexes_norm], color='red',
+                          label='Daily Maxima', s=20, marker='*')
+            ax.scatter(max_locations[worse_indexes], pd.Series(p_grid)[max_locations].values[worse_indexes], color='green',
+                          label='Daily Maxima', s=20, marker='o', alpha=0.3)
+            plt.show()
+
+    else:
+        cost = np.mean(daily_maxima(p_grid,h))
+
+    if specs.get('adversarial_perturbation', False):
+        adversarial_budget = specs.get('adversarial_budget', 10)
+        L_adv = L.copy()
+
+    if return_ts:
+        return soc, p_batt, p_grid
+    if return_adv:
+        return cost, L_adv
+    else:
+        return cost
 
 
 def nes_grad_orthogonal(f, x, sigma=0.3, m=128, seed=0):

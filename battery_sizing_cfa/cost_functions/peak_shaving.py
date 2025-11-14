@@ -12,6 +12,14 @@ def daily_maxima(L, h=None):
     out = daily_maxima_1d(L, day_id, n_days=int(day_id.max() + 1))
     return out
 
+def daily_mean(L, h=None):
+    #day_id = np.cumsum(np.diff(h, prepend=h[0]) < 0)  # or your own day labels
+    #out = np.full(day_id.max() + 1, -np.inf)
+    #np.maximum.at(out, day_id, L)
+    day_id, _ = make_day_id(h)
+    out = daily_mean_1d(L, day_id, n_days=int(day_id.max() + 1))
+    return out
+
 def day_max_cost_from_results(L, h=None):
     daily_max = daily_maxima(L, h)
     return np.nanmean(daily_max)
@@ -35,6 +43,18 @@ def daily_maxima_1d(L, day_id, n_days):
     """
     out = np.full(n_days, -np.inf, dtype=float)
     np.maximum.at(out, day_id, L)
+    return out
+
+def daily_mean_1d(L, day_id, n_days):
+    """
+    L: (T,) series
+    day_id: (T,) labels in [0..n_days-1]
+    """
+    out = np.bincount(day_id, weights=L, minlength=n_days)  # sum per day
+    counts = np.bincount(day_id, minlength=n_days)          # count per day
+    with np.errstate(divide='ignore', invalid='ignore'):
+        out = out / counts
+    out[counts == 0] = np.nan  # handle days with no data
     return out
 
 def daily_max_sum_1d(L, day_id, n_days):
