@@ -85,7 +85,17 @@ def peak_shaving_solver(T, eta_ch=0.95, eta_dis=0.9, E_max=10.0, E_min=0.0, P_ma
 
     # Problem
     prob = cp.Problem(objective, constraints)
-    return prob
+    params = {
+        'p_load': p_load,
+        'E_init': E_init,
+    }
+    vars = {
+        'p_pos': p_pos,
+        'p_neg': p_neg,
+        'E': E,
+    }
+
+    return prob, params, vars
 
 def mpc_peak_shaving(p_load_forecasts, eta_ch=0.95, eta_dis=0.9, E_max=10.0, E_min=0.0, P_max=5.0, E_init=5.0):
     """
@@ -114,7 +124,7 @@ def mpc_peak_shaving(p_load_forecasts, eta_ch=0.95, eta_dis=0.9, E_max=10.0, E_m
     E_current = E_init
     total_objective = 0.0
 
-    solver = peak_shaving_solver(H, eta_ch, eta_dis, E_max, E_min, P_max)
+    solver, params, vars = peak_shaving_solver(H, eta_ch, eta_dis, E_max, E_min, P_max)
 
     for t in tqdm(range(T)):
         # Extract the load and PV profiles for the horizon
@@ -122,17 +132,17 @@ def mpc_peak_shaving(p_load_forecasts, eta_ch=0.95, eta_dis=0.9, E_max=10.0, E_m
         p_pv_horizon = np.zeros(H)  # Assuming no PV for peak shaving
 
         #set solver parameters
-        solver.parameters()[0].value = p_load_horizon - p_pv_horizon
-        solver.parameters()[1].value = E_current
+        params['p_load'].value = p_load_horizon - p_pv_horizon
+        params['E_init'].value = E_current
 
 
         # Solve
         result = solver.solve(solver=cp.GUROBI, verbose=False, warm_start=True)
-        p_batt_pos = solver.variables()[0].value
-        p_batt_neg = solver.variables()[1].value
+        p_batt_pos = vars['p_pos'].value
+        p_batt_neg = vars['p_neg'].value
         p_batt = p_batt_pos - p_batt_neg
 
-        E = solver.variables()[2].value
+        E = vars['E'].value
 
         # # Optimize over the horizon
         # result = optimize_peak_shaving(
@@ -149,7 +159,6 @@ def mpc_peak_shaving(p_load_forecasts, eta_ch=0.95, eta_dis=0.9, E_max=10.0, E_m
         total_objective += result  # Accumulate objective
 
     return {
-        "p_grid": p_load_forecasts[:,0] + p_batt_profile,
         "p_batt": p_batt_profile,
         "E": E_profile,
         "objective": total_objective,

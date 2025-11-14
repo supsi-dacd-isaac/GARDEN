@@ -15,6 +15,7 @@ from battery_sizing_cfa.optimizers.peak_shaver import mpc_peak_shaving
 from battery_sizing_cfa.cost_functions.peak_shaving import daily_maxima, day_max_cost_from_results
 from battery_sizing_cfa.utils.plot_utils import plot_rbc_vs_mpc_diagnostics, analyze_results_mpc_vs_rbc
 import concurrent.futures
+from copy import deepcopy
 
 def build_covariates(df, H):
     """Build covariates DataFrame from datetime index."""
@@ -44,13 +45,14 @@ def train_test_split(df, train_ratio=0.8):
     return df_train, df_test
 
 def get_forecasts(df, H=24, train_ratio=0.2):
-    x, y = build_covariates(df, H=H)
-    x_train, x_test = train_test_split(x, train_ratio=train_ratio)
-    y_train, y_test = train_test_split(y, train_ratio=train_ratio)
-    m = LGBMRegressor(n_estimators=100, learning_rate=0.1, force_row_wise=True,verbose=-1, n_jobs=1)
+    x, y = build_covariates(df.copy(), H=H)
+    x_train, x_test = train_test_split(x.copy(), train_ratio=train_ratio)
+    y_train, y_test = train_test_split(y.copy(), train_ratio=train_ratio)
+
     preds = [y_test.iloc[:, 0].values.ravel()]  # first step is just the true value shifted
     preds_tr = [y_train.iloc[:, 0].values.ravel()]
     for step in range(1, H):
+        m = LGBMRegressor(n_estimators=100, learning_rate=0.1, force_row_wise=True, verbose=-1, n_jobs=1)
         m.fit(x_train, y_train.values[:, step])
         preds.append(m.predict(x_test))
         preds_tr.append(m.predict(x_train))
@@ -192,9 +194,9 @@ def optimize_policy_and_run(df_tr, df_te, y_hat_te, specs, control='rbc'):
         res_mpc = mpc_peak_shaving(y_hat_te, eta_ch=specs['eta_ch'], eta_dis=specs['eta_dis'],
                                                E_max=specs.get('E_bat_kWh', 1.0), E_min=0.0,
                                                P_max=p_battery, E_init=e_init)
-        p_grid = res_mpc['p_grid']
-
-    return p_grid
+        p_grid = L_te + res_mpc['p_batt']
+        soc = res_mpc['E'] / specs.get('E_bat_kWh', 1.0)
+    return p_grid, soc
 
 
 def compare_methods(df, sizing_method='prescient', specs=None, target_name='p_load', H=24, train_ratio=0.8, series=0, billing_peak_period_str=None):
@@ -242,7 +244,7 @@ def compare_methods(df, sizing_method='prescient', specs=None, target_name='p_lo
         ut_all = frac_rolling_quantile(L_all, W_star=n_hours, q=higher_q)
         upper_threshold = ut_all[-len(L_te):]
 
-        soc, p_batt, p_grid_rbc = rbc_thresholds(
+        soc_rbc, p_batt, p_grid_rbc = rbc_thresholds(
             L_te,  # net consumption array
             L_te * 0,  # placeholder PV flag (kept for signature)
             capacity_kwh=specs.get('E_bat_kWh', 1.0),
@@ -260,21 +262,21 @@ def compare_methods(df, sizing_method='prescient', specs=None, target_name='p_lo
         )
     else:
         print('rbc policy tuning on {} days and testing on {} days...'.format(len(L_tr)//24, len(L_te)//24))
-        p_grid_rbc = optimize_policy_and_run(x_train, x_test, y_hat_te, specs, control='rbc')
+        p_grid_rbc, soc_rbc = optimize_policy_and_run(x_train, x_test, y_hat_te, deepcopy(specs), control='rbc')
 
     print('rbc policy tuning on {} days and testing on {} days...'.format(len(L_tr)//24, len(L_te)//24))
-    p_grid_rbc_adv = optimize_policy_and_run(x_train, x_test, y_hat_te, specs, control='rbc_adv')
+    p_grid_rbc_adv, soc_rbc_adv = optimize_policy_and_run(x_train, x_test, y_hat_te, deepcopy(specs), control='rbc_adv')
 
     # run MPC on test set
     print('mpc policy testing...')
-    p_grid_mpc = optimize_policy_and_run(x_train, x_test, y_hat_te, specs, control='mpc')
+    p_grid_mpc, soc_mpc = optimize_policy_and_run(x_train, x_test, y_hat_te, deepcopy(specs), control='mpc')
 
 
     # run MPC with perfect forecasts on test set
     print('mpc policy testing with perfect forecasts...')
     #noise =  np.random.randn(y_perfect_te.shape[0]+y_perfect_te.shape[1]-1, 1) * 0.01
     #hankel_noise = np.vstack([noise[i:i+H, 0] for i in range(noise.shape[0]-H+1)])
-    p_grid_mpc_opt = optimize_policy_and_run(x_train, x_test, y_perfect_te, specs, control='mpc')
+    p_grid_mpc_opt, soc_mpc_opt = optimize_policy_and_run(x_train, x_test, y_perfect_te, deepcopy(specs), control='mpc')
 
     results = {
         'lcoe_sizing': lcoe_sizing,
@@ -287,6 +289,13 @@ def compare_methods(df, sizing_method='prescient', specs=None, target_name='p_lo
             'mpc': p_grid_mpc,
             'mpc_opt': p_grid_mpc_opt,
             'no_battery': x_test.loc[:, target_name].values + x_pv * PV_base_te
+        },
+        'profiles_soc': {
+            'rbc': soc_rbc,
+            'rbc_adv': soc_rbc_adv,
+            'mpc': soc_mpc,
+            'mpc_opt': soc_mpc_opt,
+            'no_battery': soc_mpc_opt*0
         },
         'E_bat_kWh': E_bat_kWh,
         'P_bat_max_kW': P_bat_max_kW,
@@ -340,13 +349,11 @@ def compare_methods(df, sizing_method='prescient', specs=None, target_name='p_lo
 
 hours_prescient_sizing = 24*30
 train_ratio = 0.5
-
 specs = {'eta_ch': 0.97,
          'eta_dis': 0.97,
          'soc_min':0,
          'soc_max':1,
          'soc_start':0.2,
-         'peak_tariff_per_MW_period':5750/30,
          'energy_ratio': 1.0,
          'peak_period_steps':24,
          'c_PV_kw':200,
@@ -359,7 +366,6 @@ specs = {'eta_ch': 0.97,
          'lifetime_years':15.0,
          'billing_peak_period_str':'daily',
          'sizing_method':'prescient',
-         'import_price_static':200,
          'export_price_static':50,
          'installation_fixed_costs':1000
          }
@@ -411,6 +417,21 @@ data = pd.read_pickle("battery_sizing_cfa/datasets/portugal/portugal.pk")
 # take into account the data was wrongly scaled before
 data = data / 4.0 # BEWARE! THIS IS SUPER SPECIFIC TO THE PORTUGAL DATASET!!!
 
+
+# Compute monthly peak tariff as: take half of the grid tariff and distribute it over the monthly peaks
+grid_energy_tariff = 0.07
+current_monthly_peak_tariff = 5.750 # CHF/kW/month
+k_factor = 0.5
+tot_peak_kw = data.loc[data.index.year==2014].groupby(data.index.month[data.index.year==2014]).max().sum().sum()
+tot_energy_kwh = data.loc[data.index.year==2014].sum().sum()
+monthly_peak_tariff = (current_monthly_peak_tariff + tot_energy_kwh * grid_energy_tariff * k_factor / tot_peak_kw) * 1000
+
+import_price_static = 200
+import_discount_static = import_price_static - k_factor*grid_energy_tariff*1000
+
+specs.update({'import_price_static':import_discount_static})
+
+
 #specs.update({'peak_period_steps':24})
 #run(data, n_profiles=100, sizing_method='prescient', specs=specs, train_ratio=train_ratio)
 #plt.show()
@@ -419,7 +440,7 @@ data = data / 4.0 # BEWARE! THIS IS SUPER SPECIFIC TO THE PORTUGAL DATASET!!!
 
 
 specs.update({'peak_period_steps':24*30,
-              'peak_tariff_per_MW_period':5750,
+              'peak_tariff_per_MW_period':monthly_peak_tariff,
               'replicate_periods': int(np.floor(24*365/(hours_prescient_sizing))),
               #'replicate_periods': int(np.ceil(24*365/(24*365 * train_ratio))),
               'billing_peak_period_str':'monthly'})
@@ -429,7 +450,7 @@ plt.show()
 # Then, run with monthly peak periods, use RBC sizing
 specs['sizing_method'] = 'rbc_peak_shaving'
 specs.update({'peak_period_steps':24*30,
-              'peak_tariff_per_MW_period':5750,
+              'peak_tariff_per_MW_period':monthly_peak_tariff,
               #'replicate_periods': int(np.ceil(24*365/(hours_prescient_sizing)))})
               'replicate_periods': int(np.floor(24*365/(24*365 * train_ratio))),
               'billing_peak_period_str':'monthly'})

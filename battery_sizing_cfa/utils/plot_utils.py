@@ -42,15 +42,20 @@ def plot_rbc_vs_mpc_diagnostics(x_test, results, series, billing_peak_period_str
     target_name = results['target_name']
 
     fig, ax = plt.subplots(6, 1, figsize=(12, 8), layout='constrained')
+
     w_len = len(x_test)//6
     # retrieve standard color map
     colors = plt.get_cmap('tab10')
     for i, a in enumerate(ax.ravel()):
+        # add another twin axes for SOC
+        a_right = a.twinx()
         w = np.arange(w_len) + i * w_len
         a.spines['top'].set_visible(False)
         a.spines['right'].set_visible(False)
         a.plot(x_test.index.values[w], x_test.iloc[w][target_name].values, label='Load', alpha=1, linewidth=0.5, color=colors(0))
         for j, k in enumerate(results['profiles'].keys()):
+            a_right.plot(x_test.index.values[w], results['profiles_soc'][k][w], label=k, alpha=1, linewidth=0.5,
+                   color=colors(j + 1), linestyle='--')
             a.plot(x_test.index.values[w], results['profiles'][k][w], label=k, alpha=1, linewidth=0.5, color=colors(j+1))
         a.set_ylabel('Power')
         a.legend(fontsize='small', loc='upper right', ncol=2)
