@@ -166,7 +166,7 @@ def analyze_lcoes(results, specs):
         lambda row: row['lcoe_value'] / sizing_map[row['series']], axis=1
     )
 
-    sns.boxenplot(data=norm_data, x='controller', y='lcoe_value', hue='controller', ax=ax2, showfliers=True, palette=palette)
+    sns.boxenplot(data=norm_data, x='controller', y='lcoe_value', hue='controller', ax=ax2, showfliers=False, palette=palette)
     ax2.set_title('Norm. with LCOE BaU', fontweight='bold')
     ax2.set_ylabel('LCOE Ratio')
     #ax2.set_ylim(0.5, 1.2)
@@ -233,10 +233,50 @@ def ts_plots(results, specs):
     ax[1].set_ylabel('Normalized P (-)')
     plt.savefig("battery_sizing_cfa/figs/moving_average_effect_on_peaks_{}_{}.pdf".format(specs['sizing_method'], specs['billing_peak_period_str']))
 
+
+def time_series_plots(results, n_series=5, n_max_steps=500):
+    from cycler import cycler
+
+    fig = plt.figure(figsize=(5, 7), layout="constrained")
+    gs = fig.add_gridspec(nrows=n_series+1, ncols=1, height_ratios=np.hstack([np.array(0.12), np.ones(n_series)]))  # top band for legend
+    ax_leg = fig.add_subplot(gs[0, 0])
+    ax = [fig.add_subplot(gs[i+1, 0]) for i in range(n_series)]
+
+    partial_res = [r for i, r in results.items() if i in np.arange(1, n_series*4, 4)]
+    df = pd.concat({i: pd.DataFrame(r['profiles']).iloc[:n_max_steps, :] for i, r in enumerate(partial_res)}, axis=1)
+    df_soc = pd.concat({i: pd.DataFrame(r['profiles_soc']).drop(columns='no_battery').iloc[:n_max_steps, :] for i, r in enumerate(partial_res)}, axis=1)
+    for i in range(n_series):
+        df[i].plot(ax=ax[i], linewidth=0.5, alpha=1, legend=i<1)
+        #ax[i].set_ylabel('P (kW)')
+        ax_soc = ax[i].twinx()
+        df_soc[i].plot(ax=ax_soc, linewidth=0.2, alpha=0.7, legend=False, linestyle='--')
+        # Remove gaps more effectively
+        if i < n_series - 1:
+            ax[i].set_xticks([])  # Better than set_xticklabels([])
+            ax[i].set_xlabel('')  # Remove x-label space
+
+    ax[0].legend_.remove()
+    # set xlims for all axes to 0, len(df)
+    for a in ax:
+        a.set_xlim(0, n_max_steps)
+    handles, labels = ax[0].get_legend_handles_labels()
+    ax_leg.axis("off")
+    ax_leg.legend(
+        handles, labels,
+        title='Controller', ncol=min(6, len(labels)),
+        loc='center', frameon=False,
+        fontsize='small', title_fontsize='small',
+        handlelength=1.0, handletextpad=0.4, columnspacing=0.8
+    )
+    fig.get_layout_engine().set(hspace=0, wspace=0, h_pad=0.01)
+    plt.savefig("battery_sizing_cfa/figs/opt_time_series_profiles_sample.pdf")
+
 def analyze_results_mpc_vs_rbc(res_path, specs):
     import pickle
     with open(res_path, 'rb') as f:
         results = pickle.load(f)
+
+    time_series_plots(results)
 
     day_max_quantiles_df =  extract_day_max_quantiles_over_meters(results, specs=specs, normalize_quantiles=True, normalize_with_key='mpc_opt')
     analyze_lcoes(results, specs)
@@ -384,11 +424,54 @@ if __name__ == "__main__":
         sns.despine(ax=a)
     plt.savefig("battery_sizing_cfa/figs/daily_max_quantiles_distribution_all_methods_split.pdf")
 
+    fig = plt.figure(figsize=(5, 4), layout="constrained")
+    gs = fig.add_gridspec(nrows=2, ncols=1, height_ratios=[0.12, 1])  # top band for legend
+
+    ax_leg = fig.add_subplot(gs[0])
+    ax1 = fig.add_subplot(gs[1])
+    axes = [ax1, ax2]
+
+    lower_quantiles = dmq_dfs_comb['quantile'].unique()[:3]
+    higher_quantiles = dmq_dfs_comb['quantile'].unique()[3:]
+
+    # --- First subplot ---
+    sns.boxenplot(
+        data=dmq_dfs_comb[dmq_dfs_comb['quantile'].isin(lower_quantiles)],
+        x='quantile', y='value', hue='quantile_third',
+        dodge=0.6, palette=palette, linewidth=1.2, width=0.8,
+        ax=ax1, showfliers=False
+    )
+    ax1.set_ylabel('Normalized peaks')
+    ax1.legend_.remove()
+    # --- One horizontal legend in its own axis ---
+    handles, labels = ax1.get_legend_handles_labels()
+    ax_leg.axis("off")
+    ax_leg.legend(
+        handles, labels,
+        title='Controller', ncol=min(6, len(labels)),
+        loc='center', frameon=False,
+        fontsize='small', title_fontsize='small',
+        handlelength=1.0, handletextpad=0.4, columnspacing=0.8
+    )
+
+    # Rotate x-ticks for BOTH subplots
+    for a in axes:
+        a.tick_params(axis='x', rotation=45)
+    import matplotlib.ticker as mticker
+
+    for a in axes:
+        a.yaxis.set_major_locator(mticker.MultipleLocator(0.1))  # tick every 0.05
+        a.yaxis.set_major_formatter(mticker.FormatStrFormatter('%.2f'))
+    # despine both subplots
+    for a in axes:
+        sns.despine(ax=a)
+    plt.savefig("battery_sizing_cfa/figs/daily_max_quantiles_distribution_all_methods_upper_only.pdf")
+
 
 
     sizing_df = pd.DataFrame(sizing)
     # boxenplot of sizing results
-    plt.figure(figsize=(6, 4), layout='constrained')
+    plt.figure(figsize=(4.2, 3), layout='constrained')
     sns.boxenplot(data=sizing_df, palette='Set2', linewidth=1.2)
     plt.ylabel('Battery Energy Capacity (kWh)')
     plt.title('Battery Sizing Comparison Across Methods')
