@@ -1,0 +1,786 @@
+
+! ################
+! COMMON INSTANCES - ENERGYPLUS VERSION
+! ################
+
+Version,
+  24.2;                                   !- Version Identifier
+
+! ################
+! COMMON INSTANCES - SIMULATION FEATURES
+! ################
+
+Timestep,
+  {{ timestep }};                         !- Number of Timesteps per Hour
+
+SimulationControl,
+  Yes,                                    !- Do Zone Sizing Calculation
+  Yes,                                    !- Do System Sizing Calculation
+  Yes,                                    !- Do Plant Sizing Calculation
+  No,                                     !- Run Simulation for Sizing Periods
+  Yes,                                    !- Run Simulation for Weather File Run Periods
+  No,                                     !- Do HVAC Sizing Simulation for Sizing Periods
+  1;                                      !- Maximum Number of HVAC Sizing Simulation Passes
+
+ConvergenceLimits,
+  2,                                      !- Minimum System Timestep {minutes}
+  25,                                     !- Maximum HVAC Iterations
+  {{ minIte }},                           !- Minimum Plant Iterations
+  {{ maxIte }};                           !- Maximum Plant Iterations
+
+HeatBalanceAlgorithm,
+  ConductionTransferFunction,             !- Algorithm
+  200;                                    !- Surface Temperature Upper Limit {C}
+
+RunPeriod,
+  DefaultRunPeriod,                       !- Name
+  1,                                      !- Begin Month
+  1,                                      !- Begin Day of Month
+  2006,                                   !- Begin Year
+  12,                                     !- End Month
+  31,                                     !- End Day of Month
+  2006,                                   !- End Year
+  Sunday,                                 !- Day of Week for Start Day
+  No,                                     !- Use Weather File Holidays and Special Days
+  No,                                     !- Use Weather File Daylight Saving Period
+  No,                                     !- Apply Weekend Holiday Rule
+  Yes,                                    !- Use Weather File Rain Indicators
+  Yes;                                    !- Use Weather File Snow Indicators
+
+ShadowCalculation,
+  PolygonClipping,                        !- Shading Calculation Method
+  Periodic,                               !- Shading Calculation Update Frequency Method
+  7,                                      !- Shading Calculation Update Frequency
+  15000,                                  !- Maximum Figures in Shadow Overlap Calculations
+  SutherlandHodgman,                      !- Polygon Clipping Algorithm
+  512,                                    !- Pixel Counting Resolution
+  SimpleSkyDiffuseModeling,               !- Sky Diffuse Modeling Algorithm
+  No,                                     !- Output External Shading Calculation Results
+  No,                                     !- Disable Self-Shading Within Shading Zone Groups
+  No;                                     !- Disable Self-Shading From Shading Zone Groups to Other Zones
+
+SurfaceConvectionAlgorithm:Inside,
+  TARP;                                   !- Algorithm
+
+SurfaceConvectionAlgorithm:Outside,
+  DOE-2;                                  !- Algorithm
+
+Sizing:Parameters,
+  {{ heating_sizing_factor }},            !- Heating Sizing Factor (1.35)
+  1.15;                                   !- Cooling Sizing Factor
+
+ZoneAirContaminantBalance,
+  No;                                     !- Carbon Dioxide Concentration
+
+ZoneAirHeatBalanceAlgorithm,
+  AnalyticalSolution,                     !- Algorithm
+  No,                                     !- Do Space Heat Balance for Sizing
+  No;                                     !- Do Space Heat Balance for Simulation
+
+GlobalGeometryRules,
+  UpperLeftCorner,                        !- Starting Vertex Position
+  Counterclockwise,                       !- Vertex Entry Direction
+  Relative,                               !- Coordinate System
+  Relative,                               !- Daylighting Reference Point Coordinate System
+  Relative;                               !- Rectangular Surface Coordinate System
+
+! ################
+! COMMON INSTANCES - BUILDING AND LOCATION FEATURES
+! ################
+
+Building,
+  Building,                               !- Name
+  {{ northAxis }},                        !- North Axis {deg}
+  ,                                       !- Terrain
+  0.04,                                   !- Loads Convergence Tolerance Value {W}
+  0.4,                                    !- Temperature Convergence Tolerance Value {deltaC}
+  FullExterior,                           !- Solar Distribution
+  25,                                     !- Maximum Number of Warmup Days
+  1;                                      !- Minimum Number of Warmup Days
+
+Site:Location,
+  Tesserete,                              !- Name
+  46.067,                                 !- Latitude {deg}
+  8.966,                                  !- Longitude {deg}
+  1,                                      !- Time Zone {hr}
+  529;                                    !- Elevation {m}
+
+SITE:GROUNDTEMPERATURE:BUILDINGSURFACE,
+    18,                       !- January Ground Temperature
+    18,                       !- February Ground Temperature
+    18,                       !- March Ground Temperature
+    18,                       !- April Ground Temperature
+    18,                       !- May Ground Temperature
+    18,                       !- June Ground Temperature
+    18,                       !- July Ground Temperature
+    18,                       !- August Ground Temperature
+    18,                       !- September Ground Temperature
+    18,                       !- October Ground Temperature
+    18,                       !- November Ground Temperature
+    18;                       !- December Ground Temperature
+
+SITE:GROUNDTEMPERATURE:FCFACTORMETHOD,
+    1.6,                      !- January Ground Temperature
+    0.7,                      !- February Ground Temperature
+    2.3,                      !- March Ground Temperature
+    4.8,                      !- April Ground Temperature
+    11.2,                     !- May Ground Temperature
+    16.2,                     !- June Ground Temperature
+    19.6,                     !- July Ground Temperature
+    20.6,                     !- August Ground Temperature
+    18.9,                     !- September Ground Temperature
+    15,                       !- October Ground Temperature
+    9.8,                      !- November Ground Temperature
+    5;                        !- December Ground Temperature
+
+SITE:GROUNDTEMPERATURE:SHALLOW,
+    14,                       !- January Surface Ground Temperature
+    14,                       !- February Surface Ground Temperature
+    14,                       !- March Surface Ground Temperature
+    14,                       !- April Surface Ground Temperature
+    14,                       !- May Surface Ground Temperature
+    14,                       !- June Surface Ground Temperature
+    14,                       !- July Surface Ground Temperature
+    14,                       !- August Surface Ground Temperature
+    14,                       !- September Surface Ground Temperature
+    14,                       !- October Surface Ground Temperature
+    14,                       !- November Surface Ground Temperature
+    14;                       !- December Surface Ground Temperature
+
+SITE:GROUNDTEMPERATURE:DEEP,
+    14,                       !- January Deep Ground Temperature
+    14,                       !- February Deep Ground Temperature
+    14,                       !- March Deep Ground Temperature
+    14,                       !- April Deep Ground Temperature
+    14,                       !- May Deep Ground Temperature
+    14,                       !- June Deep Ground Temperature
+    14,                       !- July Deep Ground Temperature
+    14,                       !- August Deep Ground Temperature
+    14,                       !- September Deep Ground Temperature
+    14,                       !- October Deep Ground Temperature
+    14,                       !- November Deep Ground Temperature
+    14;                       !- December Deep Ground Temperature
+
+! ################
+! COMMON INSTANCES - DESIGN DAYS
+! ################
+
+SizingPeriod:DesignDay,
+  Zuerich-Kloten Ann Clg .4% Condns DB=>MWB, !- Name
+  7,                                      !- Month
+  21,                                     !- Day of Month
+  SummerDesignDay,                        !- Day Type
+  30,                                     !- Maximum Dry-Bulb Temperature {C}
+  11,                                     !- Daily Dry-Bulb Temperature Range {deltaC}
+  DefaultMultipliers,                     !- Dry-Bulb Temperature Range Modifier Type
+  ,                                       !- Dry-Bulb Temperature Range Modifier Day Schedule Name
+  Wetbulb,                                !- Humidity Condition Type
+  19.9,                                   !- Wetbulb or DewPoint at Maximum Dry-Bulb {C}
+  ,                                       !- Humidity Condition Day Schedule Name
+  ,                                       !- Humidity Ratio at Maximum Dry-Bulb {kgWater/kgDryAir}
+  ,                                       !- Enthalpy at Maximum Dry-Bulb {J/kg}
+  ,                                       !- Daily Wet-Bulb Temperature Range {deltaC}
+  96196,                                  !- Barometric Pressure {Pa}
+  2.5,                                    !- Wind Speed {m/s}
+  240,                                    !- Wind Direction {deg}
+  No,                                     !- Rain Indicator
+  No,                                     !- Snow Indicator
+  No,                                     !- Daylight Saving Time Indicator
+  ASHRAETau,                              !- Solar Model Indicator
+  ,                                       !- Beam Solar Day Schedule Name
+  ,                                       !- Diffuse Solar Day Schedule Name
+  0.35,                                   !- ASHRAE Clear Sky Optical Depth for Beam Irradiance (taub) {dimensionless}
+  2.354,                                  !- ASHRAE Clear Sky Optical Depth for Diffuse Irradiance (taud) {dimensionless}
+  ,                                       !- Sky Clearness
+  ,                                       !- Maximum Number Warmup Days
+  FullResetAtBeginEnvironment;            !- Begin Environment Reset Mode
+
+SizingPeriod:DesignDay,
+  Zuerich-Kloten Ann Clg .4% Condns DP=>MDB, !- Name
+  7,                                      !- Month
+  21,                                     !- Day of Month
+  SummerDesignDay,                        !- Day Type
+  23.1,                                   !- Maximum Dry-Bulb Temperature {C}
+  11,                                     !- Daily Dry-Bulb Temperature Range {deltaC}
+  DefaultMultipliers,                     !- Dry-Bulb Temperature Range Modifier Type
+  ,                                       !- Dry-Bulb Temperature Range Modifier Day Schedule Name
+  Dewpoint,                               !- Humidity Condition Type
+  18.2,                                   !- Wetbulb or DewPoint at Maximum Dry-Bulb {C}
+  ,                                       !- Humidity Condition Day Schedule Name
+  ,                                       !- Humidity Ratio at Maximum Dry-Bulb {kgWater/kgDryAir}
+  ,                                       !- Enthalpy at Maximum Dry-Bulb {J/kg}
+  ,                                       !- Daily Wet-Bulb Temperature Range {deltaC}
+  96196,                                  !- Barometric Pressure {Pa}
+  2.5,                                    !- Wind Speed {m/s}
+  240,                                    !- Wind Direction {deg}
+  No,                                     !- Rain Indicator
+  No,                                     !- Snow Indicator
+  No,                                     !- Daylight Saving Time Indicator
+  ASHRAETau,                              !- Solar Model Indicator
+  ,                                       !- Beam Solar Day Schedule Name
+  ,                                       !- Diffuse Solar Day Schedule Name
+  0.35,                                   !- ASHRAE Clear Sky Optical Depth for Beam Irradiance (taub) {dimensionless}
+  2.354,                                  !- ASHRAE Clear Sky Optical Depth for Diffuse Irradiance (taud) {dimensionless}
+  ,                                       !- Sky Clearness
+  ,                                       !- Maximum Number Warmup Days
+  FullResetAtBeginEnvironment;            !- Begin Environment Reset Mode
+
+SizingPeriod:DesignDay,
+  Zuerich-Kloten Ann Clg .4% Condns Enth=>MDB, !- Name
+  7,                                      !- Month
+  21,                                     !- Day of Month
+  SummerDesignDay,                        !- Day Type
+  27.9,                                   !- Maximum Dry-Bulb Temperature {C}
+  11,                                     !- Daily Dry-Bulb Temperature Range {deltaC}
+  DefaultMultipliers,                     !- Dry-Bulb Temperature Range Modifier Type
+  ,                                       !- Dry-Bulb Temperature Range Modifier Day Schedule Name
+  Enthalpy,                               !- Humidity Condition Type
+  ,                                       !- Wetbulb or DewPoint at Maximum Dry-Bulb {C}
+  ,                                       !- Humidity Condition Day Schedule Name
+  ,                                       !- Humidity Ratio at Maximum Dry-Bulb {kgWater/kgDryAir}
+  61600,                                  !- Enthalpy at Maximum Dry-Bulb {J/kg}
+  ,                                       !- Daily Wet-Bulb Temperature Range {deltaC}
+  96196,                                  !- Barometric Pressure {Pa}
+  2.5,                                    !- Wind Speed {m/s}
+  240,                                    !- Wind Direction {deg}
+  No,                                     !- Rain Indicator
+  No,                                     !- Snow Indicator
+  No,                                     !- Daylight Saving Time Indicator
+  ASHRAETau,                              !- Solar Model Indicator
+  ,                                       !- Beam Solar Day Schedule Name
+  ,                                       !- Diffuse Solar Day Schedule Name
+  0.35,                                   !- ASHRAE Clear Sky Optical Depth for Beam Irradiance (taub) {dimensionless}
+  2.354,                                  !- ASHRAE Clear Sky Optical Depth for Diffuse Irradiance (taud) {dimensionless}
+  ,                                       !- Sky Clearness
+  ,                                       !- Maximum Number Warmup Days
+  FullResetAtBeginEnvironment;            !- Begin Environment Reset Mode
+
+SizingPeriod:DesignDay,
+  Zuerich-Kloten Ann Clg .4% Condns WB=>MDB, !- Name
+  7,                                      !- Month
+  21,                                     !- Day of Month
+  SummerDesignDay,                        !- Day Type
+  27.8,                                   !- Maximum Dry-Bulb Temperature {C}
+  11,                                     !- Daily Dry-Bulb Temperature Range {deltaC}
+  DefaultMultipliers,                     !- Dry-Bulb Temperature Range Modifier Type
+  ,                                       !- Dry-Bulb Temperature Range Modifier Day Schedule Name
+  Wetbulb,                                !- Humidity Condition Type
+  20.7,                                   !- Wetbulb or DewPoint at Maximum Dry-Bulb {C}
+  ,                                       !- Humidity Condition Day Schedule Name
+  ,                                       !- Humidity Ratio at Maximum Dry-Bulb {kgWater/kgDryAir}
+  ,                                       !- Enthalpy at Maximum Dry-Bulb {J/kg}
+  ,                                       !- Daily Wet-Bulb Temperature Range {deltaC}
+  96196,                                  !- Barometric Pressure {Pa}
+  2.5,                                    !- Wind Speed {m/s}
+  240,                                    !- Wind Direction {deg}
+  No,                                     !- Rain Indicator
+  No,                                     !- Snow Indicator
+  No,                                     !- Daylight Saving Time Indicator
+  ASHRAETau,                              !- Solar Model Indicator
+  ,                                       !- Beam Solar Day Schedule Name
+  ,                                       !- Diffuse Solar Day Schedule Name
+  0.35,                                   !- ASHRAE Clear Sky Optical Depth for Beam Irradiance (taub) {dimensionless}
+  2.354,                                  !- ASHRAE Clear Sky Optical Depth for Diffuse Irradiance (taud) {dimensionless}
+  ,                                       !- Sky Clearness
+  ,                                       !- Maximum Number Warmup Days
+  FullResetAtBeginEnvironment;            !- Begin Environment Reset Mode
+
+SizingPeriod:DesignDay,
+  Zuerich-Kloten Ann Htg 99.6% Condns DB, !- Name
+  1,                                      !- Month
+  21,                                     !- Day of Month
+  WinterDesignDay,                        !- Day Type
+  -9.2,                                   !- Maximum Dry-Bulb Temperature {C}
+  0,                                      !- Daily Dry-Bulb Temperature Range {deltaC}
+  DefaultMultipliers,                     !- Dry-Bulb Temperature Range Modifier Type
+  ,                                       !- Dry-Bulb Temperature Range Modifier Day Schedule Name
+  Wetbulb,                                !- Humidity Condition Type
+  -9.2,                                   !- Wetbulb or DewPoint at Maximum Dry-Bulb {C}
+  ,                                       !- Humidity Condition Day Schedule Name
+  ,                                       !- Humidity Ratio at Maximum Dry-Bulb {kgWater/kgDryAir}
+  ,                                       !- Enthalpy at Maximum Dry-Bulb {J/kg}
+  ,                                       !- Daily Wet-Bulb Temperature Range {deltaC}
+  96196,                                  !- Barometric Pressure {Pa}
+  1.9,                                    !- Wind Speed {m/s}
+  30,                                     !- Wind Direction {deg}
+  No,                                     !- Rain Indicator
+  No,                                     !- Snow Indicator
+  No,                                     !- Daylight Saving Time Indicator
+  ASHRAEClearSky,                         !- Solar Model Indicator
+  ,                                       !- Beam Solar Day Schedule Name
+  ,                                       !- Diffuse Solar Day Schedule Name
+  ,                                       !- ASHRAE Clear Sky Optical Depth for Beam Irradiance (taub) {dimensionless}
+  ,                                       !- ASHRAE Clear Sky Optical Depth for Diffuse Irradiance (taud) {dimensionless}
+  0,                                      !- Sky Clearness
+  ,                                       !- Maximum Number Warmup Days
+  FullResetAtBeginEnvironment;            !- Begin Environment Reset Mode
+
+SizingPeriod:DesignDay,
+  Zuerich-Kloten Ann Htg Wind 99.6% Condns WS=>MCDB, !- Name
+  1,                                      !- Month
+  21,                                     !- Day of Month
+  WinterDesignDay,                        !- Day Type
+  9,                                      !- Maximum Dry-Bulb Temperature {C}
+  0,                                      !- Daily Dry-Bulb Temperature Range {deltaC}
+  DefaultMultipliers,                     !- Dry-Bulb Temperature Range Modifier Type
+  ,                                       !- Dry-Bulb Temperature Range Modifier Day Schedule Name
+  Wetbulb,                                !- Humidity Condition Type
+  9,                                      !- Wetbulb or DewPoint at Maximum Dry-Bulb {C}
+  ,                                       !- Humidity Condition Day Schedule Name
+  ,                                       !- Humidity Ratio at Maximum Dry-Bulb {kgWater/kgDryAir}
+  ,                                       !- Enthalpy at Maximum Dry-Bulb {J/kg}
+  ,                                       !- Daily Wet-Bulb Temperature Range {deltaC}
+  96196,                                  !- Barometric Pressure {Pa}
+  11.1,                                   !- Wind Speed {m/s}
+  30,                                     !- Wind Direction {deg}
+  No,                                     !- Rain Indicator
+  No,                                     !- Snow Indicator
+  No,                                     !- Daylight Saving Time Indicator
+  ASHRAEClearSky,                         !- Solar Model Indicator
+  ,                                       !- Beam Solar Day Schedule Name
+  ,                                       !- Diffuse Solar Day Schedule Name
+  ,                                       !- ASHRAE Clear Sky Optical Depth for Beam Irradiance (taub) {dimensionless}
+  ,                                       !- ASHRAE Clear Sky Optical Depth for Diffuse Irradiance (taud) {dimensionless}
+  0,                                      !- Sky Clearness
+  ,                                       !- Maximum Number Warmup Days
+  FullResetAtBeginEnvironment;            !- Begin Environment Reset Mode
+
+SizingPeriod:DesignDay,
+  Zuerich-Kloten Ann Hum_n 99.6% Condns DP=>MCDB, !- Name
+  1,                                      !- Month
+  21,                                     !- Day of Month
+  WinterDesignDay,                        !- Day Type
+  -7.7,                                   !- Maximum Dry-Bulb Temperature {C}
+  0,                                      !- Daily Dry-Bulb Temperature Range {deltaC}
+  DefaultMultipliers,                     !- Dry-Bulb Temperature Range Modifier Type
+  ,                                       !- Dry-Bulb Temperature Range Modifier Day Schedule Name
+  Dewpoint,                               !- Humidity Condition Type
+  -12.1,                                  !- Wetbulb or DewPoint at Maximum Dry-Bulb {C}
+  ,                                       !- Humidity Condition Day Schedule Name
+  ,                                       !- Humidity Ratio at Maximum Dry-Bulb {kgWater/kgDryAir}
+  ,                                       !- Enthalpy at Maximum Dry-Bulb {J/kg}
+  ,                                       !- Daily Wet-Bulb Temperature Range {deltaC}
+  96196,                                  !- Barometric Pressure {Pa}
+  1.9,                                    !- Wind Speed {m/s}
+  30,                                     !- Wind Direction {deg}
+  No,                                     !- Rain Indicator
+  No,                                     !- Snow Indicator
+  No,                                     !- Daylight Saving Time Indicator
+  ASHRAEClearSky,                         !- Solar Model Indicator
+  ,                                       !- Beam Solar Day Schedule Name
+  ,                                       !- Diffuse Solar Day Schedule Name
+  ,                                       !- ASHRAE Clear Sky Optical Depth for Beam Irradiance (taub) {dimensionless}
+  ,                                       !- ASHRAE Clear Sky Optical Depth for Diffuse Irradiance (taud) {dimensionless}
+  0,                                      !- Sky Clearness
+  ,                                       !- Maximum Number Warmup Days
+  FullResetAtBeginEnvironment;            !- Begin Environment Reset Mode
+
+! ################
+! FLOOR N - INITIAL ZONE DEFINITION AND SIZING PARAMS 
+! ################
+
+{% for fl in TOTAL_FLOORS_LIST %} !- TOTAL_FLOORS_LIST created in 'idf_generator.py'
+
+Zone,
+  fl{{ fl }}_thz0,                       !- Name
+  0,                                      !- Direction of Relative North {deg}
+  0,                                      !- X Origin {m}
+  0,                                      !- Y Origin {m}
+  0,                                      !- Z Origin {m}
+  ,                                       !- Type
+  1,                                      !- Multiplier
+  ,                                       !- Ceiling Height {m}
+  ,                                       !- Volume {m3}
+  ,                                       !- Floor Area {m2}
+  ,                                       !- Zone Inside Convection Algorithm
+  ,                                       !- Zone Outside Convection Algorithm
+  Yes;                                    !- Part of Total Floor Area
+
+Space,
+  fl{{ fl }}_thz0 Space,                       !- Name
+  fl{{ fl }}_thz0,                             !- Zone Name
+  ,                                       !- Ceiling Height {m}
+  ,                                       !- Volume {m3}
+  ;                                       !- Floor Area {m2}
+
+Sizing:Zone,
+  fl{{ fl }}_thz0,                               !- Zone or ZoneList Name
+  SupplyAirTemperature,                   !- Zone Cooling Design Supply Air Temperature Input Method
+  14,                                     !- Zone Cooling Design Supply Air Temperature {C}
+  11.11,                                  !- Zone Cooling Design Supply Air Temperature Difference {deltaC}
+  SupplyAirTemperature,                   !- Zone Heating Design Supply Air Temperature Input Method
+  40,                                     !- Zone Heating Design Supply Air Temperature {C}
+  11.11,                                  !- Zone Heating Design Supply Air Temperature Difference {deltaC}
+  0.0085,                                 !- Zone Cooling Design Supply Air Humidity Ratio {kgWater/kgDryAir}
+  0.008,                                  !- Zone Heating Design Supply Air Humidity Ratio {kgWater/kgDryAir}
+  fl{{ fl }}_thz0 DSOA Space List,               !- Design Specification Outdoor Air Object Name
+  ,                                       !- Zone Heating Sizing Factor
+  ,                                       !- Zone Cooling Sizing Factor
+  DesignDay,                              !- Cooling Design Air Flow Method
+  0,                                      !- Cooling Design Air Flow Rate {m3/s}
+  0.000762,                               !- Cooling Minimum Air Flow per Zone Floor Area {m3/s-m2}
+  0,                                      !- Cooling Minimum Air Flow {m3/s}
+  0,                                      !- Cooling Minimum Air Flow Fraction
+  DesignDay,                              !- Heating Design Air Flow Method
+  0,                                      !- Heating Design Air Flow Rate {m3/s}
+  0.002032,                               !- Heating Maximum Air Flow per Zone Floor Area {m3/s-m2}
+  0.1415762,                              !- Heating Maximum Air Flow {m3/s}
+  0.3,                                    !- Heating Maximum Air Flow Fraction
+  ,                                       !- Design Specification Zone Air Distribution Object Name
+  No,                                     !- Account for Dedicated Outdoor Air System
+  ,                                       !- Dedicated Outdoor Air System Control Strategy
+  ,                                       !- Dedicated Outdoor Air Low Setpoint Temperature for Design {C}
+  ,                                       !- Dedicated Outdoor Air High Setpoint Temperature for Design {C}
+  Sensible Load Only No Latent Load,      !- Zone Load Sizing Method
+  HumidityRatioDifference,                !- Zone Latent Cooling Design Supply Air Humidity Ratio Input Method
+  ,                                       !- Zone Dehumidification Design Supply Air Humidity Ratio {kgWater/kgDryAir}
+  0.005,                                  !- Zone Cooling Design Supply Air Humidity Ratio Difference {kgWater/kgDryAir}
+  HumidityRatioDifference,                !- Zone Latent Heating Design Supply Air Humidity Ratio Input Method
+  ,                                       !- Zone Humidification Design Supply Air Humidity Ratio {kgWater/kgDryAir}
+  0.005,                                  !- Zone Humidification Design Supply Air Humidity Ratio Difference {kgWater/kgDryAir}
+  ,                                       !- Zone Humidistat Dehumidification Set Point Schedule Name
+  ,                                       !- Zone Humidistat Humidification Set Point Schedule Name
+  Coincident;                             !- Type of Space Sum to Use
+
+! ! FRESH AIR REQUIREMENTS (NOT SURE IF THIS IS REQUIRED FOR SIZING IN OUR MODEL)
+DesignSpecification:OutdoorAir:SpaceList,
+  fl{{ fl }}_thz0 DSOA Space List,               !- Name
+  fl{{ fl }}_thz0 Space,                         !- Space Name 1
+  outdoorair_fl{{ fl }}_thz0;        !- Space Design Specification Outdoor Air Object Name 1
+
+DesignSpecification:OutdoorAir, 
+  outdoorair_fl{{ fl }}_thz0,        !- Name
+  Sum,                                    !- Outdoor Air Method
+  0,                                      !- Outdoor Air Flow per Person {m3/s-person}
+  0.0003055556,                           !- Outdoor Air Flow per Zone Floor Area {m3/s-m2}
+  0,                                      !- Outdoor Air Flow per Zone {m3/s}
+  0;                                      !- Outdoor Air Flow Air Changes per Hour {1/hr}
+
+! ######
+! FLOOR N - CAPACITANCE MULTIPLIER (thermal inertia)
+! ######
+
+ZoneCapacitanceMultiplier:ResearchSpecial,
+  Zone Capacitance Multiplier Research Special fl{{ fl }}_thz0, !- Name
+  fl{{ fl }}_thz0,                                       !- Zone or ZoneList Name
+  {{ capacitanceMultiplier }},                                      !- Temperature Capacity Multiplier
+  ,                                       !- Humidity Capacity Multiplier
+  ,                                       !- Carbon Dioxide Capacity Multiplier
+  ;                                       !- Generic Contaminant Capacity Multiplier
+
+! ######
+! FLOOR N - GEOMETRY
+! ######
+
+  !- FLOOR surface -
+BuildingSurface:Detailed,
+  fl{{ fl }}_thz0_GroundFloor,            !- Name
+  Floor,                                  !- Surface Type
+  {% if fl==0 %}
+  Ground_construction_ground,                    !- Construction Name OJO!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+  {% else %}
+  Ground_construction,
+  {% endif %}
+  fl{{ fl }}_thz0,                        !- Zone Name
+  fl{{ fl }}_thz0 Space,                  !- Space Name
+  {% if fl==0 %}
+  Ground,                                 !- Outside Boundary Condition
+  ,                                       !- Outside Boundary Condition Object
+  {% else %}
+  Surface, !- Outside Boundary Condition
+  fl{{ fl-1 }}_thz0_Roof,                                       !- Outside Boundary Condition Object
+  {% endif %}
+  NoSun,                                  !- Sun Exposure
+  NoWind,                                 !- Wind Exposure
+  1,                                      !- View Factor to Ground
+  ,                                       !- Number of Vertices
+  {% if fl==0 %}
+  {{ side }}, {{ side }}, {{ (fl)*floorHeight }},
+  {{ side }}, 0, {{ (fl)*floorHeight }},
+  0, 0, {{ (fl)*floorHeight }},
+  0, {{ side }}, {{ (fl)*floorHeight }};
+  {% else %} !- if floor != 0 -> add a hole (in single-family houses)
+  {{ solid_side_ratio*side }}, {{ side }}, {{ (fl)*floorHeight }},
+  {{ solid_side_ratio*side }}, 0, {{ (fl)*floorHeight }},
+  0, 0, {{ (fl)*floorHeight }},
+  0, {{ side }}, {{ (fl)*floorHeight }};
+  {% endif %}
+
+  !- ROOF surface -
+BuildingSurface:Detailed,
+  fl{{ fl }}_thz0_Roof,                        !- Name
+  Roof,                                   !- Surface Type
+  {% if fl==TOTAL_FLOORS_LEN-1 %}
+  Roof_construction,                      !- Construction Name ## THIS MUST MATCH THE CONSTRUCTION DATABASE
+  {% else %}
+  Internal_ceiling,
+  {% endif %}
+  fl{{ fl }}_thz0,                             !- Zone Name
+  fl{{ fl }}_thz0 Space,                       !- Space Name
+  {% if fl==TOTAL_FLOORS_LEN-1 %}
+  Outdoors,                                 !- Outside Boundary Condition
+  ,                                       !- Outside Boundary Condition Object
+  SunExposed,                             !- Sun Exposure
+  WindExposed,                            !- Wind Exposure
+  {% else %}
+  Surface, !- Outside Boundary Condition
+  fl{{ fl+1 }}_thz0_GroundFloor,                                       !- Outside Boundary Condition Object
+  NoSun,                             !- Sun Exposure
+  NoWind,                            !- Wind Exposure
+  {% endif %}
+  0,                                      !- View Factor to Ground
+  ,                                       !- Number of Vertices
+  {% if fl==TOTAL_FLOORS_LEN-1 %}
+  {{ side }}, 0, {{ (fl+1)*floorHeight }},
+  {{ side }}, {{ side }}, {{ (fl+1)*floorHeight }},
+  0, {{ side }}, {{ (fl+1)*floorHeight }},
+  0, 0, {{ (fl+1)*floorHeight }};
+  {% else %}
+  {{ solid_side_ratio*side }}, 0, {{ (fl+1)*floorHeight }},
+  {{ solid_side_ratio*side }}, {{ side }}, {{ (fl+1)*floorHeight }},
+  0, {{ side }}, {{ (fl+1)*floorHeight }},
+  0, 0, {{ (fl+1)*floorHeight }};
+  {% endif %}  
+
+!- SOLAR COLLECTOR PANEL SURFACE AT THE TOP
+{% if fl==TOTAL_FLOORS_LEN-1 %}
+Shading:Site:Detailed,
+  solar_panels_surface_0,                   !- Name
+  ,                                       !- Transmittance Schedule Name
+  ,                                       !- Number of Vertices
+  0, 0, {{ (fl+1)*floorHeight }},              !- X,Y,Z Vertex 1 {m}
+  {{ width_panel }}, 0, {{ (fl+1)*floorHeight }},  !- X,Y,Z Vertex 2 {m}
+  {{ width_panel }}, {{ length_panel }}, {{ (fl+1)*floorHeight + height_panel }},  !- X,Y,Z Vertex 3 {m}
+  0, {{ length_panel }}, {{ (fl+1)*floorHeight + height_panel }};  !- X,Y,Z Vertex 4 {m}
+{% endif %}
+
+
+  !- 4 WALLS -
+{% set DIRECTIONS = [3,0,2,1] %} !- This order is to keep the façade (wall1) in the proper orientation
+{% for dir in DIRECTIONS %}
+BuildingSurface:Detailed,
+  fl{{ fl }}_thz0_Wall_{{ dir }},  !- Name
+  Wall,                    !- Surface Type
+  Wall_construction, !- Construction Name
+  fl{{ fl }}_thz0,                        !- Zone Name
+  fl{{ fl }}_thz0 Space,                  !- Space Name
+  {% if loop.index0 < ADIABATICWALLS %}
+  Adiabatic,                              !- Outside Boundary Condition
+  ,                                       !- Outside Boundary Condition Object
+  NoSun,                                  !- Sun Exposure
+  NoWind,                                 !- Wind Exposure
+  {% else %} 
+  Outdoors,                               !- Outside Boundary Condition
+  ,                                       !- Outside Boundary Condition Object
+  SunExposed,                             !- Sun Exposure
+  WindExposed,                            !- Wind Exposure
+  {% endif %}    
+  ,                                       !- View Factor to Ground
+  ,                                       !- Number of Vertices
+  {% if dir==0 %}
+  0, {{ side }}, {{ (fl+1)*floorHeight }},
+  0, {{ side }}, {{ (fl)*floorHeight }},
+  0, 0, {{ (fl)*floorHeight }},
+  0, 0, {{ (fl+1)*floorHeight }};
+  {% elif dir==1 %}
+  {{ side }}, {{ side }}, {{ (fl+1)*floorHeight }},
+  {{ side }}, {{ side }}, {{ (fl)*floorHeight }},
+  0, {{ side }}, {{ (fl)*floorHeight }},
+  0, {{ side }}, {{ (fl+1)*floorHeight }};
+  {% elif dir==2 %}
+  {{ side }}, 0, {{ (fl+1)*floorHeight }},
+  {{ side }}, 0, {{ (fl)*floorHeight }},
+  {{side }}, {{ side }}, {{ (fl)*floorHeight }},
+  {{ side }}, {{ side }}, {{ (fl+1)*floorHeight }};
+  {% else %}{# 3 #}
+  0, 0, {{ (fl+1)*floorHeight }},
+  0, 0, {{ (fl)*floorHeight }},
+  {{ side }}, 0, {{ (fl)*floorHeight }},
+  {{ side }}, 0, {{ (fl+1)*floorHeight }};
+  {% endif %}
+
+{% if loop.index0 < ADIABATICWALLS %}
+!- no windows in this wall
+!- no shadow control in this wall
+{% else %}
+
+FenestrationSurface:Detailed,
+  fl{{ fl }}_thz0_Wall_{{ dir }}_Win,    !- Name
+  Window,                                 !- Surface Type
+  Window_construction,                    !- Construction Name
+  fl{{ fl }}_thz0_Wall_{{ dir }},        !- Building Surface Name
+  ,                               !- Outside Boundary Condition 
+  ,                                       !- View Factor to Ground
+  Frame_construction,                     !- Frame and Divider Name
+  1,                                      !- Multiplier
+  ,                                       !- Number of Vertices
+  {% if dir==0 %}
+  0, {{ side - x_off }}, {{ (fl)*floorHeight + z_off + H_win }},
+  0, {{ side - x_off }}, {{ (fl)*floorHeight + z_off }},
+  0, {{ side - x_off - W_win }}, {{ (fl)*floorHeight + z_off }},
+  0, {{ side - x_off - W_win }}, {{ (fl)*floorHeight + z_off + H_win }};
+  {% elif dir==1 %}
+  {{ x_off + W_win }}, {{ side }}, {{ (fl)*floorHeight + z_off + H_win }},
+  {{ x_off + W_win }}, {{ side }}, {{ (fl)*floorHeight + z_off }},
+  {{ x_off }}, {{ side }}, {{ (fl)*floorHeight + z_off }},
+  {{ x_off }}, {{ side }}, {{ (fl)*floorHeight + z_off + H_win }};
+  {% elif dir==2 %}
+   {{ side }}, {{ x_off }}, {{ (fl)*floorHeight + z_off + H_win }},
+  {{ side }}, {{ x_off }}, {{ (fl)*floorHeight + z_off }},
+  {{ side }}, {{ x_off + W_win }}, {{ (fl)*floorHeight + z_off }},
+  {{ side }}, {{ x_off + W_win }}, {{ (fl)*floorHeight + z_off + H_win }};
+  {% else %}{# 3 #}
+  {{ side - x_off - W_win }}, 0, {{ (fl)*floorHeight + z_off + H_win }},
+  {{ side - x_off - W_win }}, 0, {{ (fl)*floorHeight + z_off }},
+  {{ side - x_off }}, 0, {{ (fl)*floorHeight + z_off }},
+  {{ side - x_off }}, 0, {{ (fl)*floorHeight + z_off + H_win }};
+
+  {% endif %} 
+  
+  WindowShadingControl,
+  shade_control_fl{{ fl }}_thz0_W{{ dir }},            !- Name
+  fl{{ fl }}_thz0,                             !- Zone Name
+  {{ dir + 1 }},                                      !- Shading Control Sequence Number
+  ExteriorShade,                          !- Shading Type
+  ,                                       !- Construction with Shading Name
+  OnIfHighSolarOnWindow,                  !- Shading Control Type
+  ,                                       !- Schedule Name
+  90,                                     !- Setpoint {W/m2, W or deg C}
+  No,                                     !- Shading Control Is Scheduled
+  No,                                     !- Glare Control Is Active
+  Shade0101,                              !- Shading Device Material Name
+  FixedSlatAngle,                         !- Type of Slat Angle Control for Blinds
+  ,                                       !- Slat Angle Schedule Name
+  ,                                       !- Setpoint 2 {W/m2, deg C or cd/m2}
+  ,                                       !- Daylighting Control Object Name
+  Sequential,                             !- Multiple Surface Control Type
+  fl{{ fl }}_thz0_Wall_{{ dir }}_Win;                  !- Fenestration Surface Name 1
+  
+  {% endif %}
+{% endfor %} !- END direction loop
+{% endfor %} !- END floor Loop
+
+! ######
+! FOR EACH FLOOR - LIGHTING DEMAND 
+! ######
+
+{{ lights }}
+
+! ######
+! FOR EACH FLOOR - PEOPLE ACTIVITY
+! ######
+
+{{ people }}
+
+! ######
+! FOR EACH FLOOR - APPLIANCES CONSUMPTION
+! ######
+
+{{ appliances }}
+
+! ######
+! FOR EACH FLOOR - INFILTRATION PARAMS
+! ######
+
+{{ infiltration }}
+
+! ######
+! FOR EACH FLOOR - FORCED VENTILATION PARAMS
+! ######
+
+{{ ventilation }}
+
+! ################
+! COMMON INSTANCES - SCHEDULE LIMITS (ENERGYPLUS REQUIREMENT)
+! ################
+
+{{ scheduleTypeLimits }}
+
+! ################
+! HVAC - ENERGY MANAGEMENT SYSTEM (HP/BOILER CONTROL AT 2 DIFFERENT TEMPERATURES)
+! ################
+
+{% if (IS_HEATPUMP_DHW and IS_HEATPUMP_SH) or (not IS_HEATPUMP_DHW and not IS_HEATPUMP_SH and shFuel == dhwFuel) %} ! IF HP IS NOT NEEDED FOR SH AND DHW OR THERE ARE 2 DIFFERENT BOILERS THERE'S NO NEED TO CONTROL OUTLET TEMPERATURES
+
+{{ ems }}
+
+{% else %}
+
+! no need of EMS as working with 1 water temperature is ok.
+
+{% endif %}
+
+! ################
+! HVAC - HP EFFICIENCY CURVES (COP AND HEATING CAPACITY)
+! ################
+
+{{ hp_curves }}
+
+! ################
+! HVAC - BOILER EFFICIENCY CURVES
+! ################
+
+{{ boiler_curves }}
+
+! ################
+! HVAC - THERMOSTAT CONTROL
+! ################
+
+{{ thermostat }}
+
+! ################
+! HVAC - LOOPS
+! ################
+
+{{ hvac }}
+
+! ################
+! MATERIALS AND CONSTRUCTIONS
+! ################
+
+{{ construction_floors_1918 }}
+{{ construction_floors_1918_1948 }}
+{{ construction_floors_1949_1980 }}
+{{ construction_floors_1981_1994 }}
+{{ construction_floors_1995_2000 }}
+{{ construction_floors_2001_2010 }}
+{{ construction_floors_2011 }}
+
+{{ construction_floors_radiant_1918 }}
+{{ construction_floors_radiant_1918_1948 }}
+{{ construction_floors_radiant_1949_1980 }}
+{{ construction_floors_radiant_1981_1994 }}
+{{ construction_floors_radiant_1995_2000 }}
+{{ construction_floors_radiant_2001_2010 }}
+{{ construction_floors_radiant_2011 }}
+
+{{ construction_roof_1918 }}
+{{ construction_roof_1918_1948 }}
+{{ construction_roof_1949_1980 }}
+{{ construction_roof_1981_1994 }}
+{{ construction_roof_1995_2000 }}
+{{ construction_roof_2001_2010 }}
+{{ construction_roof_2011 }}
+
+{{ construction_walls_1918 }}
+{{ construction_walls_1918_1948 }}
+{{ construction_walls_1949_1980 }}
+{{ construction_walls_1981_1994 }}
+{{ construction_walls_1995_2000 }}
+{{ construction_walls_2001_2010 }}
+{{ construction_walls_2011 }}
+
+{{ construction_windows_1918 }}
+{{ construction_windows_1918_1948 }}
+{{ construction_windows_1949_1980 }}
+{{ construction_windows_1981_1994 }}
+{{ construction_windows_1995_2000 }}
+{{ construction_windows_2001_2010 }}
+{{ construction_windows_2011 }}
+
+! ################
+! OUTPUTS
+! ################
+
+{{ outputs }}
+

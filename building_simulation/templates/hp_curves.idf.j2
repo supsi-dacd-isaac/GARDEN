@@ -1,0 +1,139 @@
+
+
+! ######
+! HVAC - HP CURVES
+! ######
+
+{% if IS_AEROTOP_G07_14M %}
+
+! ======================
+! MODEL: AEROTOP G07-14M
+! ======================
+
+Curve:Biquadratic,
+  HPWH EIR Func of Temp,        !- Name
+  0.002127962797405887,            !- C1
+  0.04551616724652642,                     !- C2 *X
+  0.00012666718102110353,                     !- C3 *X^2
+  -0.026550994253348035,           !- C4 *Y
+  0.0013872188501457088,            !- C5 *Y^2
+  -0.0011060410973828647,                     !- C6 *X*Y
+  35,                      !- Minimum Value of x (Load-side outlet)
+  55,                      !- Maximum Value of x (Load-side outlet)
+  -10,                     !- Minimum Value of y (Source-side inlet)
+  20,                      !- Maximum Value of y (Source-side inlet)
+  1.0,                     !- Minimum Curve Output (normalized)
+  3.9012398151,            !- Maximum Curve Output (normalized)
+  Temperature,             !- Input Unit Type for X
+  Temperature,             !- Input Unit Type for Y
+  Dimensionless;           !- Output Unit Type
+
+Curve:Biquadratic,
+  HPWH Heating Cap Func Temp,        !- Name
+  0.0015218659535927532,            !- C1
+  0.03254671514433575,                     !- C2 *X
+  -0.0003875976758410249,                     !- C3 *X^2
+  0.009908336611295615,            !- C4 *Y
+  0.0008053348336897272,            !- C5 *Y^2
+  -0.0002659291554312742,                     !- C6 *X*Y
+  35,                      !- Minimum Value of x (Load-side outlet)
+  55,                      !- Maximum Value of x (Load-side outlet)
+  -10,                     !- Minimum Value of y (Source-side inlet)
+  20,                      !- Maximum Value of y (Source-side inlet)
+  0.6122029422,            !- Minimum Curve Output (normalized)
+  1.0000052825,                     !- Maximum Curve Output (normalized)
+  Temperature,             !- Input Unit Type for X
+  Temperature,             !- Input Unit Type for Y
+  Dimensionless;           !- Output Unit Type
+
+!Curve:Quadratic,
+!  Part Load Frac Correlation,     !- Name
+!  1,                 !- Coefficient1 C1 (1+alpha)
+!  0,                !- Coefficient2 C2 (-2*alpha)
+!  0,                 !- Coefficient3 C3 (alpha)
+!  0.0,                  !- Minimum Value of x (PLR)
+!  1.0,                  !- Maximum Value of x (PLR)
+!  1.0,                  !- Minimum Curve Output
+!  1.0,                  !- Maximum Curve Output
+!  Dimensionless,        !- Input Unit Type for X
+!  Dimensionless;        !- Output Unit Type
+
+
+Curve:Quadratic,
+  Part Load Frac Correlation,   !- Name ! https://chatgpt.com/share/6901d55e-31e8-8003-bec6-9151f8c1644f
+  0.85,                       !- Coefficient1 C1  
+  0.15,                       !- Coefficient2 C2
+  0.00,                       !- Coefficient3 C3
+  0.0,                        !- Minimum Value of x (PLR)
+  1.0,                        !- Maximum Value of x (PLR)
+  0.0,                        !- Minimum Curve Output
+  1.0,                        !- Maximum Curve Output
+  Dimensionless,              !- Input Unit Type for X
+  Dimensionless;              !- Output Unit Type
+
+
+{% elif IS_AEROTOP_T35R %}
+
+Curve:Biquadratic,
+  HPWH EIR Func of Temp,        !- Name
+  0.0017678660,            !- C1
+  0.0378109474,                     !- C2 *X
+  -0.0001568785,                     !- C3 *X^2
+  0.0123090467,           !- C4 *Y
+  0.0007337876,            !- C5 *Y^2
+  -0.0010411991,                     !- C6 *X*Y
+  35,                      !- Minimum Value of x (Load-side outlet)
+  55,                      !- Maximum Value of x (Load-side outlet)
+  -7,                     !- Minimum Value of y (Source-side inlet)
+  7,                      !- Maximum Value of y (Source-side inlet)
+  1.0,                     !- Minimum Curve Output (normalized)
+  1.9574664265,            !- Maximum Curve Output (normalized)
+  Temperature,             !- Input Unit Type for X
+  Temperature,             !- Input Unit Type for Y
+  Dimensionless;           !- Output Unit Type
+
+Curve:Biquadratic,
+  HPWH Heating Cap Func Temp,        !- Name
+  0.0016186487,            !- C1
+  0.0346165064,                     !- C2 *X
+  -0.0004131676,                     !- C3 *X^2
+  0.0265296052,            !- C4 *Y
+  0.0024998568,            !- C5 *Y^2
+  -0.0000623115,                     !- C6 *X*Y
+  35,                      !- Minimum Value of x (Load-side outlet)
+  55,                      !- Maximum Value of x (Load-side outlet)
+  -7,                     !- Minimum Value of y (Source-side inlet)
+  7,                      !- Maximum Value of y (Source-side inlet)
+  0.6023316766,            !- Minimum Curve Output (normalized)
+  1.0167268691,                     !- Maximum Curve Output (normalized)
+  Temperature,             !- Input Unit Type for X
+  Temperature,             !- Input Unit Type for Y
+  Dimensionless;           !- Output Unit Type
+
+!Curve:Quadratic,
+!  Part Load Frac Correlation,     !- Name
+!  1,                 !- Coefficient1 C1 (1+alpha)
+!  0,                !- Coefficient2 C2 (-2*alpha)
+!  0,                 !- Coefficient3 C3 (alpha)
+!  0.0,                  !- Minimum Value of x (PLR)
+!  1.0,                  !- Maximum Value of x (PLR)
+!  1.0,                  !- Minimum Curve Output
+!  1.0,                  !- Maximum Curve Output
+!  Dimensionless,        !- Input Unit Type for X
+!  Dimensionless;        !- Output Unit Type
+
+Curve:Quadratic,
+  Part Load Frac Correlation,   !- Name
+  0.85,                       !- Coefficient1 C1  
+  0.15,                       !- Coefficient2 C2
+  0.00,                       !- Coefficient3 C3
+  0.0,                        !- Minimum Value of x (PLR)
+  1.0,                        !- Maximum Value of x (PLR)
+  0.0,                        !- Minimum Curve Output
+  1.0,                        !- Maximum Curve Output
+  Dimensionless,              !- Input Unit Type for X
+  Dimensionless;              !- Output Unit Type
+
+{% endif %}
+
+!-END CURVES

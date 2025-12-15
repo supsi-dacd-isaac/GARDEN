@@ -1,0 +1,38 @@
+MATERIAL,
+    Wa2_L1,    !- Name
+    Rough,                    !- Roughness
+    0.015,                    !- Thickness
+    0.87,                     !- Conductivity
+    2085,                     !- Density
+    840,                      !- Specific Heat
+    0.9,                      !- Thermal Absorptance
+    0.6,                      !- Solar Absorptance
+    0.6;                      !- Visible Absorptance
+
+MATERIAL,
+    Wa2_L2,    !- Name
+    Rough,                    !- Roughness
+    0.24,                     !- Thickness
+    0.13,                     !- Conductivity
+    500,                      !- Density
+    840,                      !- Specific Heat
+    0.9,                      !- Thermal Absorptance
+    0.6,                      !- Solar Absorptance
+    0.6;                      !- Visible Absorptance
+
+MATERIAL,
+    Wa2_L3,    !- Name
+    Rough,                    !- Roughness
+    0.005,                    !- Thickness
+    0.7,                      !- Conductivity
+    1100,                     !- Density
+    900,                      !- Specific Heat
+    0.9,                      !- Thermal Absorptance
+    0.6,                      !- Solar Absorptance
+    0.6;                      !- Visible Absorptance
+
+CONSTRUCTION,
+    Wall_construction,    !- Name
+    Wa2_L1,    !- Outside Layer
+    Wa2_L2,    !- Layer 2
+    Wa2_L3;    !- Layer 3

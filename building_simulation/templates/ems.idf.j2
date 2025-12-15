@@ -1,0 +1,213 @@
+! ## EMS SYSTEM ##
+{% if IS_TANK_DHW %} ! (if IS_TANK_SH == True)
+
+EnergyManagementSystem:Sensor, !- Actual Temp of the DHW tank
+  DHW_Tank_T,                !- Name
+  tank_dhw,                  !- Output:Variable or Output:Meter Index Key Name
+  Water Heater Tank Temperature;  !- Output:Variable Name
+
+{% else %} ! IF THERE IS NO TANK USE TEMP OF CIRCUIT INSTEAD
+
+EnergyManagementSystem:Sensor, !- Equivalent Temp to the DHW tank
+  DHW_Tank_T,                 
+  node_dhw_5,                   
+  System Node Temperature;
+
+{% endif %}
+  
+
+{% if IS_TANK_SH %} ! (if IS_TANK_SH == True)
+
+EnergyManagementSystem:Sensor, !- Actual Temp of the SH tank
+  SH_Tank_T,                 
+  tank_sh,                   
+  Water Heater Tank Temperature;
+
+{% else %} ! IF THERE IS NO TANK USE TEMP OF CIRCUIT INSTEAD
+
+EnergyManagementSystem:Sensor, !- Equivalent Temp to the SH tank
+  SH_Tank_T,                 
+  node_sh_5,                   
+  System Node Temperature;
+
+{% endif %}
+
+EnergyManagementSystem:Sensor, !- Setpoint of the DHW tank
+  DHW_Setpoint,              !- Name
+  node_hx_dhw_6,                  
+  System Node Setpoint Temperature;
+
+EnergyManagementSystem:Sensor, !- Setpoint of the SH tank
+  SH_Setpoint,               
+  node_hx_sh_5,                   
+  System Node Setpoint Temperature;
+
+EnergyManagementSystem:Actuator,
+  HP_Temp_SP_Act,                          !- Actuator name
+  schedule_setpoint_loop_gen,                        !- Actuated Component Unique Name
+  Schedule:Constant,                       !- Actuated Component Type
+  Schedule Value;                          !- Actuated Component Control Type
+
+EnergyManagementSystem:Actuator,
+  HX_DHW_OnOff_Act,                            !- Actuator Name
+  HX_DHW_OnOff,                            !- Actuated Component Unique Name
+  Schedule:Constant,                       !- Actuated Component Type
+  Schedule Value;                          !- Actuated Component Control Type
+
+EnergyManagementSystem:Actuator,
+  HX_SH_OnOff_Act,                         !- Actuator name
+  HX_SH_OnOff,                             !- Actuated Component Unique Name
+  Schedule:Constant,                       !- Actuated Component Type
+  Schedule Value;                          !- Actuated Component Control Type
+
+EnergyManagementSystem:Actuator,
+  DHW_boiler_setpoint,                         !- Actuator name
+  schedule_setpoint_loop_hx_dhw,                             !- Actuated Component Unique Name
+  Schedule:Constant,                       !- Actuated Component Type
+  Schedule Value;                          !- Actuated Component Control Type
+
+
+EnergyManagementSystem:GlobalVariable,
+  ModeIsDHW;
+
+EnergyManagementSystem:Program,
+  HP_Init,
+  SET ModeIsDHW = 0;        ! safe default
+
+EnergyManagementSystem:ProgramCallingManager,
+  HP_Init_Caller,
+  BeginNewEnvironment,
+  HP_Init;
+
+EnergyManagementSystem:Program,
+  HP_Priority_Control,
+  SET hyster_dhw_flex = {{ hyster_dhw_flex }}, ! flex 4-7 is ok. SYSTEM SENSITIVE
+  SET hyster_dhw = {{ hyster_dhw }}, ! no flex 4-5 is ok. SYSTEM SENSITIVE
+  SET hyster_sh = {{ hyster_sh }}, ! (0.5-1.5 is ok) SYSTEM SENSITIVE
+
+  ! if FLEX scenario where we increase the temp of storage NºC:
+  IF ((Hour >= {{ hour_start_increase[:2] }} ) && (Hour < {{ hour_stop_increase[:2] }})),
+    ! the system requires DHW if the Temperature of the DHW Tank is lower than the increased Tank T minus the hysteresis
+    SET dhw_call = (DHW_Tank_T < ({{ dhw_flow_temperature + increaseTankTemperature }} - hyster_dhw_flex)), ! DHW priority
+    ! the system requires SH if the Temperature of the SH Tank is lower than the increased Tank T minus the hysteresis
+    SET sh_call  = (SH_Tank_T  < (SH_Setpoint + {{ increaseTankTemperature }}  - hyster_sh)), ! second activate SH if needed
+  ! otherwise if NO FLEX scenario:
+  ELSE,
+    ! require DHW if tank is lower than the setpoint minus hyst
+    SET dhw_call = (DHW_Tank_T < ({{ dhw_flow_temperature }} - hyster_dhw)), ! DHW priority
+    ! require SH if tank is lower than the setpoint
+    SET sh_call  = (SH_Tank_T  < (SH_Setpoint  - hyster_sh)), ! second activate SH if needed
+  ENDIF,
+
+  IF (dhw_call),
+    SET ModeIsDHW = 1,
+  ELSEIF (sh_call),
+    SET ModeIsDHW = 0,
+  ENDIF,
+
+  ! if FLEX scenario where we increase the temp of storage 10C:
+  IF ((Hour >= {{ hour_start_increase[:2] }} ) && (Hour < {{ hour_stop_increase[:2] }})),
+    ! if the temperature to be provided is higher that the max temperature that can provide the HP(55C) we will activate the aux boiler for dhw:
+    IF {{ dhw_flow_temperature + increaseTankTemperature }} > {{ hp_setpoint_limit }}, ! THIS IS IF WE WANT >55 AS DHW TEMP (NEED AUX HEATER)
+      ! if the system requires DHW:
+      IF (ModeIsDHW == 1),
+        ! set the temperature of the HP flow as (eg. 55):
+        SET HP_Temp_SP_Act = {{ hp_setpoint_limit }},          
+        ! activate the HX of DHW
+        SET HX_DHW_OnOff_Act     = 1,
+        ! deactivate the HX of SH
+        SET HX_SH_OnOff_Act      = 0,
+        ! if the tank T is higher than 54C activate the boiler because the HP cant provide more than 55C:
+        IF (DHW_Tank_T > {{ hp_setpoint_limit - 1.0 }}),
+          SET DHW_boiler_setpoint  = {{ dhw_flow_temperature + increaseTankTemperature }},
+        ! otherwise dont activate the boiler because we only use the HP
+        ELSE,
+          SET DHW_boiler_setpoint  = 10,
+        ENDIF,
+      ! if instead of DHW the system requires SH
+      ELSE,
+        ! set the temperature of the HP flow as (eg. 35 + 10):
+        SET HP_Temp_SP_Act = {{ sh_flow_temperature + increaseTankTemperature }},         
+        ! deactivate the HX of DHW
+        SET HX_DHW_OnOff_Act     = 0,
+        ! activate the HX of SH
+        SET HX_SH_OnOff_Act      = 1,
+        ! deactivate the boiler as we dont use it for SH
+        SET DHW_boiler_setpoint  = 10,
+      ENDIF,
+    ! if the temperature to be provided is lower than the max temp that can provide the HP(55C) we dont need the aux boiler
+    ELSE,
+      ! if the system requires DHW: 
+      IF (ModeIsDHW == 1),
+        SET HP_Temp_SP_Act = {{ dhw_flow_temperature + increaseTankTemperature }},          
+        SET HX_DHW_OnOff_Act     = 1,
+        SET HX_SH_OnOff_Act      = 0,
+        SET DHW_boiler_setpoint  = 10,
+      ! if the system requires SH:
+      ELSE,
+        SET HP_Temp_SP_Act = {{ sh_flow_temperature + increaseTankTemperature }},         
+        SET HX_DHW_OnOff_Act     = 0,
+        SET HX_SH_OnOff_Act      = 1,
+        SET DHW_boiler_setpoint  = 10,
+      ENDIF,
+    ENDIF,
+  ! if NOFLEX scenario:
+  ELSE,
+    ! if the temperature to be provided is higher that the max temperature that can provide the HP(55C) we will activate the aux boiler for dhw:
+    IF {{ dhw_flow_temperature }} > {{ hp_setpoint_limit }}, ! THIS IS IF WE WANT >55 AS DHW TEMP (NEED AUX HEATER)
+      ! if the system requires DHW:
+      IF (ModeIsDHW == 1),
+        ! set the temperature of the HP flow as (eg. 55):
+        SET HP_Temp_SP_Act = {{ hp_setpoint_limit }},          
+        ! activate the HX of DHW
+        SET HX_DHW_OnOff_Act     = 1,
+        ! deactivate the HX of SH
+        SET HX_SH_OnOff_Act      = 0,
+        ! if the tank T is higher than 54C activate the boiler because the HP cant provide more than 55C:
+        IF (DHW_Tank_T > {{ hp_setpoint_limit - 1.0 }}),
+          SET DHW_boiler_setpoint  = {{ dhw_flow_temperature }},
+        ! otherwise dont activate the boiler because we only use the HP
+        ELSE,
+          SET DHW_boiler_setpoint  = 10,
+        ENDIF,
+      ! if instead of DHW the system requires SH
+      ELSE,
+        ! set the temperature of the HP flow as (eg. 35 + 10):
+        SET HP_Temp_SP_Act = {{ sh_flow_temperature }},         
+        ! deactivate the HX of DHW
+        SET HX_DHW_OnOff_Act     = 0,
+        ! activate the HX of SH
+        SET HX_SH_OnOff_Act      = 1,
+        ! deactivate the boiler as we dont use it for SH
+        SET DHW_boiler_setpoint  = 10,
+      ENDIF,
+    ! if the temperature to be provided is lower than the max temp that can provide the HP(55C) we dont need the aux boiler
+    ELSE,
+      ! if the system requires DHW: 
+      IF (ModeIsDHW == 1),
+        SET HP_Temp_SP_Act = {{ dhw_flow_temperature }},          
+        SET HX_DHW_OnOff_Act     = 1,
+        SET HX_SH_OnOff_Act      = 0,
+        SET DHW_boiler_setpoint  = 10,
+      ! if the system requires SH:
+      ELSE,
+        SET HP_Temp_SP_Act = {{ sh_flow_temperature }},         
+        SET HX_DHW_OnOff_Act     = 0,
+        SET HX_SH_OnOff_Act      = 1,
+        SET DHW_boiler_setpoint  = 10,
+      ENDIF,
+    ENDIF,
+  ENDIF,
+
+  ! if we are in summer deactivate the SH
+  IF ( (Month > 5 && Month < 9) || (Month == 5 && DayOfMonth >= 15) || (Month == 9 && DayOfMonth <= 30) ),  ! TURN OFF SH IN SUMMER
+    SET HX_SH_OnOff_Act = 0,
+  ENDIF;
+
+EnergyManagementSystem:ProgramCallingManager,
+  HP_Priority_Caller,
+  InsideHVACSystemIterationLoop,
+  HP_Priority_Control;
+
+
+!- END EMS

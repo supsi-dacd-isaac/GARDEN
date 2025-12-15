@@ -1,0 +1,38 @@
+MATERIAL,
+    Ro1_L1,    !- Name
+    Rough,                    !- Roughness
+    0.02,                     !- Thickness
+    0.14,                     !- Conductivity
+    550,                      !- Density
+    2300,                     !- Specific Heat
+    0.9,                      !- Thermal Absorptance
+    0.6,                      !- Solar Absorptance
+    0.6;                      !- Visible Absorptance
+
+MATERIAL,
+    Ro1_L2,    !- Name
+    Rough,                    !- Roughness
+    0.04,                     !- Thickness
+    0.047,                    !- Conductivity
+    250,                      !- Density
+    1300,                     !- Specific Heat
+    0.9,                      !- Thermal Absorptance
+    0.6,                      !- Solar Absorptance
+    0.6;                      !- Visible Absorptance
+
+MATERIAL,
+    Ro1_L3,    !- Name
+    Rough,                    !- Roughness
+    0.015,                    !- Thickness
+    0.87,                     !- Conductivity
+    1600,                     !- Density
+    1000,                     !- Specific Heat
+    0.9,                      !- Thermal Absorptance
+    0.6,                      !- Solar Absorptance
+    0.6;                      !- Visible Absorptance
+
+CONSTRUCTION,
+    Roof_construction,    !- Name
+    Ro1_L1,    !- Outside Layer
+    Ro1_L2,    !- Layer 2
+    Ro1_L3;    !- Layer 3

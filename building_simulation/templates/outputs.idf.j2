@@ -1,0 +1,216 @@
+!- OUTPUTS
+
+Output:Variable,
+  *,                                      !- Key Value
+  Boiler Heating Rate,                    !- Variable Name
+  Timestep;                               !- Reporting Frequency
+
+
+Output:Variable,
+  *,                                      !- Key Value
+  Boiler Diesel Rate,                     !- Variable Name
+  Timestep;                               !- Reporting Frequency
+
+
+Output:Variable,
+  *,                                      !- Key Value
+  Boiler Electricity Rate,                     !- Variable Name
+  Timestep;                               !- Reporting Frequency
+
+Output:Variable,
+  ,                                       !- Key Value
+  Zone Thermostat Heating Setpoint Temperature, !- Variable Name
+  Timestep;                               !- Reporting Frequency
+
+Output:Variable,
+  ,                                       !- Key Value
+  Site Direct Solar Radiation Rate per Area, !- Variable Name
+  Timestep;                               !- Reporting Frequency
+
+Output:Variable,
+  ,                                       !- Key Value
+  Site Outdoor Air Drybulb Temperature,   !- Variable Name
+  Timestep;                               !- Reporting Frequency
+
+Output:VariableDictionary,
+  IDF,                                    !- Key Field
+  Unsorted;                               !- Sort Option
+
+Output:Table:SummaryReports,
+  AllSummary;                             !- Report Name 1
+
+OutputControl:Table:Style,
+  CommaAndHTML,                           !- Column Separator (CommaAndHTML)
+  JtoKWH;                                 !- Unit Conversion
+
+Output:Variable,
+  *,                                      !- Key Value
+  Pump Electricity Rate,                  !- Variable Name
+  Timestep;                               !- Reporting Frequency
+
+Output:Variable,
+  solar_panels_surface_0,                                      !- Key Value
+  Surface Outside Face Incident Solar Radiation Rate per Area, !- Variable Name
+  Timestep;                               !- Reporting Frequency
+
+Output:Variable,
+  *,                                       !- Key Value
+  Zone Outdoor Air Wind Speed,   !- Variable Name
+  Timestep;                               !- Reporting Frequency
+
+!Output:Variable,
+!  *,
+!  Zone Mean Radiant Temperature,
+!  Timestep; !- Zone Average [C]
+
+{% if THERMOSTAT_METHOD == "Operative" %}
+
+Output:Variable,
+  *,
+  Zone Operative Temperature,
+  Timestep; !- Zone Average [C]
+
+{% else %}
+
+Output:Variable,
+  *,                                       !- Key Value
+  Zone Air Temperature,                   !- Variable Name
+  Timestep;                               !- Reporting Frequency
+
+{% endif %}
+
+Output:Variable,
+  *,
+  Boiler NaturalGas Rate,
+  Timestep; !- HVAC Average [W]
+
+!Output:Variable,
+!  *,
+!  Zone Air System Sensible Heating Rate, ! https://bigladdersoftware.com/epx/docs/24-2/input-output-reference/group-thermal-zone-description-geometry.html#zone-air-system-sensible-cooling-rate-w
+!  Timestep; !- HVAC Average [W]
+
+!Output:Variable,
+!  *,
+!  Solar Collector Heat Transfer Energy,
+!  Timestep; !- HVAC Average [J]
+
+
+{% for fl in TOTAL_FLOORS_LIST %} !- floorsToSimulateList created in 'idf_generator.py'
+
+
+Output:Meter,
+  light_cons:InteriorLights:Electricity:Zone:fl{{ fl }}_thz0,
+  Timestep; !- [J]
+
+
+Output:Meter,
+  appliances:InteriorEquipment:Electricity:Zone:fl{{ fl }}_thz0,
+  Timestep; !- [J]
+
+
+Output:Meter,
+  Electricity:Zone:fl{{ fl }}_thz0,
+  Timestep; !- [J]
+
+
+
+{% endfor %} !- END floor Loop
+
+
+! HP 
+Output:Variable,*,Heat Pump Electricity Rate,Timestep; !- HVAC Average [W]
+!Output:Variable,*,Heat Pump Electricity Energy,Timestep; !- HVAC Average [J]
+Output:Variable,*,Heat Pump Load Side Heat Transfer Rate,Timestep; !- HVAC Average [W]
+!Output:Variable,*,Heat Pump Load Side Heat Transfer Energy,Timestep; !- HVAC Sum [J]
+!Output:Variable,*,Water Heater Electricity Rate,Timestep; !- HVAC Average [W]
+
+
+!Output:Variable,*,System Node Mass Flow Rate,Timestep; !- HVAC Average [kg/s]
+
+
+! DEB
+!Output:Variable,*,System Node Setpoint Temperature,Timestep; !- HVAC Average [C]
+!Output:Variable,*,System Node Temperature,Timestep; !- HVAC Average [C]
+!Output:Variable,*,Water Use Connections Hot Water Volume,Timestep; !- HVAC Sum [m3]
+!Output:Variable,*,Schedule Value,Timestep; !- Zone Average []
+!Output:Variable,*,Fluid Heat Exchanger Operation Status,Timestep; !- HVAC Average []
+!Output:Variable,*,Solar Collector Heat Transfer Rate,Timestep; !- HVAC Average [W]
+!Output:Variable,*,Water Heater Tank Temperature,Timestep;
+!Output:Variable,*,Solar Collector Heat Transfer Rate,Timestep;
+!Output:Variable,*,Zone Radiant HVAC Heating Rate,Timestep;
+!Output:Meter,Baseboard:PlantLoopHeatingDemand,Timestep;
+!Output:Variable,*,Baseboard Total Heating Rate,Timestep;
+
+! DHW DEMAND
+!Output:Meter,WaterSystems:PlantLoopHeatingDemand,Timestep; !- [J] # DHW energy demand https://support.designbuilder.co.uk/support/solutions/articles/103000354109-separate-energy-consumption-for-space-heating-and-domestic-hot-water-dhw-
+Output:Variable,*,Water Use Connections Plant Hot Water Energy,Timestep; !- HVAC Sum [J]
+
+
+! SH DEMAND
+Output:Meter,PlantLoopHeatingDemand:HVAC,Timestep; !- [J] # SH energy demand THIS MATCHES THE FINAL ENERGY SUPPLIED FOR SH
+!Output:Meter,EnergyTransfer:HVAC,Timestep; !- [J] # this takes into account heat produced by HP + PUMPS
+!Output:Meter,Baseboard:EnergyTransfer,Timestep; !- [J]
+! Output:Variable,*,Zone Radiant HVAC Heating Fluid Energy,Timestep; !- HVAC Sum [J] NO NEED EQUIVALENT TO Zone Radiant HVAC Heating Energy
+
+! STORAGE TEMPERATURES TO CHECK FLEXIBILITY
+Output:Variable,*,Water Heater Tank Temperature,Timestep;
+
+
+! HP - OTHER
+!Output:Meter,Heat Pump:Heating:Electricity,Timestep; !- [J] 
+!Output:Meter,Heating:Electricity,Timestep; !- [J]
+!Output:Meter,HeatingCoils:EnergyTransfer,Timestep; !- [J]
+
+! Where the extra heat comes from? from pumps, apparently
+!Output:Variable,*,Pump Fluid Heat Gain Rate,Timestep; !- HVAC Average [W]
+!Output:Variable,*,Heat Pump Load Side Heat Transfer Rate,Timestep; !- HVAC Average [W]
+!Output:Variable,*,Heat Pump Source Side Heat Transfer Rate,Timestep; !- HVAC Average [W]
+
+!Output:Variable,*,Plant Supply Side Heating Demand Rate,Timestep; !- HVAC Average [W]
+
+!Output:Variable,*,Water Use Connections Total Volume,Timestep; !- HVAC Sum [m3]
+!Output:Variable,*,Water Use Equipment Heating Rate,Timestep; !- HVAC Average [W]
+!Output:Variable,*,Water Use Equipment Hot Water Temperature,Timestep; !- HVAC Average [C]
+!Output:Variable,*,Surface Window Shading Device Absorbed Solar Radiation Rate,Timestep;
+
+
+! To check tank losses
+!Output:Variable,*,Water Heater Heat Loss Rate,Timestep; !- HVAC Average [W]
+
+! to check how much heat is delivering the tank to the radiant floor
+!Output:Variable,*,Water Heater Use Side Heat Transfer Rate,Timestep; !- HVAC Average [W]
+
+!Output:Variable,*,Fluid Heat Exchanger Heat Transfer Rate,Timestep; !- HVAC Average [W]
+
+OutputControl:Files,
+    No,                     !- Output CSV
+    No,                     !- Output MTR
+    Yes,                     !- Output ESO
+    No,                     !- Output EIO
+    No,                     !- Output Tabular # yes
+    No,                     !- Output SQLite
+    No,                     !- Output JSON
+    No,                      !- Output AUDIT
+    No,                     !- Output Zone Sizing
+    No,                     !- Output System Sizing
+    No,                     !- Output DXF
+    No,                     !- Output BND
+    No,                     !- Output RDD
+    No,                     !- Output MDD RDD # yes
+    No,                     !- Output MTD MDD # yes
+    No,                     !- Output END
+    No,                     !- Output SHD
+    No,                     !- Output DFS
+    No,                     !- Output GLHE
+    No,                     !- Output DelightIn
+    No,                     !- Output DelightELdmp
+    No,                     !- Output DelightDFdmp
+    No,                     !- Output EDD
+    No,                     !- Output DBG
+    No,                     !- Output PerfLog
+    No,                     !- Output SLN
+    No,                     !- Output SCI
+    No,                     !- Output WRL
+    No,                     !- Output Screen
+    No,                     !- Output ExtShd
+    No;                     !- Output Tarcog

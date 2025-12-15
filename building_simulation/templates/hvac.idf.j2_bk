@@ -1,0 +1,2359 @@
+! ######
+! HVAC
+! ######
+
+{% for fl in TOTAL_FLOORS_LIST %} ! (e.g. if 4 fls TOTAL_FLOORS_LIST=[0...3])
+
+ZoneHVAC:EquipmentConnections,
+  fl{{ fl }}_thz0,                               !- Zone Name
+  fl{{ fl }}_thz0 Equipment List,                !- Zone Conditioning Equipment List Name
+  ,                                       !- Zone Air Inlet Node or NodeList Name
+  ,                                       !- Zone Air Exhaust Node or NodeList Name
+  node_air_fl{{ fl }}_thz0;                                 !- Zone Air Node Name
+
+{% endfor %}
+
+! ######
+! HVAC - GEN LOOP WITH 2 HX
+! ######
+
+PlantLoop,
+  plantloop_gen,                          !- Name
+  Water,                                  !- Fluid Type
+  ,                                       !- User Defined Fluid Type
+  plantloop_gen Operation Schemes,        !- Plant Equipment Operation Scheme Name
+  node_gen_5,                             !- Loop Temperature Setpoint Node Name
+  100,                                    !- Maximum Loop Temperature {C}
+  0,                                      !- Minimum Loop Temperature {C}
+  Autosize,                               !- Maximum Loop Flow Rate {m3/s}
+  0,                                      !- Minimum Loop Flow Rate {m3/s}
+  Autocalculate,                          !- Plant Loop Volume {m3}
+  node_gen_1,                             !- Plant Side Inlet Node Name
+  node_gen_5,                             !- Plant Side Outlet Node Name
+  plantloop_gen Supply Branches,          !- Plant Side Branch List Name
+  plantloop_gen Supply Connector List,    !- Plant Side Connector List Name
+  node_gen_6,                             !- Demand Side Inlet Node Name
+  node_gen_9,                             !- Demand Side Outlet Node Name
+  plantloop_gen Demand Branches,          !- Demand Side Branch List Name
+  plantloop_gen Demand Connector List,    !- Demand Side Connector List Name
+  SequentialLoad,                                !- Load Distribution Scheme
+  ,                                       !- Availability Manager List Name
+  SingleSetpoint,                         !- Plant Loop Demand Calculation Scheme
+  None;                                   !- Common Pipe Simulation
+
+Sizing:Plant,
+  plantloop_gen,                          !- Plant or Condenser Loop Name
+  Heating,                                !- Loop Type
+  58,                                     !- Design Loop Exit Temperature {C}
+  2,                                      !- Loop Design Temperature Difference {deltaC}
+  NonCoincident,                          !- Sizing Option
+  1,                                      !- Zone Timesteps in Averaging Window
+  None;                                   !- Coincident Sizing Factor Mode
+
+SetpointManager:Scheduled,
+  setpoint_loop_gen,                      !- Name
+  Temperature,                            !- Control Variable
+  schedule_setpoint_loop_gen,             !- Schedule Name
+  node_gen_5;                             !- Setpoint Node or NodeList Name
+
+Schedule:Constant,
+  schedule_setpoint_loop_gen,             !- Name
+  ,                                       !- Schedule Type Limits Name
+  {{ sh_flow_temperature }};                                     !- Hourly Value
+
+BranchList,
+  plantloop_gen Supply Branches,          !- Name
+  plantloop_gen Supply Inlet Branch,      !- Branch Name 1
+  plantloop_gen Supply Branch 1,          !- Branch Name 2
+  plantloop_gen Supply Outlet Branch;     !- Branch Name 3
+
+ConnectorList,
+  plantloop_gen Supply Connector List,    !- Name
+  Connector:Splitter,                     !- Connector Object Type 1
+  plantloop_gen Supply Splitter,          !- Connector Name 1
+  Connector:Mixer,                        !- Connector Object Type 2
+  plantloop_gen Supply Mixer;             !- Connector Name 2
+
+Connector:Splitter,
+  plantloop_gen Supply Splitter,          !- Name
+  plantloop_gen Supply Inlet Branch,      !- Inlet Branch Name
+  plantloop_gen Supply Branch 1;          !- Outlet Branch Name 1
+
+Connector:Mixer,
+  plantloop_gen Supply Mixer,             !- Name
+  plantloop_gen Supply Outlet Branch,     !- Outlet Branch Name
+  plantloop_gen Supply Branch 1;          !- Inlet Branch Name 1
+
+Branch,
+  plantloop_gen Supply Inlet Branch,      !- Name
+  ,                                       !- Pressure Drop Curve Name
+  Pump:VariableSpeed,                     !- Component Object Type 1
+  pump_gen,                               !- Component Name 1
+  node_gen_1,                             !- Component Inlet Node Name 1
+  node_gen_2;                             !- Component Outlet Node Name 1
+
+Pump:VariableSpeed,
+  pump_gen,                               !- Name
+  node_gen_1,                             !- Inlet Node Name
+  node_gen_2,                             !- Outlet Node Name
+  Autosize,                               !- Design Maximum Flow Rate {m3/s}
+  179352,                                 !- Design Pump Head {Pa}
+  Autosize,                               !- Design Power Consumption {W}
+  0.9,                                    !- Motor Efficiency
+  0,                                      !- Fraction of Motor Inefficiencies to Fluid Stream
+  0,                                      !- Coefficient 1 of the Part Load Performance Curve
+  1,                                      !- Coefficient 2 of the Part Load Performance Curve
+  0,                                      !- Coefficient 3 of the Part Load Performance Curve
+  0,                                      !- Coefficient 4 of the Part Load Performance Curve
+  0,                                      !- Design Minimum Flow Rate {m3/s}
+  Continuous,                             !- Pump Control Type
+  ,                                       !- Pump Flow Rate Schedule Name
+  ,                                       !- Pump Curve Name
+  ,                                       !- Impeller Diameter {m}
+  ,                                       !- VFD Control Type
+  ,                                       !- Pump RPM Schedule Name
+  ,                                       !- Minimum Pressure Schedule {Pa}
+  ,                                       !- Maximum Pressure Schedule {Pa}
+  ,                                       !- Minimum RPM Schedule {rev/min}
+  ,                                       !- Maximum RPM Schedule {rev/min}
+  ,                                       !- Zone Name
+  0.5,                                    !- Skin Loss Radiative Fraction
+  PowerPerFlowPerPressure,                !- Design Power Sizing Method
+  348701.1,                               !- Design Electric Power per Unit Flow Rate {W/(m3/s)}
+  1.282051282,                            !- Design Shaft Power per Unit Flow Rate per Unit Head {W/((m3/s)-Pa)}
+  0,                                      !- Design Minimum Flow Rate Fraction
+  General;                                !- End-Use Subcategory
+
+OutdoorAir:Node,
+  node_outdoor_air;  !- Name
+
+OutdoorAir:Node,
+  node_exhaust_air;  !- Name
+
+! ===========================================================================
+! IF THERE'S HEAT PUMP -> ADD HEAT PUMP; IF NO HEAT PUMP -> ADD BOILER
+! ===========================================================================
+
+{% if IS_HEATPUMP_SH %} ! (if IS_HEATPUMP == True)
+
+Branch,
+  plantloop_gen Supply Branch 1,          !- Name
+  ,                                       !- Pressure Drop Curve Name
+  HeatPump:PlantLoop:EIR:Heating,                        !- Component Object Type 1
+  hp_gen,                             !- Component Name 1
+  node_gen_3,                             !- Component Inlet Node Name 1
+  node_gen_4;                             !- Component Outlet Node Name 1
+
+PlantEquipmentList,
+  plantloop_gen Heating Equipment List,   !- Name
+  HeatPump:PlantLoop:EIR:Heating,                        !- Equipment Object Type 1
+  hp_gen;                             !- Equipment Name 1
+
+HeatPump:PlantLoop:EIR:Heating,
+  hp_gen,            !- Name
+  node_gen_3, !- Load Side Inlet Node Name
+  node_gen_4,  !- Load Side Outlet Node Name
+  AirSource,             ! Condenser Type
+  node_outdoor_air,  !- Source Side Inlet Node Name
+  node_exhaust_air,  !- Source Side Outlet Node Name
+  ,                        !- Heat Recovery Inlet Node Name
+  ,                        !- Heat Recovery Outlet Node Name
+  ,            !- Companion Heat Pump Name
+  Autosize,                   !- Load Side Design Volume Flow Rate {m3/s} (aerotop g07-14m: 0.00042222)
+  Autosize,                   !- Source Side Design Volume Flow Rate {m3/s} (aerotop g07-14m: 0.97)
+  ,                        !- Heat Recovery Reference Flow Rate
+  {{ hp_ref_capacity }},                   !- Reference Capacity
+  {{ hp_ref_cop }},                     !- Reference COP
+  ,                        !- Sizing Factor
+  HPWH Heating Cap Func Temp,        !- Heating Capacity Modifier Function of Temperature Curve Name
+  HPWH EIR Func of Temp,        !- Electric Input to Heating Output Ratio Modifier Function of Temperature Curve Name
+  Part Load Frac Correlation,         !- Electric Input to Heating Output Ratio Modifier Function of Part Load Ratio Curve Name
+  1, !- Heating to cooling capacity sizing ratio
+  HeatingCapacity, !- Heat Pump Sizing Method
+  Load, !- Control Type
+  , !- Flow Mode
+  ; !- Minimum part load ratio
+
+{% else %} ! (if IS_HEATPUMP_SH == False)
+
+Branch,
+  plantloop_gen Supply Branch 1,          !- Name
+  ,                                       !- Pressure Drop Curve Name
+  Boiler:HotWater,                        !- Component Object Type 1
+  boiler_gen,                             !- Component Name 1
+  node_gen_3,                             !- Component Inlet Node Name 1
+  node_gen_4;                             !- Component Outlet Node Name 1
+
+PlantEquipmentList,
+  plantloop_gen Heating Equipment List,   !- Name
+  Boiler:HotWater,                        !- Equipment Object Type 1
+  boiler_gen;                             !- Equipment Name 1
+
+Boiler:HotWater,
+  boiler_gen,                         !- Name
+  {{ shFuel }},                            !- Fuel Type
+  20000,                               !- Nominal Capacity {W}
+  {{ boilerEfficiency }},                                    !- Nominal Thermal Efficiency
+  LeavingBoiler,                          !- Efficiency Curve Temperature Evaluation Variable
+  Boiler Efficiency,                      !- Normalized Boiler Efficiency Curve Name
+  Autosize,                               !- Design Water Flow Rate {m3/s}
+  0,                                      !- Minimum Part Load Ratio
+  1,                                      !- Maximum Part Load Ratio
+  1,                                      !- Optimum Part Load Ratio
+  node_gen_3,                          !- Boiler Water Inlet Node Name
+  node_gen_4,                          !- Boiler Water Outlet Node Name
+  99,                                     !- Water Outlet Upper Temperature Limit {C}
+  NotModulated,                           !- Boiler Flow Mode
+  0,                                      !- On Cycle Parasitic Electric Load {W}
+  1,                                      !- Sizing Factor
+  General,                                !- End-Use Subcategory
+  0;                                      !- Off Cycle Parasitic Fuel Load {W}
+
+{% endif %} 
+
+! ===========================================================================
+! ===========================================================================
+
+Branch,
+  plantloop_gen Supply Outlet Branch,     !- Name
+  ,                                       !- Pressure Drop Curve Name
+  Pipe:Adiabatic,                         !- Component Object Type 1
+  plantloop_gen Supply Outlet Pipe,       !- Component Name 1
+  plantloop_gen Supply Outlet Pipe Node,  !- Component Inlet Node Name 1
+  node_gen_5;                             !- Component Outlet Node Name 1
+
+Pipe:Adiabatic,
+  plantloop_gen Supply Outlet Pipe,       !- Name
+  plantloop_gen Supply Outlet Pipe Node,  !- Inlet Node Name
+  node_gen_5;                             !- Outlet Node Name
+
+BranchList,
+  plantloop_gen Demand Branches,          !- Name
+  plantloop_gen Demand Inlet Branch,      !- Branch Name 1
+  plantloop_gen Demand Branch 1,          !- Branch Name 2
+  plantloop_gen Demand Branch 2,          !- Branch Name 3
+  plantloop_gen Demand Bypass Branch,     !- Branch Name 4
+  plantloop_gen Demand Outlet Branch;     !- Branch Name 5
+
+ConnectorList,
+  plantloop_gen Demand Connector List,    !- Name
+  Connector:Splitter,                     !- Connector Object Type 1
+  plantloop_gen Demand Splitter,          !- Connector Name 1
+  Connector:Mixer,                        !- Connector Object Type 2
+  plantloop_gen Demand Mixer;             !- Connector Name 2
+
+Connector:Splitter,
+  plantloop_gen Demand Splitter,          !- Name
+  plantloop_gen Demand Inlet Branch,      !- Inlet Branch Name
+  plantloop_gen Demand Branch 1,          !- Outlet Branch Name 1
+  plantloop_gen Demand Branch 2,          !- Outlet Branch Name 2
+  plantloop_gen Demand Bypass Branch;     !- Outlet Branch Name 3
+
+Connector:Mixer,
+  plantloop_gen Demand Mixer,             !- Name
+  plantloop_gen Demand Outlet Branch,     !- Outlet Branch Name
+  plantloop_gen Demand Branch 1,          !- Inlet Branch Name 1
+  plantloop_gen Demand Branch 2,          !- Inlet Branch Name 2
+  plantloop_gen Demand Bypass Branch;     !- Inlet Branch Name 3
+
+Branch,
+  plantloop_gen Demand Inlet Branch,      !- Name
+  ,                                       !- Pressure Drop Curve Name
+  Pipe:Adiabatic,                         !- Component Object Type 1
+  plantloop_gen Demand Inlet Pipe,        !- Component Name 1
+  node_gen_6,                             !- Component Inlet Node Name 1
+  plantloop_gen Demand Inlet Pipe Node;   !- Component Outlet Node Name 1
+
+Pipe:Adiabatic,
+  plantloop_gen Demand Inlet Pipe,        !- Name
+  node_gen_6,                             !- Inlet Node Name
+  plantloop_gen Demand Inlet Pipe Node;   !- Outlet Node Name
+
+Branch,
+  plantloop_gen Demand Branch 1,          !- Name
+  ,                                       !- Pressure Drop Curve Name
+  HeatExchanger:FluidToFluid,             !- Component Object Type 1
+  hx_dhw,                                 !- Component Name 1
+  node_gen_7_0,                           !- Component Inlet Node Name 1
+  node_gen_8_0;                           !- Component Outlet Node Name 1
+
+HeatExchanger:FluidToFluid,
+  hx_dhw,                                 !- Name
+  HX_DHW_OnOff,                                       !- Availability Schedule Name
+  node_gen_7_0,                           !- Loop Demand Side Inlet Node Name
+  node_gen_8_0,                           !- Loop Demand Side Outlet Node Name
+  Autosize,                               !- Loop Demand Side Design Flow Rate {m3/s}
+  node_hx_dhw_3_0,                        !- Loop Supply Side Inlet Node Name
+  node_hx_dhw_4_0,                        !- Loop Supply Side Outlet Node Name
+  Autosize,                               !- Loop Supply Side Design Flow Rate {m3/s}
+  Ideal,                                  !- Heat Exchange Model Type
+  Autosize,                               !- Heat Exchanger U-Factor Times Area Value {W/K}
+  UncontrolledOn,                         !- Control Type
+  node_hx_dhw_6,                          !- Heat Exchanger Setpoint Node Name
+  0.01,                                   !- Minimum Temperature Difference to Activate Heat Exchanger {deltaC}
+  LoopToLoop,                             !- Heat Transfer Metering End Use Type
+  ,                                       !- Component Override Loop Supply Side Inlet Node Name
+  ,                                       !- Component Override Loop Demand Side Inlet Node Name
+  Loop,                                   !- Component Override Cooling Control Temperature Mode
+  1,                                      !- Sizing Factor
+  0,                                      !- Operation Minimum Temperature Limit {C}
+  100;                                    !- Operation Maximum Temperature Limit {C}
+
+
+Schedule:Constant,
+  HX_DHW_OnOff,
+  OnOff,
+  0;
+
+
+
+
+Branch,
+  plantloop_gen Demand Branch 2,          !- Name
+  ,                                       !- Pressure Drop Curve Name
+  HeatExchanger:FluidToFluid,             !- Component Object Type 1
+  hx_sh,                                  !- Component Name 1
+  node_gen_7_1,                           !- Component Inlet Node Name 1
+  node_gen_8_1;                           !- Component Outlet Node Name 1
+
+HeatExchanger:FluidToFluid,
+  hx_sh,                                  !- Name
+  HX_SH_OnOff,                            !- Availability Schedule Name
+  node_gen_7_1,                           !- Loop Demand Side Inlet Node Name
+  node_gen_8_1,                           !- Loop Demand Side Outlet Node Name
+  Autosize,                               !- Loop Demand Side Design Flow Rate {m3/s}
+  node_hx_sh_3,                           !- Loop Supply Side Inlet Node Name
+  node_hx_sh_4,                           !- Loop Supply Side Outlet Node Name
+  Autosize,                               !- Loop Supply Side Design Flow Rate {m3/s}
+  Ideal,                                  !- Heat Exchange Model Type
+  Autosize,                               !- Heat Exchanger U-Factor Times Area Value {W/K}
+  UncontrolledOn,                         !- Control Type
+  node_hx_sh_5,                           !- Heat Exchanger Setpoint Node Name
+  0.01,                                   !- Minimum Temperature Difference to Activate Heat Exchanger {deltaC}
+  LoopToLoop,                             !- Heat Transfer Metering End Use Type
+  ,                                       !- Component Override Loop Supply Side Inlet Node Name
+  ,                                       !- Component Override Loop Demand Side Inlet Node Name
+  Loop,                                   !- Component Override Cooling Control Temperature Mode
+  1,                                      !- Sizing Factor
+  0,                                      !- Operation Minimum Temperature Limit {C}
+  100;                                    !- Operation Maximum Temperature Limit {C}
+
+{% if (IS_HEATPUMP_DHW and IS_HEATPUMP_SH) or (not IS_HEATPUMP_DHW and not IS_HEATPUMP_SH and shFuel == dhwFuel) %} ! We define the variable HX_SH_ONOFF as we are going to work with EMS.
+
+Schedule:Constant,
+  HX_SH_OnOff,
+  OnOff,
+  1;
+
+{% else %} ! if no EMS (because HP only supplies SH) then manually define the schedule to be 0 during summer
+
+  Schedule:Compact,
+  HX_SH_OnOff, 
+  OnOff,         
+  Through: 5/15,                          
+  For: AllDays,                           
+  Until: 24:00,                           
+  1,                                      
+  Through: 9/30,                          
+  For: AllDays,                           
+  Until: 24:00,                           
+  0,                                      
+  Through: 12/31,                         
+  For: AllDays,                           
+  Until: 24:00,                           
+  1;   
+
+{% endif %}
+
+
+Branch,
+  plantloop_gen Demand Bypass Branch,     !- Name
+  ,                                       !- Pressure Drop Curve Name
+  Pipe:Adiabatic,                         !- Component Object Type 1
+  plantloop_gen Demand Bypass Pipe,       !- Component Name 1
+  plantloop_gen Demand Bypass Pipe Inlet Node, !- Component Inlet Node Name 1
+  plantloop_gen Demand Bypass Pipe Outlet Node; !- Component Outlet Node Name 1
+
+Pipe:Adiabatic,
+  plantloop_gen Demand Bypass Pipe,       !- Name
+  plantloop_gen Demand Bypass Pipe Inlet Node, !- Inlet Node Name
+  plantloop_gen Demand Bypass Pipe Outlet Node; !- Outlet Node Name
+
+Branch,
+  plantloop_gen Demand Outlet Branch,     !- Name
+  ,                                       !- Pressure Drop Curve Name
+  Pipe:Adiabatic,                         !- Component Object Type 1
+  plantloop_gen Demand Outlet Pipe,       !- Component Name 1
+  plantloop_gen Demand Outlet Pipe Node,  !- Component Inlet Node Name 1
+  node_gen_9;                             !- Component Outlet Node Name 1
+
+Pipe:Adiabatic,
+  plantloop_gen Demand Outlet Pipe,       !- Name
+  plantloop_gen Demand Outlet Pipe Node,  !- Inlet Node Name
+  node_gen_9;                             !- Outlet Node Name
+
+PlantEquipmentOperationSchemes,
+  plantloop_gen Operation Schemes,        !- Name
+  PlantEquipmentOperation:HeatingLoad,    !- Control Scheme Object Type 1
+  plantloop_gen Heating Operation Scheme, !- Control Scheme Name 1
+  Always On Discrete;                     !- Control Scheme Schedule Name 1
+
+PlantEquipmentOperation:HeatingLoad,
+  plantloop_gen Heating Operation Scheme, !- Name
+  0,                                      !- Load Range Lower Limit 1 {W}
+  1000000000,                             !- Load Range Upper Limit 1 {W}
+  plantloop_gen Heating Equipment List;   !- Range Equipment List Name 1
+
+! ###################################################################################
+! ###################################################################################
+! ###################################################################################
+
+! ######
+! HVAC - HEAT EXCHANGER TO DHW TANK WITH SOLAR 
+! ######
+
+PlantLoop,
+  plantloop_hx_dhw,                       !- Name
+  Water,                                  !- Fluid Type
+  ,                                       !- User Defined Fluid Type
+  plantloop_hx_dhw Operation Schemes,     !- Plant Equipment Operation Scheme Name
+  node_hx_dhw_6,                          !- Loop Temperature Setpoint Node Name
+  100,                                    !- Maximum Loop Temperature {C}
+  0,                                      !- Minimum Loop Temperature {C}
+  Autosize,                               !- Maximum Loop Flow Rate {m3/s}
+  0,                                      !- Minimum Loop Flow Rate {m3/s}
+  Autocalculate,                          !- Plant Loop Volume {m3}
+  node_hx_dhw_1,                          !- Plant Side Inlet Node Name
+  node_hx_dhw_6,                          !- Plant Side Outlet Node Name
+  plantloop_hx_dhw Supply Branches,       !- Plant Side Branch List Name
+  plantloop_hx_dhw Supply Connector List, !- Plant Side Connector List Name
+  node_hx_dhw_7,                          !- Demand Side Inlet Node Name
+  node_hx_dhw_10,                         !- Demand Side Outlet Node Name
+  plantloop_hx_dhw Demand Branches,       !- Demand Side Branch List Name
+  plantloop_hx_dhw Demand Connector List, !- Demand Side Connector List Name
+  SequentialLoad,                         !- Load Distribution Scheme
+  ,                                       !- Availability Manager List Name
+  SingleSetpoint,                         !- Plant Loop Demand Calculation Scheme
+  None;                                   !- Common Pipe Simulation
+
+Sizing:Plant,
+  plantloop_hx_dhw,                       !- Plant or Condenser Loop Name
+  Heating,                                !- Loop Type
+  58,                                     !- Design Loop Exit Temperature {C}
+  2,                                      !- Loop Design Temperature Difference {deltaC}
+  NonCoincident,                          !- Sizing Option
+  1,                                      !- Zone Timesteps in Averaging Window
+  None;                                   !- Coincident Sizing Factor Mode
+
+BranchList,
+  plantloop_hx_dhw Supply Branches,       !- Name
+  plantloop_hx_dhw Supply Inlet Branch,   !- Branch Name 1
+  plantloop_hx_dhw Supply Branch 1,       !- Branch Name 2
+  plantloop_hx_dhw Supply Branch 2,       !- Branch Name 3
+  plantloop_hx_dhw Supply Outlet Branch;  !- Branch Name 4
+
+ConnectorList,
+  plantloop_hx_dhw Supply Connector List, !- Name
+  Connector:Splitter,                     !- Connector Object Type 1
+  plantloop_hx_dhw Supply Splitter,       !- Connector Name 1
+  Connector:Mixer,                        !- Connector Object Type 2
+  plantloop_hx_dhw Supply Mixer;          !- Connector Name 2
+
+Connector:Splitter,
+  plantloop_hx_dhw Supply Splitter,       !- Name
+  plantloop_hx_dhw Supply Inlet Branch,   !- Inlet Branch Name
+  plantloop_hx_dhw Supply Branch 1,       !- Outlet Branch Name 1
+  plantloop_hx_dhw Supply Branch 2;       !- Outlet Branch Name 2
+
+Connector:Mixer,
+  plantloop_hx_dhw Supply Mixer,          !- Name
+  plantloop_hx_dhw Supply Outlet Branch,  !- Outlet Branch Name
+  plantloop_hx_dhw Supply Branch 1,       !- Inlet Branch Name 1
+  plantloop_hx_dhw Supply Branch 2;       !- Inlet Branch Name 2
+
+Branch,
+  plantloop_hx_dhw Supply Inlet Branch,   !- Name
+  ,                                       !- Pressure Drop Curve Name
+  Pump:VariableSpeed,                     !- Component Object Type 1
+  pump_hx_dhw,                            !- Component Name 1
+  node_hx_dhw_1,                          !- Component Inlet Node Name 1
+  node_hx_dhw_2;                          !- Component Outlet Node Name 1
+
+Pump:VariableSpeed,
+  pump_hx_dhw,                            !- Name
+  node_hx_dhw_1,                          !- Inlet Node Name
+  node_hx_dhw_2,                          !- Outlet Node Name
+  Autosize,                               !- Design Maximum Flow Rate {m3/s}
+  179352,                                 !- Design Pump Head {Pa}
+  Autosize,                               !- Design Power Consumption {W}
+  0.9,                                    !- Motor Efficiency
+  0,                                      !- Fraction of Motor Inefficiencies to Fluid Stream
+  0,                                      !- Coefficient 1 of the Part Load Performance Curve
+  1,                                      !- Coefficient 2 of the Part Load Performance Curve
+  0,                                      !- Coefficient 3 of the Part Load Performance Curve
+  0,                                      !- Coefficient 4 of the Part Load Performance Curve
+  0,                                      !- Design Minimum Flow Rate {m3/s}
+  Continuous,                             !- Pump Control Type
+  ,                                       !- Pump Flow Rate Schedule Name
+  ,                                       !- Pump Curve Name
+  ,                                       !- Impeller Diameter {m}
+  ,                                       !- VFD Control Type
+  ,                                       !- Pump RPM Schedule Name
+  ,                                       !- Minimum Pressure Schedule {Pa}
+  ,                                       !- Maximum Pressure Schedule {Pa}
+  ,                                       !- Minimum RPM Schedule {rev/min}
+  ,                                       !- Maximum RPM Schedule {rev/min}
+  ,                                       !- Zone Name
+  0.5,                                    !- Skin Loss Radiative Fraction
+  PowerPerFlowPerPressure,                !- Design Power Sizing Method
+  348701.1,                               !- Design Electric Power per Unit Flow Rate {W/(m3/s)}
+  1.282051282,                            !- Design Shaft Power per Unit Flow Rate per Unit Head {W/((m3/s)-Pa)}
+  0,                                      !- Design Minimum Flow Rate Fraction
+  General;                                !- End-Use Subcategory
+
+Branch,
+  plantloop_hx_dhw Supply Branch 1,       !- Name
+  ,                                       !- Pressure Drop Curve Name
+  HeatExchanger:FluidToFluid,             !- Component Object Type 1
+  hx_dhw,                                 !- Component Name 1
+  node_hx_dhw_3_0,                        !- Component Inlet Node Name 1
+  node_hx_dhw_4_0;                        !- Component Outlet Node Name 1
+
+Branch,
+  plantloop_hx_dhw Supply Branch 2,       !- Name
+  ,                                       !- Pressure Drop Curve Name
+  HeatExchanger:FluidToFluid,             !- Component Object Type 1
+  hx_sol,                                 !- Component Name 1
+  node_hx_dhw_3_1,                        !- Component Inlet Node Name 1
+  node_hx_dhw_4_1;                        !- Component Outlet Node Name 1
+
+HeatExchanger:FluidToFluid,
+  hx_sol,                                 !- Name
+  schedule_hx_sol_availability,            !- Availability Schedule Name
+  node_sol_hx_7,                          !- Loop Demand Side Inlet Node Name
+  node_sol_hx_8,                          !- Loop Demand Side Outlet Node Name
+  Autosize,                               !- Loop Demand Side Design Flow Rate {m3/s}
+  node_hx_dhw_3_1,                        !- Loop Supply Side Inlet Node Name
+  node_hx_dhw_4_1,                        !- Loop Supply Side Outlet Node Name
+  Autosize,                               !- Loop Supply Side Design Flow Rate {m3/s}
+  Ideal,                                  !- Heat Exchange Model Type
+  Autosize,                               !- Heat Exchanger U-Factor Times Area Value {W/K}
+  UncontrolledOn,                         !- Control Type
+  node_hx_dhw_6,                          !- Heat Exchanger Setpoint Node Name
+  0.01,                                   !- Minimum Temperature Difference to Activate Heat Exchanger {deltaC}
+  LoopToLoop,                             !- Heat Transfer Metering End Use Type
+  ,                                       !- Component Override Loop Supply Side Inlet Node Name
+  ,                                       !- Component Override Loop Demand Side Inlet Node Name
+  Loop,                                   !- Component Override Cooling Control Temperature Mode
+  1,                                      !- Sizing Factor
+  0,                                      !- Operation Minimum Temperature Limit {C}
+  100;                                    !- Operation Maximum Temperature Limit {C}
+
+Branch,
+  plantloop_hx_dhw Supply Outlet Branch,  !- Name
+  ,                                       !- Pressure Drop Curve Name
+  Boiler:HotWater,                        !- Component Object Type 1
+  aux_heater_dhw,                         !- Component Name 1
+  node_hx_dhw_5,                          !- Component Inlet Node Name 1
+  node_hx_dhw_6;                          !- Component Outlet Node Name 1
+
+Boiler:HotWater,
+  aux_heater_dhw,                         !- Name
+  {{ dhwFuel }},                          !- Fuel Type
+  {{ auxHeaterCapacity }},                !- Nominal Capacity {W}
+  {{ boilerEfficiency }},                 !- Nominal Thermal Efficiency
+  LeavingBoiler,                          !- Efficiency Curve Temperature Evaluation Variable
+  Boiler Efficiency,                      !- Normalized Boiler Efficiency Curve Name
+  Autosize,                               !- Design Water Flow Rate {m3/s}
+  0,                                      !- Minimum Part Load Ratio
+  1,                                      !- Maximum Part Load Ratio
+  1,                                      !- Optimum Part Load Ratio
+  node_hx_dhw_5,                          !- Boiler Water Inlet Node Name
+  node_hx_dhw_6,                          !- Boiler Water Outlet Node Name
+  99,                                     !- Water Outlet Upper Temperature Limit {C}
+  LeavingSetpointModulated,               !- Boiler Flow Mode (NotModulated/LeavingSetpointModulated)
+  0,                                      !- On Cycle Parasitic Electric Load {W}
+  1,                                      !- Sizing Factor
+  General,                                !- End-Use Subcategory
+  0;                                      !- Off Cycle Parasitic Fuel Load {W}
+
+SetpointManager:Scheduled,
+  setpoint_loop_hx_dhw,                   !- Name
+  Temperature,                     !- Control Variable
+  schedule_setpoint_loop_hx_dhw,          !- Schedule Name
+  node_hx_dhw_6;                          !- Setpoint Node or NodeList Name
+
+Schedule:Constant,
+  schedule_setpoint_loop_hx_dhw,          !- Name
+  ,                                       !- Schedule Type Limits Name
+  {{ dhw_flow_temperature }};                                     !- Hourly Value
+
+BranchList,
+  plantloop_hx_dhw Demand Branches,       !- Name
+  plantloop_hx_dhw Demand Inlet Branch,   !- Branch Name 1
+  plantloop_hx_dhw Demand Branch 1,       !- Branch Name 2
+  plantloop_hx_dhw Demand Bypass Branch,  !- Branch Name 3
+  plantloop_hx_dhw Demand Outlet Branch;  !- Branch Name 4
+
+ConnectorList,
+  plantloop_hx_dhw Demand Connector List, !- Name
+  Connector:Splitter,                     !- Connector Object Type 1
+  plantloop_hx_dhw Demand Splitter,       !- Connector Name 1
+  Connector:Mixer,                        !- Connector Object Type 2
+  plantloop_hx_dhw Demand Mixer;          !- Connector Name 2
+
+Connector:Splitter,
+  plantloop_hx_dhw Demand Splitter,       !- Name
+  plantloop_hx_dhw Demand Inlet Branch,   !- Inlet Branch Name
+  plantloop_hx_dhw Demand Branch 1,       !- Outlet Branch Name 1
+  plantloop_hx_dhw Demand Bypass Branch;  !- Outlet Branch Name 2
+
+Connector:Mixer,
+  plantloop_hx_dhw Demand Mixer,          !- Name
+  plantloop_hx_dhw Demand Outlet Branch,  !- Outlet Branch Name
+  plantloop_hx_dhw Demand Branch 1,       !- Inlet Branch Name 1
+  plantloop_hx_dhw Demand Bypass Branch;  !- Inlet Branch Name 2
+
+Branch,
+  plantloop_hx_dhw Demand Inlet Branch,   !- Name
+  ,                                       !- Pressure Drop Curve Name
+  Pipe:Adiabatic,                         !- Component Object Type 1
+  plantloop_hx_dhw Demand Inlet Pipe,     !- Component Name 1
+  node_hx_dhw_7,                          !- Component Inlet Node Name 1
+  plantloop_hx_dhw Demand Inlet Pipe Node; !- Component Outlet Node Name 1
+
+Pipe:Adiabatic,
+  plantloop_hx_dhw Demand Inlet Pipe,     !- Name
+  node_hx_dhw_7,                          !- Inlet Node Name
+  plantloop_hx_dhw Demand Inlet Pipe Node; !- Outlet Node Name
+
+! ===========================================================================
+! IF THERE'S DHW STORAGE -> ADD TANK; IF NO DHW STORAGE -> ADD HEAT EXCHANGER
+! ===========================================================================
+
+{% if IS_TANK_DHW %} ! (if IS_TANK_DHW == True)
+
+Branch,
+  plantloop_hx_dhw Demand Branch 1,       !- Name
+  ,                                       !- Pressure Drop Curve Name
+  WaterHeater:Mixed,                      !- Component Object Type 1
+  tank_dhw,                               !- Component Name 1
+  node_hx_dhw_8,                          !- Component Inlet Node Name 1
+  node_hx_dhw_9;                          !- Component Outlet Node Name 1
+
+{% else %} ! (if IS_TANK_DHW == False) if no DHW storage then a heat exchanger object is used to bypass
+
+Branch,
+  plantloop_hx_dhw Demand Branch 1,       !- Name
+  ,                                       !- Pressure Drop Curve Name
+  HeatExchanger:FluidToFluid,                      !- Component Object Type 1
+  tank_dhw_bypass,                               !- Component Name 1
+  node_hx_dhw_8,                          !- Component Inlet Node Name 1
+  node_hx_dhw_9;                          !- Component Outlet Node Name 1
+
+{% endif %}
+
+! ===========================================================================
+! ===========================================================================
+
+Branch,
+  plantloop_hx_dhw Demand Bypass Branch,  !- Name
+  ,                                       !- Pressure Drop Curve Name
+  Pipe:Adiabatic,                         !- Component Object Type 1
+  plantloop_hx_dhw Demand Bypass Pipe,    !- Component Name 1
+  plantloop_hx_dhw Demand Bypass Pipe Inlet Node, !- Component Inlet Node Name 1
+  plantloop_hx_dhw Demand Bypass Pipe Outlet Node; !- Component Outlet Node Name 1
+
+Pipe:Adiabatic,
+  plantloop_hx_dhw Demand Bypass Pipe,    !- Name
+  plantloop_hx_dhw Demand Bypass Pipe Inlet Node, !- Inlet Node Name
+  plantloop_hx_dhw Demand Bypass Pipe Outlet Node; !- Outlet Node Name
+
+Branch,
+  plantloop_hx_dhw Demand Outlet Branch,  !- Name
+  ,                                       !- Pressure Drop Curve Name
+  Pipe:Adiabatic,                         !- Component Object Type 1
+  plantloop_hx_dhw Demand Outlet Pipe,    !- Component Name 1
+  plantloop_hx_dhw Demand Outlet Pipe Node, !- Component Inlet Node Name 1
+  node_hx_dhw_10;                         !- Component Outlet Node Name 1
+
+Pipe:Adiabatic,
+  plantloop_hx_dhw Demand Outlet Pipe,    !- Name
+  plantloop_hx_dhw Demand Outlet Pipe Node, !- Inlet Node Name
+  node_hx_dhw_10;                         !- Outlet Node Name
+
+PlantEquipmentOperationSchemes,
+  plantloop_hx_dhw Operation Schemes,     !- Name
+  PlantEquipmentOperation:HeatingLoad,    !- Control Scheme Object Type 1
+  plantloop_hx_dhw Heating Operation Scheme, !- Control Scheme Name 1
+  Always On Discrete;                     !- Control Scheme Schedule Name 1
+
+PlantEquipmentOperation:HeatingLoad,
+  plantloop_hx_dhw Heating Operation Scheme, !- Name
+  0,                                      !- Load Range Lower Limit 1 {W}
+  1000000000,                             !- Load Range Upper Limit 1 {W}
+  plantloop_hx_dhw Heating Equipment List; !- Range Equipment List Name 1
+
+{% if IS_HEATPUMP_DHW %}
+
+PlantEquipmentList,
+  plantloop_hx_dhw Heating Equipment List, !- Name
+  HeatExchanger:FluidToFluid,             !- Equipment Object Type 3
+  hx_sol,                                 !- Equipment Name 3
+  HeatExchanger:FluidToFluid,             !- Equipment Object Type 1
+  hx_dhw,                                 !- Equipment Name 1
+  Boiler:HotWater,                        !- Equipment Object Type 2
+  aux_heater_dhw;                         !- Equipment Name 2
+  
+{% elif IS_SOLAR %}
+
+PlantEquipmentList,
+  plantloop_hx_dhw Heating Equipment List, !- Name
+  Boiler:HotWater,                        !- Equipment Object Type 2
+  aux_heater_dhw,                        !- Equipment Name 2
+  HeatExchanger:FluidToFluid,             !- Equipment Object Type 3
+  hx_sol;                                 !- Equipment Name 3
+  
+  
+{% else %}
+
+{% if not IS_HEATPUMP_SH and not IS_HEATPUMP_DHW and shFuel == dhwFuel %} ! if both are boilers with same fuel then only 1 boiler
+
+PlantEquipmentList,
+  plantloop_hx_dhw Heating Equipment List, !- Name
+  HeatExchanger:FluidToFluid,             !- Equipment Object Type 1
+  hx_dhw;                                 !- Equipment Name 1
+
+
+{% else %} 
+
+PlantEquipmentList,
+  plantloop_hx_dhw Heating Equipment List, !- Name
+  Boiler:HotWater,                        !- Equipment Object Type 1
+  aux_heater_dhw;                         !- Equipment Name 1
+
+{% endif %} {% endif %}
+
+! ###################################################################################
+! ###################################################################################
+! ###################################################################################
+
+! ######
+! HVAC - DHW LOOP
+! ######
+
+PlantLoop,
+  plantloop_dhw,                          !- Name
+  Water,                                  !- Fluid Type
+  ,                                       !- User Defined Fluid Type
+  plantloop_dhw Operation Schemes,        !- Plant Equipment Operation Scheme Name
+  node_dhw_5,                             !- Loop Temperature Setpoint Node Name
+  100,                                    !- Maximum Loop Temperature {C}
+  0,                                      !- Minimum Loop Temperature {C}
+  Autosize,                               !- Maximum Loop Flow Rate {m3/s}
+  0,                                      !- Minimum Loop Flow Rate {m3/s}
+  Autocalculate,                          !- Plant Loop Volume {m3}
+  node_dhw_1,                             !- Plant Side Inlet Node Name
+  node_dhw_5,                             !- Plant Side Outlet Node Name
+  plantloop_dhw Supply Branches,          !- Plant Side Branch List Name
+  plantloop_dhw Supply Connector List,    !- Plant Side Connector List Name
+  node_dhw_6,                             !- Demand Side Inlet Node Name
+  node_dhw_9,                             !- Demand Side Outlet Node Name
+  plantloop_dhw Demand Branches,          !- Demand Side Branch List Name
+  plantloop_dhw Demand Connector List,    !- Demand Side Connector List Name
+  SequentialLoad,                                !- Load Distribution Scheme
+  ,                                       !- Availability Manager List Name
+  SingleSetpoint,                         !- Plant Loop Demand Calculation Scheme
+  None;                                   !- Common Pipe Simulation
+
+Sizing:Plant,
+  plantloop_dhw,                          !- Plant or Condenser Loop Name
+  Heating,                                !- Loop Type
+  58,                                     !- Design Loop Exit Temperature {C}
+  2,                                      !- Loop Design Temperature Difference {deltaC}
+  NonCoincident,                          !- Sizing Option
+  1,                                      !- Zone Timesteps in Averaging Window
+  None;                                   !- Coincident Sizing Factor Mode
+
+SetpointManager:Scheduled,
+  setpoint_loop_dhw,                      !- Name
+  Temperature,                            !- Control Variable
+  schedule_setpoint_loop_dhw,             !- Schedule Name
+  node_dhw_5;                             !- Setpoint Node or NodeList Name
+
+Schedule:Constant,
+  schedule_setpoint_loop_dhw,             !- Name
+  ,                                       !- Schedule Type Limits Name
+  {{ dhw_flow_temperature }};                                     !- Hourly Value
+
+BranchList,
+  plantloop_dhw Supply Branches,          !- Name
+  plantloop_dhw Supply Inlet Branch,      !- Branch Name 1
+  plantloop_dhw Supply Branch 1,          !- Branch Name 2
+  plantloop_dhw Supply Outlet Branch;     !- Branch Name 3
+
+ConnectorList,
+  plantloop_dhw Supply Connector List,    !- Name
+  Connector:Splitter,                     !- Connector Object Type 1
+  plantloop_dhw Supply Splitter,          !- Connector Name 1
+  Connector:Mixer,                        !- Connector Object Type 2
+  plantloop_dhw Supply Mixer;             !- Connector Name 2
+
+Connector:Splitter,
+  plantloop_dhw Supply Splitter,          !- Name
+  plantloop_dhw Supply Inlet Branch,      !- Inlet Branch Name
+  plantloop_dhw Supply Branch 1;          !- Outlet Branch Name 1
+
+Connector:Mixer,
+  plantloop_dhw Supply Mixer,             !- Name
+  plantloop_dhw Supply Outlet Branch,     !- Outlet Branch Name
+  plantloop_dhw Supply Branch 1;          !- Inlet Branch Name 1
+
+Branch,
+  plantloop_dhw Supply Inlet Branch,      !- Name
+  ,                                       !- Pressure Drop Curve Name
+  Pump:VariableSpeed,                     !- Component Object Type 1
+  pump_dhw,                               !- Component Name 1
+  node_dhw_1,                             !- Component Inlet Node Name 1
+  node_dhw_2;                             !- Component Outlet Node Name 1
+
+Pump:VariableSpeed,
+  pump_dhw,                               !- Name
+  node_dhw_1,                             !- Inlet Node Name
+  node_dhw_2,                             !- Outlet Node Name
+  Autosize,                               !- Design Maximum Flow Rate {m3/s}
+  179352,                                 !- Design Pump Head {Pa}
+  Autosize,                               !- Design Power Consumption {W}
+  0.9,                                    !- Motor Efficiency
+  0,                                      !- Fraction of Motor Inefficiencies to Fluid Stream
+  0,                                      !- Coefficient 1 of the Part Load Performance Curve
+  1,                                      !- Coefficient 2 of the Part Load Performance Curve
+  0,                                      !- Coefficient 3 of the Part Load Performance Curve
+  0,                                      !- Coefficient 4 of the Part Load Performance Curve
+  0,                                      !- Design Minimum Flow Rate {m3/s}
+  Continuous,                             !- Pump Control Type
+  ,                                       !- Pump Flow Rate Schedule Name
+  ,                                       !- Pump Curve Name
+  ,                                       !- Impeller Diameter {m}
+  ,                                       !- VFD Control Type
+  ,                                       !- Pump RPM Schedule Name
+  ,                                       !- Minimum Pressure Schedule {Pa}
+  ,                                       !- Maximum Pressure Schedule {Pa}
+  ,                                       !- Minimum RPM Schedule {rev/min}
+  ,                                       !- Maximum RPM Schedule {rev/min}
+  ,                                       !- Zone Name
+  0.5,                                    !- Skin Loss Radiative Fraction
+  PowerPerFlowPerPressure,                !- Design Power Sizing Method
+  348701.1,                               !- Design Electric Power per Unit Flow Rate {W/(m3/s)}
+  1.282051282,                            !- Design Shaft Power per Unit Flow Rate per Unit Head {W/((m3/s)-Pa)}
+  0,                                      !- Design Minimum Flow Rate Fraction
+  General;                                !- End-Use Subcategory
+
+! ===========================================================================
+! IF THERE'S DHW STORAGE -> ADD TANK; IF NO DHW STORAGE -> ADD HEAT EXCHANGER
+! ===========================================================================
+
+{% if IS_TANK_DHW %} ! (if IS_TANK_DHW == True)
+
+Branch,
+  plantloop_dhw Supply Branch 1,          !- Name
+  ,                                       !- Pressure Drop Curve Name
+  WaterHeater:Mixed,                      !- Component Object Type 1
+  tank_dhw,                               !- Component Name 1
+  node_dhw_3,                             !- Component Inlet Node Name 1
+  node_dhw_4;                             !- Component Outlet Node Name 1
+
+WaterHeater:Mixed,
+  tank_dhw,                               !- Name
+  {{ dhwVolume }},                                    !- Tank Volume {m3}
+  setpoint_tank_dhw,                      !- Setpoint Temperature Schedule Name
+  0.1,                                    !- Deadband Temperature Difference {deltaC}
+  80,                                     !- Maximum Temperature Limit {C}
+  Cycle,                                  !- Heater Control Type
+  0,                                      !- Heater Maximum Capacity {W}
+  ,                                       !- Heater Minimum Capacity {W}
+  0,                                      !- Heater Ignition Minimum Flow Rate {m3/s}
+  0,                                      !- Heater Ignition Delay {s}
+  Electricity,                            !- Heater Fuel Type
+  0.9,                                    !- Heater Thermal Efficiency
+  ,                                       !- Part Load Factor Curve Name
+  20,                                     !- Off Cycle Parasitic Fuel Consumption Rate {W}
+  Electricity,                             !- Off Cycle Parasitic Fuel Type
+  0.8,                                    !- Off Cycle Parasitic Heat Fraction to Tank
+  0,                                      !- On Cycle Parasitic Fuel Consumption Rate {W}
+  Electricity,                             !- On Cycle Parasitic Fuel Type
+  0,                                      !- On Cycle Parasitic Heat Fraction to Tank
+  Schedule,                                   !- Ambient Temperature Indicator
+  tank_env_temperature,                                       !- Ambient Temperature Schedule Name
+  ,                               !- Ambient Temperature Zone Name
+  ,                                       !- Ambient Temperature Outdoor Air Node Name
+  6,                                      !- Off Cycle Loss Coefficient to Ambient Temperature {W/K}
+  1,                                      !- Off Cycle Loss Fraction to Zone
+  6,                                      !- On Cycle Loss Coefficient to Ambient Temperature {W/K}
+  1,                                      !- On Cycle Loss Fraction to Zone
+  ,                                       !- Peak Use Flow Rate {m3/s}
+  ,                                       !- Use Flow Rate Fraction Schedule Name
+  ,                                       !- Cold Water Supply Temperature Schedule Name
+  node_dhw_3,                             !- Use Side Inlet Node Name
+  node_dhw_4,                             !- Use Side Outlet Node Name
+  1,                                      !- Use Side Effectiveness
+  node_hx_dhw_8,                          !- Source Side Inlet Node Name
+  node_hx_dhw_9,                          !- Source Side Outlet Node Name
+  1,                                      !- Source Side Effectiveness
+  Autosize,                               !- Use Side Design Flow Rate {m3/s}
+  Autosize,                               !- Source Side Design Flow Rate {m3/s}
+  1.5,                                    !- Indirect Water Heating Recovery Time {hr} ! Key parameter to increase the demand of hot water
+  StorageTank,            !- Source Side Flow Control Mode
+  ,                                       !- Indirect Alternate Setpoint Temperature Schedule Name
+  General;                                !- End-Use Subcategory
+
+Schedule:Constant,
+  setpoint_tank_dhw,                      !- Name
+  ,                                       !- Schedule Type Limits Name
+  {{ dhw_tank_setpoint }};                                     !- Hourly Value
+
+! Why commented? no need of defining sizing params if autosizing is not used as we pass the volume of the tank.
+!WaterHeater:Sizing,
+!  tank_dhw,                               !- WaterHeater Name
+!  PeakDraw,                               !- Design Mode
+!  0.538503,                               !- Time Storage Can Meet Peak Draw {hr}
+!  0,                                      !- Time for Tank Recovery {hr}
+!  1;                                      !- Nominal Tank Volume for Autosizing Plant Connections {m3}
+
+PlantEquipmentList,
+  plantloop_dhw Heating Equipment List,   !- Name
+  WaterHeater:Mixed,                      !- Equipment Object Type 1
+  tank_dhw;                               !- Equipment Name 1
+
+{% else %} ! (if IS_TANK_DHW == False) if no DHW storage then a heat exchanger object is used to bypass
+
+Branch,
+  plantloop_dhw Supply Branch 1,          !- Name
+  ,                                       !- Pressure Drop Curve Name
+  HeatExchanger:FluidToFluid,                      !- Component Object Type 1
+  tank_dhw_bypass,                               !- Component Name 1
+  node_dhw_3,                             !- Component Inlet Node Name 1
+  node_dhw_4;                             !- Component Outlet Node Name 1
+
+HeatExchanger:FluidToFluid,
+  tank_dhw_bypass,                                 !- Name
+  HX_DHW_bypass_On,
+  node_hx_dhw_8,                           !- Loop Demand Side Inlet Node Name
+  node_hx_dhw_9,                           !- Loop Demand Side Outlet Node Name
+  Autosize,                               !- Loop Demand Side Design Flow Rate {m3/s}
+  node_dhw_3,                        !- Loop Supply Side Inlet Node Name
+  node_dhw_4,                        !- Loop Supply Side Outlet Node Name
+  Autosize,                               !- Loop Supply Side Design Flow Rate {m3/s}
+  Ideal,                                  !- Heat Exchange Model Type
+  Autosize,                               !- Heat Exchanger U-Factor Times Area Value {W/K}
+  UncontrolledOn,                         !- Control Type
+  node_dhw_5,                          !- Heat Exchanger Setpoint Node Name
+  0.01,                                   !- Minimum Temperature Difference to Activate Heat Exchanger {deltaC}
+  LoopToLoop,                             !- Heat Transfer Metering End Use Type
+  ,                                       !- Component Override Loop Supply Side Inlet Node Name
+  ,                                       !- Component Override Loop Demand Side Inlet Node Name
+  Loop,                                   !- Component Override Cooling Control Temperature Mode
+  1,                                      !- Sizing Factor
+  0,                                      !- Operation Minimum Temperature Limit {C}
+  100;                                    !- Operation Maximum Temperature Limit {C}
+
+Schedule:Constant,
+  HX_DHW_bypass_On,
+  OnOff,
+  1;
+
+PlantEquipmentList,
+  plantloop_dhw Heating Equipment List,   !- Name
+  HeatExchanger:FluidToFluid,                      !- Equipment Object Type 1
+  tank_dhw_bypass;                               !- Equipment Name 1
+
+{% endif %}
+
+! ===========================================================================
+! ===========================================================================
+
+Branch,
+  plantloop_dhw Supply Outlet Branch,     !- Name
+  ,                                       !- Pressure Drop Curve Name
+  Pipe:Adiabatic,                         !- Component Object Type 1
+  plantloop_dhw Supply Outlet Pipe,       !- Component Name 1
+  plantloop_dhw Supply Outlet Pipe Node,  !- Component Inlet Node Name 1
+  node_dhw_5;                             !- Component Outlet Node Name 1
+
+Pipe:Adiabatic,
+  plantloop_dhw Supply Outlet Pipe,       !- Name
+  plantloop_dhw Supply Outlet Pipe Node,  !- Inlet Node Name
+  node_dhw_5;                             !- Outlet Node Name
+
+BranchList,
+  plantloop_dhw Demand Branches,          !- Name
+  plantloop_dhw Demand Inlet Branch,      !- Branch Name 1
+  plantloop_dhw Demand Branch 1,          !- Branch Name 2
+  plantloop_dhw Demand Bypass Branch,     !- Branch Name 3
+  plantloop_dhw Demand Outlet Branch;     !- Branch Name 4
+
+ConnectorList,
+  plantloop_dhw Demand Connector List,    !- Name
+  Connector:Splitter,                     !- Connector Object Type 1
+  plantloop_dhw Demand Splitter,          !- Connector Name 1
+  Connector:Mixer,                        !- Connector Object Type 2
+  plantloop_dhw Demand Mixer;             !- Connector Name 2
+
+Connector:Splitter,
+  plantloop_dhw Demand Splitter,          !- Name
+  plantloop_dhw Demand Inlet Branch,      !- Inlet Branch Name
+  plantloop_dhw Demand Branch 1,          !- Outlet Branch Name 1
+  plantloop_dhw Demand Bypass Branch;     !- Outlet Branch Name 2
+
+Connector:Mixer,
+  plantloop_dhw Demand Mixer,             !- Name
+  plantloop_dhw Demand Outlet Branch,     !- Outlet Branch Name
+  plantloop_dhw Demand Branch 1,          !- Inlet Branch Name 1
+  plantloop_dhw Demand Bypass Branch;     !- Inlet Branch Name 2
+
+Branch,
+  plantloop_dhw Demand Inlet Branch,      !- Name
+  ,                                       !- Pressure Drop Curve Name
+  Pipe:Adiabatic,                         !- Component Object Type 1
+  plantloop_dhw Demand Inlet Pipe,        !- Component Name 1
+  node_dhw_6,                             !- Component Inlet Node Name 1
+  plantloop_dhw Demand Inlet Pipe Node;   !- Component Outlet Node Name 1
+
+Pipe:Adiabatic,
+  plantloop_dhw Demand Inlet Pipe,        !- Name
+  node_dhw_6,                             !- Inlet Node Name
+  plantloop_dhw Demand Inlet Pipe Node;   !- Outlet Node Name
+
+Branch,
+  plantloop_dhw Demand Branch 1,          !- Name
+  ,                                       !- Pressure Drop Curve Name
+  WaterUse:Connections,                   !- Component Object Type 1
+  dhw_connection,                         !- Component Name 1
+  node_dhw_7,                             !- Component Inlet Node Name 1
+  node_dhw_8;                             !- Component Outlet Node Name 1
+
+Branch,
+  plantloop_dhw Demand Bypass Branch,     !- Name
+  ,                                       !- Pressure Drop Curve Name
+  Pipe:Adiabatic,                         !- Component Object Type 1
+  plantloop_dhw Demand Bypass Pipe,       !- Component Name 1
+  plantloop_dhw Demand Bypass Pipe Inlet Node, !- Component Inlet Node Name 1
+  plantloop_dhw Demand Bypass Pipe Outlet Node; !- Component Outlet Node Name 1
+
+Pipe:Adiabatic,
+  plantloop_dhw Demand Bypass Pipe,       !- Name
+  plantloop_dhw Demand Bypass Pipe Inlet Node, !- Inlet Node Name
+  plantloop_dhw Demand Bypass Pipe Outlet Node; !- Outlet Node Name
+
+Branch,
+  plantloop_dhw Demand Outlet Branch,     !- Name
+  ,                                       !- Pressure Drop Curve Name
+  Pipe:Adiabatic,                         !- Component Object Type 1
+  plantloop_dhw Demand Outlet Pipe,       !- Component Name 1
+  plantloop_dhw Demand Outlet Pipe Node,  !- Component Inlet Node Name 1
+  node_dhw_9;                             !- Component Outlet Node Name 1
+
+Pipe:Adiabatic,
+  plantloop_dhw Demand Outlet Pipe,       !- Name
+  plantloop_dhw Demand Outlet Pipe Node,  !- Inlet Node Name
+  node_dhw_9;                             !- Outlet Node Name
+
+PlantEquipmentOperationSchemes,
+  plantloop_dhw Operation Schemes,        !- Name
+  PlantEquipmentOperation:HeatingLoad,    !- Control Scheme Object Type 1
+  plantloop_dhw Heating Operation Scheme, !- Control Scheme Name 1
+  Always On Discrete;                     !- Control Scheme Schedule Name 1
+
+PlantEquipmentOperation:HeatingLoad,
+  plantloop_dhw Heating Operation Scheme, !- Name
+  0,                                      !- Load Range Lower Limit 1 {W}
+  1000000000,                             !- Load Range Upper Limit 1 {W}
+  plantloop_dhw Heating Equipment List;   !- Range Equipment List Name 1
+
+! ######
+! HVAC - DHW COMPONENT
+! ######
+
+WaterUse:Connections,
+  dhw_connection,                         !- Name
+  node_dhw_7,                             !- Inlet Node Name
+  node_dhw_8,                             !- Outlet Node Name
+  ,                                       !- Supply Water Storage Tank Name
+  ,                                       !- Reclamation Water Storage Tank Name
+  setpoint_dhw_use,                       !- Hot Water Supply Temperature Schedule Name
+  ,                                       !- Cold Water Supply Temperature Schedule Name
+  ,                                       !- Drain Water Heat Exchanger Type
+  ,                                       !- Drain Water Heat Exchanger Destination
+  ,                                       !- Drain Water Heat Exchanger U-Factor Times Area {W/K}
+  {% for fl in TOTAL_FLOORS_LIST %} ! (e.g. if 4 fls TOTAL_FLOORS_LIST=[0...3])
+  {% if loop.index0 < TOTAL_FLOORS_LEN-1 %}
+  dhw_fl{{ fl }}_thz0,                 !- Water Use Equipment Name
+  {% else %}
+  dhw_fl{{ fl }}_thz0;
+  {% endif %}
+  {% endfor %}
+
+Schedule:Constant,
+  setpoint_dhw_use,                       !- Name
+  Temperature,                                       !- Schedule Type Limits Name
+  {{ dhw_use_temperature }};                                     !- Hourly Value
+
+Schedule:Constant,
+  schedule_targetTemperature,            !- Name
+  Temperature,                                       !- Schedule Type Limits Name
+  {{ dhw_target_temperature }};                                   !- Hourly Value
+
+Schedule:Constant,
+  schedule_sensibleFraction_dhw,            !- Name
+  fractional,                                       !- Schedule Type Limits Name
+  0.05;                                   !- Hourly Value
+
+Schedule:Constant,
+  schedule_latentFraction_dhw,            !- Name
+  fractional,                                       !- Schedule Type Limits Name
+  0.05;                                   !- Hourly Value
+
+! ######
+! FLOOR N - DHW DEMAND
+! ######
+
+{% for fl in TOTAL_FLOORS_LIST %} ! (e.g. if 4 fls TOTAL_FLOORS_LIST=[0...3])
+
+WaterUse:Equipment,
+  dhw_fl{{ fl }}_thz0,                    !- Name
+  General,                                !- End-Use Subcategory
+  {{ dhw_rate_zone }},                                  !- Peak Flow Rate {m3/s} (3.0e-5 ~= 3100 kWh/dwelling/yr heating energy for DHW. Ref = 850 kWh/yr per person for DHW in Switzerland) 
+  schedule_dhw_use_fl{{ fl }}_thz0,       !- Flow Rate Fraction Schedule Name
+  schedule_targetTemperature,             !- Target Temperature Schedule Name
+  ,                                       !- Hot Water Supply Temperature Schedule Name
+  ,                                       !- Cold Water Supply Temperature Schedule Name
+  fl{{ fl }}_thz0,                        !- Zone Name
+  schedule_sensibleFraction_dhw,          !- Sensible Fraction Schedule Name
+  schedule_latentFraction_dhw;            !- Latent Fraction Schedule Name
+
+Schedule:Compact, ! SIA 385_2_2015
+  schedule_dhw_use_fl{{ fl }}_thz0,      !- Name
+  Fractional,                            !- Schedule Type Limits Name
+  Through: 12/31,                        
+  For: Weekdays,                          
+  Until: 01:00,                                
+  0.017,                                     
+  Until: 02:00,                                 
+  0.009,                      
+  Until: 04:00,                                 
+  0.005,                                      
+  Until: 04:00,                                 
+  0.003,                      
+  Until: 05:00,                                 
+  0.004,                      
+  Until: 06:00,                                  
+  0.006, ! 0.05
+  Until: 07:00,                                
+  0.033, ! 0.2                                    
+  Until: 08:00,                                 
+  0.062, ! 0.15                     
+  Until: 09:00,                                 
+  0.084,  ! 0.1                                    
+  Until: 10:00,                                 
+  0.058,                      
+  Until: 11:00,                                 
+  0.05,                      
+  Until: 12:00,                                  
+  0.05,                                            
+  Until: 13:00,                                
+  0.058,                    
+  Until: 14:00,                                  
+  0.06,
+  Until: 15:00,                                 
+  0.047,                                      
+  Until: 16:00,                                 
+  0.041,                      
+  Until: 17:00,                                 
+  0.038,                      
+  Until: 18:00,                                  
+  0.045,                                            
+  Until: 19:00,                                
+  0.056, ! 0.05                   
+  Until: 20:00,                                  
+  0.066,  ! 0.2                                      
+  Until: 21:00,                                 
+  0.064,  ! 0.2
+  Until: 22:00,                                 
+  0.061, ! 0.05                      
+  Until: 23:00,                                  
+  0.05,                                                             
+  Until: 24:00,                                 
+  0.034,
+  For: AllOtherDays,                          
+  Until: 01:00,                                
+  0.019,                                     
+  Until: 02:00,                                 
+  0.012,                      
+  Until: 04:00,                                 
+  0.007,                                      
+  Until: 04:00,                                 
+  0.004,                      
+  Until: 05:00,                                 
+  0.002,                      
+  Until: 06:00,                                  
+  0.004, ! 0.05
+  Until: 07:00,                                
+  0.003, ! 0.2                                    
+  Until: 08:00,                                 
+  0.009, ! 0.15                     
+  Until: 09:00,                                 
+  0.028,  ! 0.1                                    
+  Until: 10:00,                                 
+  0.054,                      
+  Until: 11:00,                                 
+  0.09,                      
+  Until: 12:00,                                  
+  0.087,                                            
+  Until: 13:00,                                
+  0.077,                    
+  Until: 14:00,                                  
+  0.075,
+  Until: 15:00,                                 
+  0.06,                                      
+  Until: 16:00,                                 
+  0.053,                      
+  Until: 17:00,                                 
+  0.055,                      
+  Until: 18:00,                                  
+  0.053,                                            
+  Until: 19:00,                                
+  0.061, ! 0.05                   
+  Until: 20:00,                                  
+  0.062,  ! 0.2                                      
+  Until: 21:00,                                 
+  0.071,  ! 0.2
+  Until: 22:00,                                 
+  0.05, ! 0.05                      
+  Until: 23:00,                                  
+  0.034,                                                             
+  Until: 24:00,                                 
+  0.027;                                       
+
+{% endfor %}
+
+
+! ###################################################################################
+! ###################################################################################
+! ###################################################################################
+
+! ######
+! HVAC - HEAT EXCHANGER TO SH TANK
+! ######
+
+PlantLoop,
+  plantloop_hx_sh,                        !- Name
+  Water,                                  !- Fluid Type
+  ,                                       !- User Defined Fluid Type
+  plantloop_hx_sh Operation Schemes,      !- Plant Equipment Operation Scheme Name
+  node_hx_sh_5,                           !- Loop Temperature Setpoint Node Name
+  100,                                    !- Maximum Loop Temperature {C}
+  0,                                      !- Minimum Loop Temperature {C}
+  Autosize,                               !- Maximum Loop Flow Rate {m3/s}
+  0,                                      !- Minimum Loop Flow Rate {m3/s}
+  Autocalculate,                          !- Plant Loop Volume {m3}
+  node_hx_sh_1,                           !- Plant Side Inlet Node Name
+  node_hx_sh_5,                           !- Plant Side Outlet Node Name
+  plantloop_hx_sh Supply Branches,        !- Plant Side Branch List Name
+  plantloop_hx_sh Supply Connector List,  !- Plant Side Connector List Name
+  node_hx_sh_6,                           !- Demand Side Inlet Node Name
+  node_hx_sh_9,                           !- Demand Side Outlet Node Name
+  plantloop_hx_sh Demand Branches,        !- Demand Side Branch List Name
+  plantloop_hx_sh Demand Connector List,  !- Demand Side Connector List Name
+  SequentialLoad,                                !- Load Distribution Scheme
+  plantloop_hx_sh_avm_list,                                       !- Availability Manager List Name
+  SingleSetpoint,                         !- Plant Loop Demand Calculation Scheme
+  None;                                   !- Common Pipe Simulation
+
+AvailabilityManagerAssignmentList,
+  plantloop_hx_sh_avm_list,        !- Name
+  AvailabilityManager:Scheduled,   !- Availability Manager 1 Object Type
+  plantloop_hx_sh_avail_manager;   !- Availability Manager 1 Name
+
+AvailabilityManager:Scheduled,
+  plantloop_hx_sh_avail_manager,   !- Name
+  schedule_summer_off;     !- Schedule Name
+
+Schedule:Compact,
+  schedule_summer_off,  !- Name
+  On/Off,                       !- Schedule Type Limits Name
+  Through: 05/14,  For: AllDays, Until: 24:00, 1,   ! before May 15 -> ON
+  Through: 09/30,  For: AllDays, Until: 24:00, 0,   ! May 15–Sep 30 -> OFF
+  Through: 12/31,  For: AllDays, Until: 24:00, 1;   ! Oct 1–Dec 31 -> ON
+
+Sizing:Plant,
+  plantloop_hx_sh,                        !- Plant or Condenser Loop Name
+  Heating,                                !- Loop Type
+  58,                                     !- Design Loop Exit Temperature {C}
+  2,                                      !- Loop Design Temperature Difference {deltaC}
+  NonCoincident,                          !- Sizing Option
+  1,                                      !- Zone Timesteps in Averaging Window
+  None;                                   !- Coincident Sizing Factor Mode
+
+
+SetpointManager:Scheduled,
+  setpoint_loop_hx_sh,                    !- Name
+  Temperature,                            !- Control Variable
+  schedule_setpoint_loop_hx_sh,           !- Schedule Name
+  node_hx_sh_5;                           !- Setpoint Node or NodeList Name
+
+Schedule:Constant,
+  schedule_setpoint_loop_hx_sh,           !- Name
+  ,                                       !- Schedule Type Limits Name
+  {{ sh_flow_temperature }};                                     !- Hourly Value
+
+BranchList,
+  plantloop_hx_sh Supply Branches,        !- Name
+  plantloop_hx_sh Supply Inlet Branch,    !- Branch Name 1
+  plantloop_hx_sh Supply Branch 1,        !- Branch Name 2
+  plantloop_hx_sh Supply Outlet Branch;   !- Branch Name 3
+
+ConnectorList,
+  plantloop_hx_sh Supply Connector List,  !- Name
+  Connector:Splitter,                     !- Connector Object Type 1
+  plantloop_hx_sh Supply Splitter,        !- Connector Name 1
+  Connector:Mixer,                        !- Connector Object Type 2
+  plantloop_hx_sh Supply Mixer;           !- Connector Name 2
+
+Connector:Splitter,
+  plantloop_hx_sh Supply Splitter,        !- Name
+  plantloop_hx_sh Supply Inlet Branch,    !- Inlet Branch Name
+  plantloop_hx_sh Supply Branch 1;        !- Outlet Branch Name 1
+
+Connector:Mixer,
+  plantloop_hx_sh Supply Mixer,           !- Name
+  plantloop_hx_sh Supply Outlet Branch,   !- Outlet Branch Name
+  plantloop_hx_sh Supply Branch 1;        !- Inlet Branch Name 1
+
+Branch,
+  plantloop_hx_sh Supply Inlet Branch,    !- Name
+  ,                                       !- Pressure Drop Curve Name
+  Pump:VariableSpeed,                     !- Component Object Type 1
+  pump_hx_sh,                             !- Component Name 1
+  node_hx_sh_1,                           !- Component Inlet Node Name 1
+  node_hx_sh_2;                           !- Component Outlet Node Name 1
+
+Pump:VariableSpeed,
+  pump_hx_sh,                             !- Name
+  node_hx_sh_1,                           !- Inlet Node Name
+  node_hx_sh_2,                           !- Outlet Node Name
+  Autosize,                               !- Design Maximum Flow Rate {m3/s}
+  179352,                                 !- Design Pump Head {Pa}
+  Autosize,                               !- Design Power Consumption {W}
+  0.9,                                    !- Motor Efficiency
+  0,                                      !- Fraction of Motor Inefficiencies to Fluid Stream
+  0,                                      !- Coefficient 1 of the Part Load Performance Curve
+  1,                                      !- Coefficient 2 of the Part Load Performance Curve
+  0,                                      !- Coefficient 3 of the Part Load Performance Curve
+  0,                                      !- Coefficient 4 of the Part Load Performance Curve
+  0,                                      !- Design Minimum Flow Rate {m3/s}
+  Continuous,                             !- Pump Control Type
+  ,                                       !- Pump Flow Rate Schedule Name
+  ,                                       !- Pump Curve Name
+  ,                                       !- Impeller Diameter {m}
+  ,                                       !- VFD Control Type
+  ,                                       !- Pump RPM Schedule Name
+  ,                                       !- Minimum Pressure Schedule {Pa}
+  ,                                       !- Maximum Pressure Schedule {Pa}
+  ,                                       !- Minimum RPM Schedule {rev/min}
+  ,                                       !- Maximum RPM Schedule {rev/min}
+  ,                                       !- Zone Name
+  0.5,                                    !- Skin Loss Radiative Fraction
+  PowerPerFlowPerPressure,                !- Design Power Sizing Method
+  348701.1,                               !- Design Electric Power per Unit Flow Rate {W/(m3/s)}
+  1.282051282,                            !- Design Shaft Power per Unit Flow Rate per Unit Head {W/((m3/s)-Pa)}
+  0,                                      !- Design Minimum Flow Rate Fraction
+  General;                                !- End-Use Subcategory
+
+Branch,
+  plantloop_hx_sh Supply Branch 1,        !- Name
+  ,                                       !- Pressure Drop Curve Name
+  HeatExchanger:FluidToFluid,             !- Component Object Type 1
+  hx_sh,                                  !- Component Name 1
+  node_hx_sh_3,                           !- Component Inlet Node Name 1
+  node_hx_sh_4;                           !- Component Outlet Node Name 1
+
+Branch,
+  plantloop_hx_sh Supply Outlet Branch,   !- Name
+  ,                                       !- Pressure Drop Curve Name
+  Pipe:Adiabatic,                         !- Component Object Type 1
+  plantloop_hx_sh Supply Outlet Pipe,     !- Component Name 1
+  plantloop_hx_sh Supply Outlet Pipe Node, !- Component Inlet Node Name 1
+  node_hx_sh_5;                           !- Component Outlet Node Name 1
+
+Pipe:Adiabatic,
+  plantloop_hx_sh Supply Outlet Pipe,     !- Name
+  plantloop_hx_sh Supply Outlet Pipe Node, !- Inlet Node Name
+  node_hx_sh_5;                           !- Outlet Node Name
+
+BranchList,
+  plantloop_hx_sh Demand Branches,        !- Name
+  plantloop_hx_sh Demand Inlet Branch,    !- Branch Name 1
+  plantloop_hx_sh Demand Branch 1,        !- Branch Name 2
+  plantloop_hx_sh Demand Bypass Branch,   !- Branch Name 3
+  plantloop_hx_sh Demand Outlet Branch;   !- Branch Name 4
+
+ConnectorList,
+  plantloop_hx_sh Demand Connector List,  !- Name
+  Connector:Splitter,                     !- Connector Object Type 1
+  plantloop_hx_sh Demand Splitter,        !- Connector Name 1
+  Connector:Mixer,                        !- Connector Object Type 2
+  plantloop_hx_sh Demand Mixer;           !- Connector Name 2
+
+Connector:Splitter,
+  plantloop_hx_sh Demand Splitter,        !- Name
+  plantloop_hx_sh Demand Inlet Branch,    !- Inlet Branch Name
+  plantloop_hx_sh Demand Branch 1,        !- Outlet Branch Name 1
+  plantloop_hx_sh Demand Bypass Branch;   !- Outlet Branch Name 2
+
+Connector:Mixer,
+  plantloop_hx_sh Demand Mixer,           !- Name
+  plantloop_hx_sh Demand Outlet Branch,   !- Outlet Branch Name
+  plantloop_hx_sh Demand Branch 1,        !- Inlet Branch Name 1
+  plantloop_hx_sh Demand Bypass Branch;   !- Inlet Branch Name 2
+
+Branch,
+  plantloop_hx_sh Demand Inlet Branch,    !- Name
+  ,                                       !- Pressure Drop Curve Name
+  Pipe:Adiabatic,                         !- Component Object Type 1
+  plantloop_hx_sh Demand Inlet Pipe,      !- Component Name 1
+  node_hx_sh_6,                           !- Component Inlet Node Name 1
+  plantloop_hx_sh Demand Inlet Pipe Node; !- Component Outlet Node Name 1
+
+Pipe:Adiabatic,
+  plantloop_hx_sh Demand Inlet Pipe,      !- Name
+  node_hx_sh_6,                           !- Inlet Node Name
+  plantloop_hx_sh Demand Inlet Pipe Node; !- Outlet Node Name
+
+! ===========================================================================
+! IF THERE'S SH STORAGE -> ADD TANK; IF NO SH STORAGE -> ADD HEAT EXCHANGER
+! ===========================================================================
+
+{% if IS_TANK_SH %} ! (if IS_TANK_SH == True)
+
+Branch,
+  plantloop_hx_sh Demand Branch 1,        !- Name
+  ,                                       !- Pressure Drop Curve Name
+  WaterHeater:Mixed,                      !- Component Object Type 1
+  tank_sh,                                !- Component Name 1
+  node_hx_sh_7,                           !- Component Inlet Node Name 1
+  node_hx_sh_8;                           !- Component Outlet Node Name 1
+
+{% else %} ! (if IS_TANK_SH == False)
+
+Branch,
+  plantloop_hx_sh Demand Branch 1,        !- Name
+  ,                                       !- Pressure Drop Curve Name
+  HeatExchanger:FluidToFluid,                      !- Component Object Type 1
+  tank_sh_bypass,                                !- Component Name 1
+  node_hx_sh_7,                           !- Component Inlet Node Name 1
+  node_hx_sh_8;                           !- Component Outlet Node Name 1
+
+{% endif %}
+
+! ===========================================================================
+! ===========================================================================
+
+Schedule:Compact,
+  tank_env_temperature,      !- Name
+  Temperature,                            !- Schedule Type Limits Name
+  Through: 12/31,                         !- Field 1
+  For: AllDays,                           !- Field 2
+  Until: 24:00,                           !- Field 3
+  18;                                     !- Field 4
+
+Branch,
+  plantloop_hx_sh Demand Bypass Branch,   !- Name
+  ,                                       !- Pressure Drop Curve Name
+  Pipe:Adiabatic,                         !- Component Object Type 1
+  plantloop_hx_sh Demand Bypass Pipe,     !- Component Name 1
+  plantloop_hx_sh Demand Bypass Pipe Inlet Node, !- Component Inlet Node Name 1
+  plantloop_hx_sh Demand Bypass Pipe Outlet Node; !- Component Outlet Node Name 1
+
+Pipe:Adiabatic,
+  plantloop_hx_sh Demand Bypass Pipe,     !- Name
+  plantloop_hx_sh Demand Bypass Pipe Inlet Node, !- Inlet Node Name
+  plantloop_hx_sh Demand Bypass Pipe Outlet Node; !- Outlet Node Name
+
+Branch,
+  plantloop_hx_sh Demand Outlet Branch,   !- Name
+  ,                                       !- Pressure Drop Curve Name
+  Pipe:Adiabatic,                         !- Component Object Type 1
+  plantloop_hx_sh Demand Outlet Pipe,     !- Component Name 1
+  plantloop_hx_sh Demand Outlet Pipe Node, !- Component Inlet Node Name 1
+  node_hx_sh_9;                           !- Component Outlet Node Name 1
+
+Pipe:Adiabatic,
+  plantloop_hx_sh Demand Outlet Pipe,     !- Name
+  plantloop_hx_sh Demand Outlet Pipe Node, !- Inlet Node Name
+  node_hx_sh_9;                           !- Outlet Node Name
+
+PlantEquipmentOperationSchemes,
+  plantloop_hx_sh Operation Schemes,      !- Name
+  PlantEquipmentOperation:HeatingLoad,    !- Control Scheme Object Type 1
+  plantloop_hx_sh Heating Operation Scheme, !- Control Scheme Name 1
+  Always On Discrete;                     !- Control Scheme Schedule Name 1
+
+PlantEquipmentOperation:HeatingLoad,
+  plantloop_hx_sh Heating Operation Scheme, !- Name
+  0,                                      !- Load Range Lower Limit 1 {W}
+  1000000000,                             !- Load Range Upper Limit 1 {W}
+  plantloop_hx_sh Heating Equipment List; !- Range Equipment List Name 1
+
+PlantEquipmentList,
+  plantloop_hx_sh Heating Equipment List, !- Name
+  HeatExchanger:FluidToFluid,             !- Equipment Object Type 1
+  hx_sh;                                  !- Equipment Name 1
+
+
+! ###################################################################################
+! ###################################################################################
+! ###################################################################################
+
+! ######
+! HVAC - SH TANK TO EMITTERS
+! ######
+
+PlantLoop,
+  plantloop_sh,                           !- Name
+  Water,                                  !- Fluid Type
+  ,                                       !- User Defined Fluid Type
+  plantloop_sh Operation Schemes,         !- Plant Equipment Operation Scheme Name
+  node_sh_5,                              !- Loop Temperature Setpoint Node Name
+  100,                                    !- Maximum Loop Temperature {C}
+  0,                                      !- Minimum Loop Temperature {C}
+  Autosize,                               !- Maximum Loop Flow Rate {m3/s}
+  0,                                      !- Minimum Loop Flow Rate {m3/s}
+  Autocalculate,                          !- Plant Loop Volume {m3}
+  node_sh_1,                              !- Plant Side Inlet Node Name
+  node_sh_5,                              !- Plant Side Outlet Node Name
+  plantloop_sh Supply Branches,           !- Plant Side Branch List Name
+  plantloop_sh Supply Connector List,     !- Plant Side Connector List Name
+  node_sh_6,                              !- Demand Side Inlet Node Name
+  node_sh_9,                              !- Demand Side Outlet Node Name
+  plantloop_sh Demand Branches,           !- Demand Side Branch List Name
+  plantloop_sh Demand Connector List,     !- Demand Side Connector List Name
+  SequentialLoad,                         !- Load Distribution Scheme
+  plantloop_sh_avm_list,                  !- Availability Manager List Name
+  SingleSetpoint,                         !- Plant Loop Demand Calculation Scheme
+  None;                                   !- Common Pipe Simulation
+
+AvailabilityManagerAssignmentList,
+  plantloop_sh_avm_list,        !- Name
+  AvailabilityManager:Scheduled,   !- Availability Manager 1 Object Type
+  plantloop_sh_avail_manager;   !- Availability Manager 1 Name
+
+AvailabilityManager:Scheduled,
+  plantloop_sh_avail_manager,   !- Name
+  schedule_summer_off;     !- Schedule Name
+
+Sizing:Plant,
+  plantloop_sh,                           !- Plant or Condenser Loop Name
+  Heating,                                !- Loop Type
+  58,                                     !- Design Loop Exit Temperature {C}
+  2,                                      !- Loop Design Temperature Difference {deltaC}
+  NonCoincident,                          !- Sizing Option
+  1,                                      !- Zone Timesteps in Averaging Window
+  None;                                   !- Coincident Sizing Factor Mode
+
+SetpointManager:Scheduled,
+  setpoint_loop_sh,                       !- Name
+  Temperature,                            !- Control Variable
+  schedule_setpoint_loop_sh,              !- Schedule Name
+  node_sh_5;                              !- Setpoint Node or NodeList Name
+
+Schedule:Constant,
+  schedule_setpoint_loop_sh,              !- Name
+  ,                                       !- Schedule Type Limits Name
+  {{ sh_flow_temperature }};                                     !- Hourly Value
+
+Schedule:Compact,
+  schedule_availability_emitter, !- Name
+  Fractional,                               !- Schedule Type Limits Name
+  Through: 5/15,                          
+  For: AllDays,                           
+  Until: 24:00,                           
+  1,                                      
+  Through: 9/30,                          
+  For: AllDays,                           
+  Until: 24:00,                           
+  0,                                      
+  Through: 12/31,                         
+  For: AllDays,                           
+  Until: 24:00,                           
+  1;   
+
+! ===========================================================================
+! IF THERE'S SH STORAGE -> ADD TANK; IF NO SH STORAGE -> ADD HEAT EXCHANGER
+! ===========================================================================
+
+{% if IS_TANK_SH %} ! (if IS_TANK_SH == True)
+
+Branch,
+  plantloop_sh Supply Branch 1,           !- Name
+  ,                                       !- Pressure Drop Curve Name
+  WaterHeater:Mixed,                      !- Component Object Type 1
+  tank_sh,                                !- Component Name 1
+  node_sh_3,                              !- Component Inlet Node Name 1
+  node_sh_4;                              !- Component Outlet Node Name 1
+
+PlantEquipmentList,
+  plantloop_sh Heating Equipment List,    !- Name
+  WaterHeater:Mixed,                      !- Equipment Object Type 1
+  tank_sh;                                !- Equipment Name 1
+
+WaterHeater:Mixed,
+  tank_sh,                                !- Name
+  {{ shVolume }},                                      !- Tank Volume {m3}
+  setpoint_tank_sh,                       !- Setpoint Temperature Schedule Name
+  0.01,                                    !- Deadband Temperature Difference {deltaC}
+  82.22,                                  !- Maximum Temperature Limit {C}
+  Cycle,                                  !- Heater Control Type
+  0,                                      !- Heater Maximum Capacity {W}
+  ,                                       !- Heater Minimum Capacity {W}
+  0,                                      !- Heater Ignition Minimum Flow Rate {m3/s}
+  0,                                      !- Heater Ignition Delay {s}
+  NaturalGas,                             !- Heater Fuel Type
+  0.8,                                    !- Heater Thermal Efficiency
+  ,                                       !- Part Load Factor Curve Name
+  20,                                     !- Off Cycle Parasitic Fuel Consumption Rate {W}
+  NaturalGas,                             !- Off Cycle Parasitic Fuel Type
+  0.8,                                    !- Off Cycle Parasitic Heat Fraction to Tank
+  0,                                      !- On Cycle Parasitic Fuel Consumption Rate {W}
+  NaturalGas,                             !- On Cycle Parasitic Fuel Type
+  0,                                      !- On Cycle Parasitic Heat Fraction to Tank
+  Schedule,                                   !- Ambient Temperature Indicator
+  tank_env_temperature,                                       !- Ambient Temperature Schedule Name
+  ,                               !- Ambient Temperature Zone Name
+  ,                                       !- Ambient Temperature Outdoor Air Node Name
+  6,                                      !- Off Cycle Loss Coefficient to Ambient Temperature {W/K}
+  1,                                      !- Off Cycle Loss Fraction to Zone
+  6,                                      !- On Cycle Loss Coefficient to Ambient Temperature {W/K}
+  1,                                      !- On Cycle Loss Fraction to Zone
+  ,                                       !- Peak Use Flow Rate {m3/s}
+  ,                                       !- Use Flow Rate Fraction Schedule Name
+  ,                                       !- Cold Water Supply Temperature Schedule Name
+  node_sh_3,                              !- Use Side Inlet Node Name
+  node_sh_4,                              !- Use Side Outlet Node Name
+  1,                                      !- Use Side Effectiveness
+  node_hx_sh_7,                           !- Source Side Inlet Node Name
+  node_hx_sh_8,                           !- Source Side Outlet Node Name
+  1,                                      !- Source Side Effectiveness
+  Autosize,                               !- Use Side Design Flow Rate {m3/s}
+  Autosize,                               !- Source Side Design Flow Rate {m3/s}
+  0.5,                                    !- Indirect Water Heating Recovery Time {hr} ! Key parameter to increase the demand of hot water
+  StorageTank,            !- Source Side Flow Control Mode
+  ,                                       !- Indirect Alternate Setpoint Temperature Schedule Name
+  General;                                !- End-Use Subcategory
+
+Schedule:Compact,
+  setpoint_tank_sh,      !- Name
+  Temperature,                            !- Schedule Type Limits Name
+  Through: 5/15,                         !- Field 1
+  For: AllDays,                           !- Field 2
+  Until: 24:00,                           !- Field 3
+  {{ sh_tank_setpoint }},
+  Through: 9/30,
+  For: AllDays,                           !- Field 2
+  Until: 24:00,                           !- Field 3
+  10,
+  Through: 12/31,
+  For: AllDays,                           !- Field 2
+  Until: 24:00,                           !- Field 3
+  {{ sh_tank_setpoint }};
+
+!WaterHeater:Sizing,
+!  tank_sh,                                !- WaterHeater Name
+!  PeakDraw,                               !- Design Mode
+!  0.538503,                               !- Time Storage Can Meet Peak Draw {hr}
+!  0,                                      !- Time for Tank Recovery {hr}
+!  1;                                      !- Nominal Tank Volume for Autosizing Plant Connections {m3}
+
+{% else %} ! (if IS_TANK_SH == False)
+
+Branch,
+  plantloop_sh Supply Branch 1,           !- Name
+  ,                                       !- Pressure Drop Curve Name
+  HeatExchanger:FluidToFluid,                      !- Component Object Type 1
+  tank_sh_bypass,                                !- Component Name 1
+  node_sh_3,                              !- Component Inlet Node Name 1
+  node_sh_4;                              !- Component Outlet Node Name 1
+
+HeatExchanger:FluidToFluid,
+  tank_sh_bypass,                                 !- Name
+  HX_SH_bypass_On,                                       !- Availability Schedule Name
+  node_hx_sh_7,                           !- Loop Demand Side Inlet Node Name
+  node_hx_sh_8,                           !- Loop Demand Side Outlet Node Name
+  Autosize,                               !- Loop Demand Side Design Flow Rate {m3/s}
+  node_sh_3,                        !- Loop Supply Side Inlet Node Name
+  node_sh_4,                        !- Loop Supply Side Outlet Node Name
+  Autosize,                               !- Loop Supply Side Design Flow Rate {m3/s}
+  Ideal,                                  !- Heat Exchange Model Type
+  Autosize,                               !- Heat Exchanger U-Factor Times Area Value {W/K}
+  UncontrolledOn,                         !- Control Type
+  node_sh_5,                          !- Heat Exchanger Setpoint Node Name
+  0.01,                                   !- Minimum Temperature Difference to Activate Heat Exchanger {deltaC}
+  LoopToLoop,                             !- Heat Transfer Metering End Use Type
+  ,                                       !- Component Override Loop Supply Side Inlet Node Name
+  ,                                       !- Component Override Loop Demand Side Inlet Node Name
+  Loop,                                   !- Component Override Cooling Control Temperature Mode
+  1,                                      !- Sizing Factor
+  0,                                      !- Operation Minimum Temperature Limit {C}
+  100;                                    !- Operation Maximum Temperature Limit {C}
+
+Schedule:Constant,
+  HX_SH_bypass_On,
+  OnOff,
+  1;
+
+PlantEquipmentList,
+  plantloop_sh Heating Equipment List,    !- Name
+  HeatExchanger:FluidToFluid,                      !- Equipment Object Type 1
+  tank_sh_bypass;                                !- Equipment Name 1
+
+
+{% endif %}
+
+! ===========================================================================
+! ===========================================================================
+
+BranchList,
+  plantloop_sh Supply Branches,           !- Name
+  plantloop_sh Supply Inlet Branch,       !- Branch Name 1
+  plantloop_sh Supply Branch 1,           !- Branch Name 2
+  plantloop_sh Supply Outlet Branch;      !- Branch Name 3
+
+ConnectorList,
+  plantloop_sh Supply Connector List,     !- Name
+  Connector:Splitter,                     !- Connector Object Type 1
+  plantloop_sh Supply Splitter,           !- Connector Name 1
+  Connector:Mixer,                        !- Connector Object Type 2
+  plantloop_sh Supply Mixer;              !- Connector Name 2
+
+Connector:Splitter,
+  plantloop_sh Supply Splitter,           !- Name
+  plantloop_sh Supply Inlet Branch,       !- Inlet Branch Name
+  plantloop_sh Supply Branch 1;           !- Outlet Branch Name 1
+
+Connector:Mixer,
+  plantloop_sh Supply Mixer,              !- Name
+  plantloop_sh Supply Outlet Branch,      !- Outlet Branch Name
+  plantloop_sh Supply Branch 1;           !- Inlet Branch Name 1
+
+Branch,
+  plantloop_sh Supply Inlet Branch,       !- Name
+  ,                                       !- Pressure Drop Curve Name
+  Pump:VariableSpeed,                     !- Component Object Type 1
+  pump_sh,                                !- Component Name 1
+  node_sh_1,                              !- Component Inlet Node Name 1
+  node_sh_2;                              !- Component Outlet Node Name 1
+
+Pump:VariableSpeed,
+  pump_sh,                                !- Name
+  node_sh_1,                              !- Inlet Node Name
+  node_sh_2,                              !- Outlet Node Name
+  Autosize,                               !- Design Maximum Flow Rate {m3/s}
+  179352,                                 !- Design Pump Head {Pa}
+  Autosize,                               !- Design Power Consumption {W}
+  0.9,                                    !- Motor Efficiency
+  0,                                      !- Fraction of Motor Inefficiencies to Fluid Stream
+  0,                                      !- Coefficient 1 of the Part Load Performance Curve
+  1,                                      !- Coefficient 2 of the Part Load Performance Curve
+  0,                                      !- Coefficient 3 of the Part Load Performance Curve
+  0,                                      !- Coefficient 4 of the Part Load Performance Curve
+  0,                                      !- Design Minimum Flow Rate {m3/s}
+  Continuous,                             !- Pump Control Type
+  ,                                       !- Pump Flow Rate Schedule Name
+  ,                                       !- Pump Curve Name
+  ,                                       !- Impeller Diameter {m}
+  ,                                       !- VFD Control Type
+  ,                                       !- Pump RPM Schedule Name
+  ,                                       !- Minimum Pressure Schedule {Pa}
+  ,                                       !- Maximum Pressure Schedule {Pa}
+  ,                                       !- Minimum RPM Schedule {rev/min}
+  ,                                       !- Maximum RPM Schedule {rev/min}
+  ,                                       !- Zone Name
+  0.5,                                    !- Skin Loss Radiative Fraction
+  PowerPerFlowPerPressure,                !- Design Power Sizing Method
+  348701.1,                               !- Design Electric Power per Unit Flow Rate {W/(m3/s)}
+  1.282051282,                            !- Design Shaft Power per Unit Flow Rate per Unit Head {W/((m3/s)-Pa)}
+  0,                                      !- Design Minimum Flow Rate Fraction
+  General;                                !- End-Use Subcategory
+
+Branch,
+  plantloop_sh Supply Outlet Branch,      !- Name
+  ,                                       !- Pressure Drop Curve Name
+  Pipe:Adiabatic,                         !- Component Object Type 1
+  plantloop_sh Supply Outlet Pipe,        !- Component Name 1
+  plantloop_sh Supply Outlet Pipe Node,   !- Component Inlet Node Name 1
+  node_sh_5;                              !- Component Outlet Node Name 1
+
+Pipe:Adiabatic,
+  plantloop_sh Supply Outlet Pipe,        !- Name
+  plantloop_sh Supply Outlet Pipe Node,   !- Inlet Node Name
+  node_sh_5;                              !- Outlet Node Name
+
+BranchList,
+  plantloop_sh Demand Branches,           !- Name
+  plantloop_sh Demand Inlet Branch,       !- Branch Name 1
+  {% for fl in TOTAL_FLOORS_LIST %}
+  plantloop_sh Demand Branch {{ fl }},           !- Branch Name 2
+  {% endfor %}
+  plantloop_sh Demand Bypass Branch,      !- Branch Name 5
+  plantloop_sh Demand Outlet Branch;      !- Branch Name 6
+
+ConnectorList,
+  plantloop_sh Demand Connector List,     !- Name
+  Connector:Splitter,                     !- Connector Object Type 1
+  plantloop_sh Demand Splitter,           !- Connector Name 1
+  Connector:Mixer,                        !- Connector Object Type 2
+  plantloop_sh Demand Mixer;              !- Connector Name 2
+
+Connector:Splitter,
+  plantloop_sh Demand Splitter,           !- Name
+  plantloop_sh Demand Inlet Branch,       !- Inlet Branch Name
+  {% for fl in TOTAL_FLOORS_LIST %}
+  plantloop_sh Demand Branch {{ fl }},           !- Branch Name 2
+  {% endfor %}
+  plantloop_sh Demand Bypass Branch;      !- Outlet Branch Name 4
+
+Connector:Mixer,
+  plantloop_sh Demand Mixer,              !- Name
+  plantloop_sh Demand Outlet Branch,      !- Outlet Branch Name
+  {% for fl in TOTAL_FLOORS_LIST %}
+  plantloop_sh Demand Branch {{ fl }},           !- Branch Name 2
+  {% endfor %}
+  plantloop_sh Demand Bypass Branch;      !- Inlet Branch Name 4
+
+Branch,
+  plantloop_sh Demand Inlet Branch,       !- Name
+  ,                                       !- Pressure Drop Curve Name
+  Pipe:Adiabatic,                         !- Component Object Type 1
+  plantloop_sh Demand Inlet Pipe,         !- Component Name 1
+  node_sh_6,                              !- Component Inlet Node Name 1
+  plantloop_sh Demand Inlet Pipe Node;    !- Component Outlet Node Name 1
+
+Pipe:Adiabatic,
+  plantloop_sh Demand Inlet Pipe,         !- Name
+  node_sh_6,                              !- Inlet Node Name
+  plantloop_sh Demand Inlet Pipe Node;    !- Outlet Node Name
+
+! ===========================================================================
+! IF THERE'S RADIANT FLOOR -> ADD RADIANT FLOOR OBJECT; IF NO RADIANT FLOOR -> ADD BASEBOARD RADIANT CONVECTIVE (RADIATORS) OBJECT
+! ===========================================================================
+
+{% for fl in TOTAL_FLOORS_LIST %} ! (e.g. if 4 fls TOTAL_FLOORS_LIST=[0...3])
+
+Branch,
+  plantloop_sh Demand Branch {{ fl }},           !- Name
+  ,                                       !- Pressure Drop Curve Name
+  {% if IS_RADIANTFLOOR %}
+  ZoneHVAC:LowTemperatureRadiant:VariableFlow, !- Component Object Type 1
+  {% else %} ! RADIATORS
+  ZoneHVAC:Baseboard:RadiantConvective:Water,
+  {% endif %}
+  emitter_fl{{ fl }}_thz0,                  !- Component Name 1
+  node_sh_7_{{ fl }},                            !- Component Inlet Node Name 1
+  node_sh_8_{{ fl }};                            !- Component Outlet Node Name 1
+
+! ######
+! FLOOR 0 - HVAC EMITTER: RADIANT FLOOR
+! ######
+
+ZoneHVAC:EquipmentList,
+  fl{{ fl }}_thz0 Equipment List,                !- Name
+  SequentialLoad,                         !- Load Distribution Scheme
+  {% if IS_RADIANTFLOOR %}
+  ZoneHVAC:LowTemperatureRadiant:VariableFlow, !- Component Object Type 1
+  {% else %} ! RADIATORS
+  ZoneHVAC:Baseboard:RadiantConvective:Water,
+  {% endif %}
+  emitter_fl{{ fl }}_thz0,         !- Zone Equipment Name 1
+  1,                                      !- Zone Equipment Cooling Sequence 1
+  1,                                      !- Zone Equipment Heating or No-Load Sequence 1
+  ,                                       !- Zone Equipment Sequential Cooling Fraction Schedule Name 1
+  ;                                       !- Zone Equipment Sequential Heating Fraction Schedule Name 1
+
+{% if IS_RADIANTFLOOR %} ! radiantFloor
+
+ZoneHVAC:LowTemperatureRadiant:VariableFlow,
+  emitter_fl{{ fl }}_thz0,                  !- Name
+  emitter_fl{{ fl }}_thz0 Design,           !- Design Object
+  schedule_availability_emitter,!- Availability Schedule Name
+  fl{{ fl }}_thz0,                               !- Zone Name
+  radiantSurface_radiantFloor_fl{{ fl }}_thz0,            !- Surface Name or Radiant Surface Group Name
+  Autosize,                               !- Hydronic Tubing Length {m}
+  Autosize,                               !- Heating Design Capacity {W}
+  Autosize,                               !- Maximum Hot Water Flow {m3/s}
+  node_sh_7_{{ fl }},                            !- Heating Water Inlet Node Name
+  node_sh_8_{{ fl }},                            !- Heating Water Outlet Node Name
+  0,                                      !- Cooling Design Capacity {W}
+  0,                                      !- Maximum Cold Water Flow {m3/s}
+  ,                                       !- Cooling Water Inlet Node Name
+  ,                                       !- Cooling Water Outlet Node Name
+  CalculateFromCircuitLength,             !- Number of Circuits
+  106;                                    !- Circuit Length {m}
+
+ZoneHVAC:LowTemperatureRadiant:VariableFlow:Design,
+  emitter_fl{{ fl }}_thz0 Design,           !- Name
+  ConvectionOnly,                         !- Fluid to Radiant Surface Heat Transfer Model
+  0.013,                                  !- Hydronic Tubing Inside Diameter {m}
+  0.016,                                  !- Hydronic Tubing Outside Diameter {m}
+  0.35,                                   !- Hydronic Tubing Conductivity {W/m-K}
+  MeanAirTemperature,                     !- Temperature Control Type
+  ZeroFlowPower,                          !- Setpoint Control Type
+  HeatingDesignCapacity,                  !- Heating Design Capacity Method
+  0,                                      !- Heating Design Capacity Per Floor Area {W/m2}
+  1,                                      !- Fraction of Autosized Heating Design Capacity
+  0.5,                                    !- Heating Control Throttling Range {deltaC}
+  schedule_heatingsetpoint_fl{{ fl }}_thz0,      !- Heating Control Temperature Schedule Name
+  CoolingDesignCapacity,                  !- Cooling Design Capacity Method
+  0,                                      !- Cooling Design Capacity Per Floor Area {W/m2}
+  1,                                      !- Fraction of Autosized Cooling Design Capacity
+  0.5,                                    !- Cooling Control Throttling Range {deltaC}
+  ,                                       !- Cooling Control Temperature Schedule Name
+  SimpleOff,                              !- Condensation Control Type
+  1;                                      !- Condensation Control Dewpoint Offset {C}
+
+ZoneHVAC:LowTemperatureRadiant:SurfaceGroup,
+  radiantSurface_radiantFloor_fl{{ fl }}_thz0,            !- Name
+  fl{{ fl }}_thz0_GroundFloor,                   !- Surface Name 1
+  1;                                      !- Flow Fraction for Surface 1
+
+{% else %} ! radiators
+
+ZoneHVAC:Baseboard:RadiantConvective:Water,
+  emitter_fl{{ fl }}_thz0,         !- Name
+  emitter_fl{{ fl }}_thz0 Design,  !- Design Object
+  schedule_availability_emitter,          !- Availability Schedule Name
+  node_sh_7_{{ fl }},              !- Inlet Node Name
+  node_sh_8_{{ fl }},              !- Outlet Node Name
+  {{ ratedWaterTemperature }},                                     !- Rated Average Water Temperature {C} VAR
+  {{ ratedWaterMassFlowRate }},                                  !- Rated Water Mass Flow Rate {kg/s}
+  Autosize,                               !- Heating Design Capacity {W}
+  AutoSize,                               !- Maximum Water Flow Rate {m3/s}
+  fl{{ fl }}_thz0_GroundFloor,           !- Surface Name 1
+  0.035,                                  !- Fraction of Radiant Energy to Surface 1
+  fl{{ fl }}_thz0_Wall_1,                      !- Surface Name 2
+  0.09625,                                !- Fraction of Radiant Energy to Surface 2
+  fl{{ fl }}_thz0_Wall_0,                      !- Surface Name 3
+  0.09625,                                !- Fraction of Radiant Energy to Surface 3
+  fl{{ fl }}_thz0_Roof,                        !- Surface Name 4
+  0.28,                                   !- Fraction of Radiant Energy to Surface 4
+  fl{{ fl }}_thz0_Wall_2,                      !- Surface Name 5
+  0.09625,                                !- Fraction of Radiant Energy to Surface 5
+  fl{{ fl }}_thz0_Wall_3,                      !- Surface Name 6
+  0.09625;                                !- Fraction of Radiant Energy to Surface 6
+
+ZoneHVAC:Baseboard:RadiantConvective:Water:Design,
+  emitter_fl{{ fl }}_thz0 Design, !- Name
+  HeatingDesignCapacity,                  !- Heating Design Capacity Method
+  ,                                      !- Heating Design Capacity Per Floor Area {W/m2}
+  1,                                      !- Fraction of Autosized Heating Design Capacity
+  0.2,                                    !- Convergence Tolerance (0.2 is ok)
+  0.2,                                    !- Fraction Radiant
+  0.3;                                    !- Fraction of Radiant Energy Incident on People
+
+{% endif %}
+{% endfor %}
+
+! ===========================================================================
+! ===========================================================================
+  
+Branch,
+  plantloop_sh Demand Bypass Branch,      !- Name
+  ,                                       !- Pressure Drop Curve Name
+  Pipe:Adiabatic,                         !- Component Object Type 1
+  plantloop_sh Demand Bypass Pipe,        !- Component Name 1
+  plantloop_sh Demand Bypass Pipe Inlet Node, !- Component Inlet Node Name 1
+  plantloop_sh Demand Bypass Pipe Outlet Node; !- Component Outlet Node Name 1
+
+Pipe:Adiabatic,
+  plantloop_sh Demand Bypass Pipe,        !- Name
+  plantloop_sh Demand Bypass Pipe Inlet Node, !- Inlet Node Name
+  plantloop_sh Demand Bypass Pipe Outlet Node; !- Outlet Node Name
+
+Branch,
+  plantloop_sh Demand Outlet Branch,      !- Name
+  ,                                       !- Pressure Drop Curve Name
+  Pipe:Adiabatic,                         !- Component Object Type 1
+  plantloop_sh Demand Outlet Pipe,        !- Component Name 1
+  plantloop_sh Demand Outlet Pipe Node,   !- Component Inlet Node Name 1
+  node_sh_9;                              !- Component Outlet Node Name 1
+
+Pipe:Adiabatic,
+  plantloop_sh Demand Outlet Pipe,        !- Name
+  plantloop_sh Demand Outlet Pipe Node,   !- Inlet Node Name
+  node_sh_9;                              !- Outlet Node Name
+
+PlantEquipmentOperationSchemes,
+  plantloop_sh Operation Schemes,         !- Name
+  PlantEquipmentOperation:HeatingLoad,    !- Control Scheme Object Type 1
+  plantloop_sh Heating Operation Scheme,  !- Control Scheme Name 1
+  Always On Discrete;                     !- Control Scheme Schedule Name 1
+
+PlantEquipmentOperation:HeatingLoad,
+  plantloop_sh Heating Operation Scheme,  !- Name
+  0,                                      !- Load Range Lower Limit 1 {W}
+  1000000000,                             !- Load Range Upper Limit 1 {W}
+  plantloop_sh Heating Equipment List;    !- Range Equipment List Name 1
+
+! ###################################################################################
+! ###################################################################################
+! ###################################################################################
+
+! ######
+! HVAC - SOLAR COLLECTOR TO HX 
+! ######
+
+PlantLoop,
+  plantloop_sol_hx,                       !- Name
+  Water,                                  !- Fluid Type
+  ,                                       !- User Defined Fluid Type
+  plantloop_sol_hx Operation Schemes,     !- Plant Equipment Operation Scheme Name
+  node_sol_hx_5,                          !- Loop Temperature Setpoint Node Name
+  100,                                    !- Maximum Loop Temperature {C}
+  0,                                      !- Minimum Loop Temperature {C}
+  Autosize,                               !- Maximum Loop Flow Rate {m3/s}
+  0,                                      !- Minimum Loop Flow Rate {m3/s}
+  Autocalculate,                          !- Plant Loop Volume {m3}
+  node_sol_hx_1,                          !- Plant Side Inlet Node Name
+  node_sol_hx_5,                          !- Plant Side Outlet Node Name
+  plantloop_sol_hx Supply Branches,       !- Plant Side Branch List Name
+  plantloop_sol_hx Supply Connector List, !- Plant Side Connector List Name
+  node_sol_hx_6,                          !- Demand Side Inlet Node Name
+  node_sol_hx_9,                          !- Demand Side Outlet Node Name
+  plantloop_sol_hx Demand Branches,       !- Demand Side Branch List Name
+  plantloop_sol_hx Demand Connector List, !- Demand Side Connector List Name
+  SequentialLoad,                                !- Load Distribution Scheme
+  plantloop_sol_hx_AvailabilityManagerAssignmentList,  !- Availability Manager List Name
+  SingleSetpoint,                         !- Plant Loop Demand Calculation Scheme
+  None;                                   !- Common Pipe Simulation
+
+! ===========================================================================
+! IF THERE'S SOLAR COLLECTOR -> AVAILABILITY IS ON; IF NO SOLAR COLLECTOR -> AVAILABILITY IS OFF
+! ===========================================================================
+
+{% if IS_SOLAR %}
+
+AvailabilityManagerAssignmentList,
+  plantloop_sol_hx_AvailabilityManagerAssignmentList, !- Name
+  AvailabilityManager:DifferentialThermostat, !- Availability Manager Object Type 2
+  plantloop_sol_hx_availabilityManager;   !- Availability Manager Name 2
+
+
+AvailabilityManager:DifferentialThermostat,
+  plantloop_sol_hx_availabilityManager,   !- Name
+  node_sol_hx_4_0,                        !- Hot Node Name
+  node_hx_dhw_2,                          !- Cold Node Name
+  10,                                     !- Temperature Difference On Limit {deltaC}
+  2;                                      !- Temperature Difference Off Limit {deltaC}
+
+Schedule:Constant,
+  schedule_hx_sol_availability,          !- Name
+  ,                                       !- Schedule Type Limits Name
+  1;                                     !- Hourly Value (= 0 if no solar)
+
+! The solar loop starts circulating when the collector outlet is 10 °C hotter than the tank return.
+! It stops when that difference falls below 2 °C.
+! Between 2 °C and 10 °C, the "EMS" remembers its previous state (hysteresis).
+
+
+{% else %}
+
+AvailabilityManagerAssignmentList,
+  plantloop_sol_hx_AvailabilityManagerAssignmentList, !- Name
+  AvailabilityManager:Scheduled,          !- Availability Manager Object Type 1
+  plantloop_sol_hx_availabilityManager_availability; !- Availability Manager Name 1
+
+AvailabilityManager:Scheduled,
+  plantloop_sol_hx_availabilityManager_availability, !- Name
+  schedule_hx_sol_availability;                      !- Schedule Name
+
+Schedule:Constant,
+  schedule_hx_sol_availability,          !- Name
+  ,                                       !- Schedule Type Limits Name
+  0;                                     !- Hourly Value (= 0 if no solar)
+
+{% endif %}
+
+
+
+
+
+! ===========================================================================
+! ===========================================================================
+
+Sizing:Plant,
+  plantloop_sol_hx,                       !- Plant or Condenser Loop Name
+  Heating,                                !- Loop Type
+  {{ solar_flow_temperature }},                                     !- Design Loop Exit Temperature {C}
+  2,                                     !- Loop Design Temperature Difference {deltaC}
+  NonCoincident,                          !- Sizing Option
+  1,                                      !- Zone Timesteps in Averaging Window
+  None;                                   !- Coincident Sizing Factor Mode
+
+SetpointManager:Scheduled,
+  setpoint_loop_sol_hx,                   !- Name
+  Temperature,                            !- Control Variable
+  schedule_setpoint_loop_sol_hx,          !- Schedule Name
+  node_sol_hx_5;                          !- Setpoint Node or NodeList Name
+
+Schedule:Constant,
+  schedule_setpoint_loop_sol_hx,          !- Name
+  ,                                       !- Schedule Type Limits Name
+  {{ solar_flow_temperature }};                                     !- Hourly Value
+
+BranchList,
+  plantloop_sol_hx Supply Branches,       !- Name
+  plantloop_sol_hx Supply Inlet Branch,   !- Branch Name 1
+  plantloop_sol_hx Supply Branch 1,       !- Branch Name 2
+  plantloop_sol_hx Supply Branch 2,       !- Branch Name 3
+  plantloop_sol_hx Supply Outlet Branch;  !- Branch Name 4
+
+ConnectorList,
+  plantloop_sol_hx Supply Connector List, !- Name
+  Connector:Splitter,                     !- Connector Object Type 1
+  plantloop_sol_hx Supply Splitter,       !- Connector Name 1
+  Connector:Mixer,                        !- Connector Object Type 2
+  plantloop_sol_hx Supply Mixer;          !- Connector Name 2
+
+Connector:Splitter,
+  plantloop_sol_hx Supply Splitter,       !- Name
+  plantloop_sol_hx Supply Inlet Branch,   !- Inlet Branch Name
+  plantloop_sol_hx Supply Branch 1,       !- Outlet Branch Name 1
+  plantloop_sol_hx Supply Branch 2;       !- Outlet Branch Name 2
+
+Connector:Mixer,
+  plantloop_sol_hx Supply Mixer,          !- Name
+  plantloop_sol_hx Supply Outlet Branch,  !- Outlet Branch Name
+  plantloop_sol_hx Supply Branch 1,       !- Inlet Branch Name 1
+  plantloop_sol_hx Supply Branch 2;       !- Inlet Branch Name 2
+
+Branch,
+  plantloop_sol_hx Supply Inlet Branch,   !- Name
+  ,                                       !- Pressure Drop Curve Name
+  Pump:VariableSpeed,                     !- Component Object Type 1
+  pump_sol_hx,                            !- Component Name 1
+  node_sol_hx_1,                          !- Component Inlet Node Name 1
+  node_sol_hx_2;                          !- Component Outlet Node Name 1
+
+Pump:VariableSpeed,
+  pump_sol_hx,                            !- Name
+  node_sol_hx_1,                          !- Inlet Node Name
+  node_sol_hx_2,                          !- Outlet Node Name
+  Autosize,                               !- Design Maximum Flow Rate {m3/s}
+  179352,                                 !- Design Pump Head {Pa}
+  Autosize,                               !- Design Power Consumption {W}
+  0.9,                                    !- Motor Efficiency
+  0,                                      !- Fraction of Motor Inefficiencies to Fluid Stream
+  0,                                      !- Coefficient 1 of the Part Load Performance Curve
+  1,                                      !- Coefficient 2 of the Part Load Performance Curve
+  0,                                      !- Coefficient 3 of the Part Load Performance Curve
+  0,                                      !- Coefficient 4 of the Part Load Performance Curve
+  0,                                      !- Design Minimum Flow Rate {m3/s}
+  Continuous,                             !- Pump Control Type
+  ,                                       !- Pump Flow Rate Schedule Name
+  ,                                       !- Pump Curve Name
+  ,                                       !- Impeller Diameter {m}
+  ,                                       !- VFD Control Type
+  ,                                       !- Pump RPM Schedule Name
+  ,                                       !- Minimum Pressure Schedule {Pa}
+  ,                                       !- Maximum Pressure Schedule {Pa}
+  ,                                       !- Minimum RPM Schedule {rev/min}
+  ,                                       !- Maximum RPM Schedule {rev/min}
+  ,                                       !- Zone Name
+  0.5,                                    !- Skin Loss Radiative Fraction
+  PowerPerFlowPerPressure,                !- Design Power Sizing Method
+  348701.1,                               !- Design Electric Power per Unit Flow Rate {W/(m3/s)}
+  1.282051282,                            !- Design Shaft Power per Unit Flow Rate per Unit Head {W/((m3/s)-Pa)}
+  0,                                      !- Design Minimum Flow Rate Fraction
+  General;                                !- End-Use Subcategory
+
+Branch,
+  plantloop_sol_hx Supply Branch 1,       !- Name
+  ,                                       !- Pressure Drop Curve Name
+  SolarCollector:FlatPlate:Water,         !- Component Object Type 1
+  solar_collector_flatPlate,       !- Component Name 1
+  node_sol_hx_3_0,                        !- Component Inlet Node Name 1
+  node_sol_hx_4_0;                        !- Component Outlet Node Name 1
+
+SolarCollector:FlatPlate:Water,
+  solar_collector_flatPlate,              !- Name
+  solar_collector_flatPlate_performance,  !- SolarCollectorPerformance Name
+  solar_panels_surface_0,                 !- Surface Name
+  node_sol_hx_3_0,                        !- Inlet Node Name
+  node_sol_hx_4_0;                        !- Outlet Node Name
+
+!SolarCollectorPerformance:FlatPlate,
+!  solar_collector_flatPlate_performance,  !- Name
+!  2.212,                                  !- Gross Area {m2}
+!  Water,                                  !- Test Fluid
+!  3.85e-05,                               !- Test Flow Rate {m3/s}
+!  Inlet,                                  !- Test Correlation Type
+!  0.638,                                  !- Coefficient 1 of Efficiency Equation {dimensionless}
+!  -4.2645,                                !- Coefficient 2 of Efficiency Equation {W/m2-K}
+!  -0.0297,                                !- Coefficient 3 of Efficiency Equation {W/m2-K2}
+!  0.0248,                                 !- Coefficient 2 of Incident Angle Modifier
+!  -0.0861;                                !- Coefficient 3 of Incident Angle Modifier
+
+SolarCollectorPerformance:FlatPlate,
+  solar_collector_flatPlate_performance,  !- Name
+  3.7162,                                  !- Gross Area {m2}
+  Water,                                  !- Test Fluid
+  3.85e-05,                               !- Test Flow Rate {m3/s}
+  Inlet,                                  !- Test Correlation Type
+  0.691,                                  !- Coefficient 1 of Efficiency Equation {dimensionless}
+  -3.396,                                !- Coefficient 2 of Efficiency Equation {W/m2-K}
+  -0.00193,                                !- Coefficient 3 of Efficiency Equation {W/m2-K2}
+  -0.1939,                                 !- Coefficient 2 of Incident Angle Modifier
+  -0.0055;                                !- Coefficient 3 of Incident Angle Modifier
+
+!Shading:Site:Detailed,
+!  solar_panels_surface_0,                 !- Name
+!  ,                                       !- Transmittance Schedule Name
+!  ,                                       !- Number of Vertices
+!  0, 2.2, 8.3,                            !- X,Y,Z Vertex 1 {m}
+!  0, 0, 7.2,                              !- X,Y,Z Vertex 2 {m}
+!  2.72727272727273, 0, 7.2,               !- X,Y,Z Vertex 3 {m}
+!  2.72727272727273, 2.2, 8.3;             !- X,Y,Z Vertex 4 {m}
+
+Branch,
+  plantloop_sol_hx Supply Branch 2,       !- Name
+  ,                                       !- Pressure Drop Curve Name
+  TemperingValve,                         !- Component Object Type 1
+  Tempering Valve,                        !- Component Name 1
+  node_sol_hx_3_1,                        !- Component Inlet Node Name 1
+  node_sol_hx_4_1;                        !- Component Outlet Node Name 1
+
+TemperingValve,
+  Tempering Valve,                        !- Name
+  node_sol_hx_3_1,                        !- Inlet Node Name
+  node_sol_hx_4_1,                        !- Outlet Node Name
+  node_sol_hx_4_0,                        !- Stream 2 Source Node Name
+  node_sol_hx_5,                          !- Temperature Setpoint Node Name
+  node_sol_hx_2;                          !- Pump Outlet Node Name
+
+Branch,
+  plantloop_sol_hx Supply Outlet Branch,  !- Name
+  ,                                       !- Pressure Drop Curve Name
+  Pipe:Adiabatic,                         !- Component Object Type 1
+  plantloop_sol_hx Supply Outlet Pipe,    !- Component Name 1
+  plantloop_sol_hx Supply Outlet Pipe Node, !- Component Inlet Node Name 1
+  node_sol_hx_5;                          !- Component Outlet Node Name 1
+
+Pipe:Adiabatic,
+  plantloop_sol_hx Supply Outlet Pipe,    !- Name
+  plantloop_sol_hx Supply Outlet Pipe Node, !- Inlet Node Name
+  node_sol_hx_5;                          !- Outlet Node Name
+
+BranchList,
+  plantloop_sol_hx Demand Branches,       !- Name
+  plantloop_sol_hx Demand Inlet Branch,   !- Branch Name 1
+  plantloop_sol_hx Demand Branch 1,       !- Branch Name 2
+  plantloop_sol_hx Demand Bypass Branch,  !- Branch Name 3
+  plantloop_sol_hx Demand Outlet Branch;  !- Branch Name 4
+
+ConnectorList,
+  plantloop_sol_hx Demand Connector List, !- Name
+  Connector:Splitter,                     !- Connector Object Type 1
+  plantloop_sol_hx Demand Splitter,       !- Connector Name 1
+  Connector:Mixer,                        !- Connector Object Type 2
+  plantloop_sol_hx Demand Mixer;          !- Connector Name 2
+
+Connector:Splitter,
+  plantloop_sol_hx Demand Splitter,       !- Name
+  plantloop_sol_hx Demand Inlet Branch,   !- Inlet Branch Name
+  plantloop_sol_hx Demand Branch 1,       !- Outlet Branch Name 1
+  plantloop_sol_hx Demand Bypass Branch;  !- Outlet Branch Name 2
+
+Connector:Mixer,
+  plantloop_sol_hx Demand Mixer,          !- Name
+  plantloop_sol_hx Demand Outlet Branch,  !- Outlet Branch Name
+  plantloop_sol_hx Demand Branch 1,       !- Inlet Branch Name 1
+  plantloop_sol_hx Demand Bypass Branch;  !- Inlet Branch Name 2
+
+Branch,
+  plantloop_sol_hx Demand Inlet Branch,   !- Name
+  ,                                       !- Pressure Drop Curve Name
+  Pipe:Adiabatic,                         !- Component Object Type 1
+  plantloop_sol_hx Demand Inlet Pipe,     !- Component Name 1
+  node_sol_hx_6,                          !- Component Inlet Node Name 1
+  plantloop_sol_hx Demand Inlet Pipe Node; !- Component Outlet Node Name 1
+
+Pipe:Adiabatic,
+  plantloop_sol_hx Demand Inlet Pipe,     !- Name
+  node_sol_hx_6,                          !- Inlet Node Name
+  plantloop_sol_hx Demand Inlet Pipe Node; !- Outlet Node Name
+
+Branch,
+  plantloop_sol_hx Demand Branch 1,       !- Name
+  ,                                       !- Pressure Drop Curve Name
+  HeatExchanger:FluidToFluid,             !- Component Object Type 1
+  hx_sol,                                 !- Component Name 1
+  node_sol_hx_7,                          !- Component Inlet Node Name 1
+  node_sol_hx_8;                          !- Component Outlet Node Name 1
+
+Branch,
+  plantloop_sol_hx Demand Bypass Branch,  !- Name
+  ,                                       !- Pressure Drop Curve Name
+  Pipe:Adiabatic,                         !- Component Object Type 1
+  plantloop_sol_hx Demand Bypass Pipe,    !- Component Name 1
+  plantloop_sol_hx Demand Bypass Pipe Inlet Node, !- Component Inlet Node Name 1
+  plantloop_sol_hx Demand Bypass Pipe Outlet Node; !- Component Outlet Node Name 1
+
+Pipe:Adiabatic,
+  plantloop_sol_hx Demand Bypass Pipe,    !- Name
+  plantloop_sol_hx Demand Bypass Pipe Inlet Node, !- Inlet Node Name
+  plantloop_sol_hx Demand Bypass Pipe Outlet Node; !- Outlet Node Name
+
+Branch,
+  plantloop_sol_hx Demand Outlet Branch,  !- Name
+  ,                                       !- Pressure Drop Curve Name
+  Pipe:Adiabatic,                         !- Component Object Type 1
+  plantloop_sol_hx Demand Outlet Pipe,    !- Component Name 1
+  plantloop_sol_hx Demand Outlet Pipe Node, !- Component Inlet Node Name 1
+  node_sol_hx_9;                          !- Component Outlet Node Name 1
+
+Pipe:Adiabatic,
+  plantloop_sol_hx Demand Outlet Pipe,    !- Name
+  plantloop_sol_hx Demand Outlet Pipe Node, !- Inlet Node Name
+  node_sol_hx_9;                          !- Outlet Node Name
+
+PlantEquipmentOperationSchemes,
+  plantloop_sol_hx Operation Schemes,     !- Name
+  PlantEquipmentOperation:HeatingLoad,    !- Control Scheme Object Type 1
+  plantloop_sol_hx Heating Operation Scheme, !- Control Scheme Name 1
+  Always On Discrete;                     !- Control Scheme Schedule Name 1
+
+PlantEquipmentOperation:HeatingLoad,
+  plantloop_sol_hx Heating Operation Scheme, !- Name
+  0,                                      !- Load Range Lower Limit 1 {W}
+  1000000000,                             !- Load Range Upper Limit 1 {W}
+  plantloop_sol_hx Heating Equipment List; !- Range Equipment List Name 1
+
+PlantEquipmentList,
+  plantloop_sol_hx Heating Equipment List, !- Name
+  SolarCollector:FlatPlate:Water,         !- Equipment Object Type 1
+  solar_collector_flatPlate;       !- Equipment Name 1
+
+Schedule:Constant,
+  Always On Discrete,                     !- Name
+  OnOff,                                  !- Schedule Type Limits Name
+  1;                                      !- Hourly Value
+
+! ###################################################################################
+! ###################################################################################
+! ###################################################################################
+
+
+
+
+
+
+
+

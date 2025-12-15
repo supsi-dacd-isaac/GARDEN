@@ -1,0 +1,28 @@
+!- ELECTRIC EQUIPMENT
+{% for fl in TOTAL_FLOORS_LIST %} ! (e.g. if 4 fls total_floors_list=[0...3])!- floorsToSimulateList created in 'idf_generator.py'
+
+ElectricEquipment,
+  fl{{ fl }}_thz0_Appliances,             !- Name
+  fl{{ fl }}_thz0 Space,                  !- Zone or ZoneList or Space or SpaceList Name
+  SFH_NOMINAL_electric_appliances_fraction_schedule,          !- Schedule Name
+  Watts/Area,                             !- Design Level Calculation Method
+  ,                                       !- Design Level {W}
+  {{ appliances_power_square_meter }},    !- Watts per Floor Area {W/m2} (def. 8)
+  ,                                       !- Watts per Person {W/person}
+  0,                                      !- Fraction Latent
+  0,                                      !- Fraction Radiant
+  1,                                      !- Fraction Lost
+  appliances;                             !- End-Use Subcategory
+{% endfor %} !- END floor Loop
+
+SCHEDULE:FILE,
+    SFH_NOMINAL_electric_appliances_fraction_schedule,    !- Name
+    FRACTION,                 !- Schedule Type Limits Name
+    .\templates\profiles\SIA2024_SFH_nominal.csv,    !- File Name
+    4,                        !- Column Number
+    1,                       !- Rows to Skip at Top
+    8760,                     !- Number of Hours of Data
+    Semicolon,                !- Column Separator
+    Yes;                       !- Interpolate to Timestep
+
+! END appliances

@@ -1,0 +1,94 @@
+MATERIAL,
+    Gr2_L1,    !- Name
+    Rough,                    !- Roughness
+    0.015,                    !- Thickness
+    0.87,                     !- Conductivity
+    1600,                     !- Density
+    1000,                     !- Specific Heat
+    0.9,                      !- Thermal Absorptance
+    0.6,                      !- Solar Absorptance
+    0.6;                      !- Visible Absorptance
+
+MATERIAL,
+    Gr2_L2,    !- Name
+    Rough,                    !- Roughness
+    0.16,                     !- Thickness
+    2.3,                      !- Conductivity
+    2300,                     !- Density
+    1000,                     !- Specific Heat
+    0.9,                      !- Thermal Absorptance
+    0.6,                      !- Solar Absorptance
+    0.6;                      !- Visible Absorptance
+
+MATERIAL,
+    Gr2_L3,    !- Name
+    Rough,                    !- Roughness
+    0.03,                     !- Thickness
+    0.047,                    !- Conductivity
+    250,                      !- Density
+    1300,                     !- Specific Heat
+    0.9,                      !- Thermal Absorptance
+    0.6,                      !- Solar Absorptance
+    0.6;                      !- Visible Absorptance
+
+MATERIAL,
+    Gr2_L4,    !- Name
+    Rough,                    !- Roughness
+    0.02,                     !- Thickness
+    0.7,                      !- Conductivity
+    1600,                     !- Density
+    1000,                     !- Specific Heat
+    0.9,                      !- Thermal Absorptance
+    0.7,                      !- Solar Absorptance
+    0.7;                      !- Visible Absorptance
+
+MATERIAL,
+    Gr2_L5,    !- Name
+    Rough,                    !- Roughness
+    0.025,                    !- Thickness
+    0.14,                     !- Conductivity
+    550,                      !- Density
+    2300,                     !- Specific Heat
+    0.9,                      !- Thermal Absorptance
+    0.6,                      !- Solar Absorptance
+    0.6;                      !- Visible Absorptance
+
+MATERIAL,
+    internal_ceiling_L1,    !- Name
+    Rough,                    !- Roughness
+    0.1,                      !- Thickness
+    1.4,                      !- Conductivity
+    2100,                     !- Density
+    840,                      !- Specific Heat
+    0.9,                      !- Thermal Absorptance
+    0.6,                      !- Solar Absorptance
+    0.6;                      !- Visible Absorptance
+
+CONSTRUCTION,
+    Ground_construction_ground,    !- Name
+    Gr2_L1,    !- Outside Layer
+    Gr2_L2,    !- Layer 2
+    Gr2_L3,    !- Layer 3
+    Gr2_L4,    !- Layer 4
+    Gr2_L5;    !- Layer 5
+
+Material,
+  insulation_layer,  !- Name
+  Rough,                                  !- Roughness
+  0.03,                                 !- Thickness {m}
+  0.02,                                   !- Conductivity {W/m-K}
+  56.06,                                  !- Density {kg/m3}
+  1210,                                   !- Specific Heat {J/kg-K}
+  0.9,                                    !- Thermal Absorptance
+  0.7,                                    !- Solar Absorptance
+  0.7;                                    !- Visible Absorptance
+
+CONSTRUCTION,
+    Internal_ceiling,    !- Name
+    internal_ceiling_L1,
+    insulation_layer;    !- Outside Layer
+
+CONSTRUCTION,
+    Ground_construction,    !- Name
+    insulation_layer,
+    internal_ceiling_L1;    !- Outside Layer

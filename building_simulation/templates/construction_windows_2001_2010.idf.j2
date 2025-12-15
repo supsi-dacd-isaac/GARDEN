@@ -1,0 +1,95 @@
+WINDOWMATERIAL:GLAZING,
+    Wi3_L1,    !- Name
+    SpectralAverage,          !- Optical Data Type
+    ,                         !- Window Glass Spectral Data Set Name
+    0.005,                    !- Thickness
+    0.85,                     !- Solar Transmittance at Normal Incidence
+    0.077,                    !- Front Side Solar Reflectance at Normal Incidence
+    0.077,                    !- Back Side Solar Reflectance at Normal Incidence
+    0.904,                    !- Visible Transmittance at Normal Incidence
+    0.083,                    !- Front Side Visible Reflectance at Normal Incidence
+    0.083,                    !- Back Side Visible Reflectance at Normal Incidence
+    0,                        !- Infrared Transmittance at Normal Incidence
+    0.84,                     !- Front Side Infrared Hemispherical Emissivity
+    0.84,                     !- Back Side Infrared Hemispherical Emissivity
+    1,                        !- Conductivity
+    1,                        !- Dirt Correction Factor for Solar and Visible Transmittance
+    No,                       !- Solar Diffusing
+    72000000000,              !- Youngs modulus
+    0.22;                     !- Poissons ratio
+
+WINDOWMATERIAL:GLAZING,
+    Wi3_L3,    !- Name
+    SpectralAverage,          !- Optical Data Type
+    ,                         !- Window Glass Spectral Data Set Name
+    0.005,                    !- Thickness
+    0.591,                    !- Solar Transmittance at Normal Incidence
+    0.289,                    !- Front Side Solar Reflectance at Normal Incidence
+    0.225,                    !- Back Side Solar Reflectance at Normal Incidence
+    0.896,                    !- Visible Transmittance at Normal Incidence
+    0.044,                    !- Front Side Visible Reflectance at Normal Incidence
+    0.048,                    !- Back Side Visible Reflectance at Normal Incidence
+    0,                        !- Infrared Transmittance at Normal Incidence
+    0.041,                    !- Front Side Infrared Hemispherical Emissivity
+    0.84,                     !- Back Side Infrared Hemispherical Emissivity
+    1,                        !- Conductivity
+    1,                        !- Dirt Correction Factor for Solar and Visible Transmittance
+    No,                       !- Solar Diffusing
+    72000000000,              !- Youngs modulus
+    0.22;                     !- Poissons ratio
+
+WINDOWMATERIAL:GAS,
+    Wi3_L2,    !- Name
+    Krypton,                  !- Gas Type
+    0.01;                     !- Thickness
+
+CONSTRUCTION,
+    Window_construction,    !- Name
+    Wi3_L1,    !- Outside Layer
+    Wi3_L2,    !- Layer 2
+    Wi3_L3;    !- Layer 3
+
+WindowMaterial:Shade,
+  Shade0101,                              !- Name
+  0.31,                                   !- Solar Transmittance {dimensionless}
+  0.5,                                    !- Solar Reflectance {dimensionless}
+  0.31,                                   !- Visible Transmittance {dimensionless}
+  0.5,                                    !- Visible Reflectance {dimensionless}
+  0.9,                                    !- Infrared Hemispherical Emissivity {dimensionless}
+  0,                                      !- Infrared Transmittance {dimensionless}
+  0.001,                                  !- Thickness {m}
+  0.9,                                    !- Conductivity {W/m-K}
+  0.1,                                    !- Shade to Glass Distance {m}
+  0,                                      !- Top Opening Multiplier
+  0,                                      !- Bottom Opening Multiplier
+  0,                                      !- Left-Side Opening Multiplier
+  0,                                      !- Right-Side Opening Multiplier
+  0;                                      !- Airflow Permeability {dimensionless}
+
+WindowProperty:FrameAndDivider,
+  Frame_construction,           !- Name
+  0.04,                                   !- Frame Width {m}
+  0,                                      !- Frame Outside Projection {m}
+  0,                                      !- Frame Inside Projection {m}
+  9.5,                                    !- Frame Conductance {W/m2-K}
+  1,                                      !- Ratio of Frame-Edge Glass Conductance to Center-Of-Glass Conductance
+  0.5,                                    !- Frame Solar Absorptance
+  0.5,                                    !- Frame Visible Absorptance
+  0.9,                                    !- Frame Thermal Hemispherical Emissivity
+  DividedLite,                            !- Divider Type
+  0,                                      !- Divider Width {m}
+  0,                                      !- Number of Horizontal Dividers
+  0,                                      !- Number of Vertical Dividers
+  0,                                      !- Divider Outside Projection {m}
+  0,                                      !- Divider Inside Projection {m}
+  0,                                      !- Divider Conductance {W/m2-K}
+  1,                                      !- Ratio of Divider-Edge Glass Conductance to Center-Of-Glass Conductance
+  0,                                      !- Divider Solar Absorptance
+  0,                                      !- Divider Visible Absorptance
+  0.9,                                    !- Divider Thermal Hemispherical Emissivity
+  0.5,                                    !- Outside Reveal Solar Absorptance
+  0,                                      !- Inside Sill Depth {m}
+  0,                                      !- Inside Sill Solar Absorptance
+  0,                                      !- Inside Reveal Depth {m}
+  0,                                      !- Inside Reveal Solar Absorptance
+  CurtainWall;                            !- NFRC Product Type for Assembly Calculations

@@ -1,0 +1,32 @@
+!- LIGHTS
+{% for fl in TOTAL_FLOORS_LIST %} ! (e.g. if 4 fls total_floors_list=[0...3]) !- total_floors_list created in 'idf_generator.py'
+
+Lights,
+  fl{{ fl }}_thz0_Lights,                 !- Name
+  fl{{ fl }}_thz0 Space,                  !- Zone or ZoneList or Space or SpaceList Name
+  SFH_NOMINAL_lighting_fraction_schedule, !- Schedule Name
+  Watts/Area,                             !- Design Level Calculation Method
+  ,                                       !- Lighting Level {W}
+  {{ light_power_square_meter }},         !- Watts per Floor Area {W/m2}
+  ,                                       !- Watts per Person {W/person}
+  0,                                      !- Return Air Fraction
+  0.4,                                    !- Fraction Radiant
+  0.2,                                    !- Fraction Visible
+  1,                                      !- Fraction Replaceable
+  light_cons,                             !- End-Use Subcategory
+  No,                                     !- Return Air Fraction Calculated from Plenum Temperature
+  0,                                      !- Return Air Fraction Function of Plenum Temperature Coefficient 1
+  0;                                      !- Return Air Fraction Function of Plenum Temperature Coefficient 2 {1/K}
+{% endfor %} !- END floor Loop
+
+SCHEDULE:FILE,
+  SFH_NOMINAL_lighting_fraction_schedule,    !- Name
+  FRACTION,                 !- Schedule Type Limits Name
+  .\templates\profiles\SIA2024_SFH_nominal.csv,    !- File Name
+  5,                        !- Column Number
+  1,                       !- Rows to Skip at Top
+  8760,                     !- Number of Hours of Data
+  Semicolon,                !- Column Separator
+  Yes;                       !- Interpolate to Timestep
+
+!- END LIGHTS

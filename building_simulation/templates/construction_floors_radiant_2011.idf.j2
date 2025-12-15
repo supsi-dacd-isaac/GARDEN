@@ -1,0 +1,153 @@
+MATERIAL,
+    Gr2_L1,    !- Name
+    Rough,                    !- Roughness
+    0.1,                      !- Thickness
+    0.04,                     !- Conductivity
+    100,                      !- Density
+    840,                      !- Specific Heat
+    0.9,                      !- Thermal Absorptance
+    0.6,                      !- Solar Absorptance
+    0.6;                      !- Visible Absorptance
+
+MATERIAL,
+    Gr2_L2,    !- Name
+    Rough,                    !- Roughness
+    0.18,                     !- Thickness
+    2.3,                      !- Conductivity
+    2300,                     !- Density
+    880,                      !- Specific Heat
+    0.9,                      !- Thermal Absorptance
+    0.6,                      !- Solar Absorptance
+    0.6;                      !- Visible Absorptance
+
+MATERIAL,
+    Gr2_L3,    !- Name
+    Rough,                    !- Roughness
+    0.02,                     !- Thickness
+    0.038,                    !- Conductivity
+    15,                       !- Density
+    1500,                     !- Specific Heat
+    0.9,                      !- Thermal Absorptance
+    0.6,                      !- Solar Absorptance
+    0.6;                      !- Visible Absorptance
+
+MATERIAL,
+    Gr2_L4,    !- Name
+    Rough,                    !- Roughness
+    0.02,                     !- Thickness
+    0.04,                     !- Conductivity
+    22,                       !- Density
+    830,                      !- Specific Heat
+    0.9,                      !- Thermal Absorptance
+    0.6,                      !- Solar Absorptance
+    0.6;                      !- Visible Absorptance
+
+MATERIAL,
+    Gr2_L5,    !- Name
+    Rough,                    !- Roughness
+    0.07,                     !- Thickness
+    1.4,                      !- Conductivity
+    2100,                     !- Density
+    650,                      !- Specific Heat
+    0.9,                      !- Thermal Absorptance
+    0.6,                      !- Solar Absorptance
+    0.6;                      !- Visible Absorptance
+
+MATERIAL,
+    Gr2_L6,    !- Name
+    Rough,                    !- Roughness
+    0.024,                    !- Thickness
+    0.2,                      !- Conductivity
+    800,                      !- Density
+    1300,                     !- Specific Heat
+    0.9,                      !- Thermal Absorptance
+    0.7,                      !- Solar Absorptance
+    0.7;                      !- Visible Absorptance
+
+MATERIAL,
+    internal_ceiling_L1,    !- Name
+    Rough,                    !- Roughness
+    0.1,                      !- Thickness
+    1.4,                      !- Conductivity
+    2100,                     !- Density
+    840,                      !- Specific Heat
+    0.9,                      !- Thermal Absorptance
+    0.6,                      !- Solar Absorptance
+    0.6;                      !- Visible Absorptance
+
+CONSTRUCTION,
+    Ground_construction_ground,    !- Name
+    Gr2_L1,    !- Outside Layer
+    Gr2_L2,    !- Layer 2
+    Gr2_L3,    !- Layer 3
+    Gr2_L4,    !- Layer 4
+    Gr2_L5,    !- Layer 5
+    Gr2_L6,    !- Layer 3
+    Radiant grond slab insulation - 4 in.,
+    Radiant slab concrete 3.5 in,           !- Layer 2
+    Radiant slab concrete - 1.5 in;         !- Layer 3
+
+ConstructionProperty:InternalHeatSource,
+    Ground_construction_ground InternalHeatSource Property, !- Name
+    Ground_construction_ground,       !- Construction Name
+    7,                                      !- Thermal Source Present After Layer Number
+    7,                                      !- Temperature Calculation Requested After Layer Number
+    1,                                      !- Dimensions for the CTF Calculation
+    0.2286,                                 !- Tube Spacing {m}
+    0;                                      !- Two-Dimensional Temperature Calculation Position {dimensionless}
+
+CONSTRUCTION,
+    Ground_construction,    !- Name
+    internal_ceiling_L1,    !- Outside Layer
+    Radiant grond slab insulation - 4 in.,    !- Layer 2 # adding some extra insulation (raul test)
+    Radiant slab concrete 3.5 in,           !- Layer 2
+    Radiant slab concrete - 1.5 in;         !- Layer 3
+
+ConstructionProperty:InternalHeatSource,
+    Ground_construction InternalHeatSource Property, !- Name
+    Ground_construction,       !- Construction Name
+    2,                                      !- Thermal Source Present After Layer Number
+    2,                                      !- Temperature Calculation Requested After Layer Number
+    1,                                      !- Dimensions for the CTF Calculation
+    0.2286,                                 !- Tube Spacing {m}
+    0;                                      !- Two-Dimensional Temperature Calculation Position {dimensionless}
+
+CONSTRUCTION,
+    Internal_ceiling,    !- Name
+    Radiant slab concrete - 1.5 in,
+    Radiant slab concrete 3.5 in,
+    Radiant grond slab insulation - 4 in.,    !- Layer 2 # adding some extra insulation (raul test)
+    internal_ceiling_L1;
+
+Material,
+  Radiant grond slab insulation - 4 in.,  !- Name
+  Rough,                                  !- Roughness
+  0.03,                                 !- Thickness {m} 0.1016 ! EDITED
+  0.02,                                   !- Conductivity {W/m-K}
+  56.06,                                  !- Density {kg/m3}
+  1210,                                   !- Specific Heat {J/kg-K}
+  0.9,                                    !- Thermal Absorptance
+  0.7,                                    !- Solar Absorptance
+  0.7;                                    !- Visible Absorptance
+
+Material,
+  Radiant slab concrete - 1.5 in,         !- Name
+  MediumRough,                            !- Roughness
+  0.0381,                                 !- Thickness {m}
+  2.31,                                   !- Conductivity {W/m-K}
+  2322,                                   !- Density {kg/m3}
+  832,                                    !- Specific Heat {J/kg-K}
+  0.9,                                    !- Thermal Absorptance
+  0.7,                                    !- Solar Absorptance
+  0.7;                                    !- Visible Absorptance
+
+Material,
+  Radiant slab concrete 3.5 in,           !- Name
+  MediumRough,                            !- Roughness
+  0.0889,                                 !- Thickness {m}
+  2.31,                                   !- Conductivity {W/m-K}
+  2322,                                   !- Density {kg/m3}
+  832,                                    !- Specific Heat {J/kg-K}
+  0.9,                                    !- Thermal Absorptance
+  0.7,                                    !- Solar Absorptance
+  0.7;                                    !- Visible Absorptance

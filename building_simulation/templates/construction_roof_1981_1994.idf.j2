@@ -1,0 +1,59 @@
+MATERIAL,
+    Ro2_L1,    !- Name
+    Rough,                    !- Roughness
+    0.008,                    !- Thickness
+    0.17,                     !- Conductivity
+    1050,                     !- Density
+    1000,                     !- Specific Heat
+    0.9,                      !- Thermal Absorptance
+    0.9,                      !- Solar Absorptance
+    0.9;                      !- Visible Absorptance
+
+MATERIAL,
+    Ro2_L2,    !- Name
+    Rough,                    !- Roughness
+    0.09,                     !- Thickness
+    0.04,                     !- Conductivity
+    100,                      !- Density
+    840,                      !- Specific Heat
+    0.9,                      !- Thermal Absorptance
+    0.6,                      !- Solar Absorptance
+    0.6;                      !- Visible Absorptance
+
+MATERIAL,
+    Ro2_L4,    !- Name
+    Rough,                    !- Roughness
+    0.18,                     !- Thickness
+    2.1,                      !- Conductivity
+    2300,                     !- Density
+    840,                      !- Specific Heat
+    0.9,                      !- Thermal Absorptance
+    0.6,                      !- Solar Absorptance
+    0.6;                      !- Visible Absorptance
+
+MATERIAL,
+    Ro2_L5,    !- Name
+    Rough,                    !- Roughness
+    0.005,                    !- Thickness
+    0.7,                      !- Conductivity
+    1100,                     !- Density
+    900,                      !- Specific Heat
+    0.9,                      !- Thermal Absorptance
+    0.6,                      !- Solar Absorptance
+    0.6;                      !- Visible Absorptance
+
+MATERIAL:NOMASS,
+    Ro2_L3,    !- Name
+    Rough,                    !- Roughness
+    2.105263e-02,             !- Thermal Resistance
+    0.9,                      !- Thermal Absorptance
+    0.7,                      !- Solar Absorptance
+    0.7;                      !- Visible Absorptance
+
+CONSTRUCTION,
+    Roof_construction,    !- Name
+    Ro2_L1,    !- Outside Layer
+    Ro2_L2,    !- Layer 2
+    Ro2_L3,    !- Layer 3
+    Ro2_L4,    !- Layer 4
+    Ro2_L5;    !- Layer 5

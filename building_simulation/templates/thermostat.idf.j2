@@ -1,0 +1,86 @@
+! ######
+! FLOOR N - THERMOSTAT CONTROL
+! ######
+
+{% for fl in TOTAL_FLOORS_LIST %} ! (e.g. if 4 fls TOTAL_FLOORS_LIST=[0...3])
+
+
+{% if THERMOSTAT_METHOD == "Operative" %}
+
+ZoneControl:Thermostat:OperativeTemperature,
+  fl{{ fl }}_thz0 Thermostat,          !- ZoneControl:Thermostat Name
+  Constant,                   !- Radiative Fraction Input Mode
+  0.5,                        !- Fixed Radiative Fraction
+  ,                           !- Radiative Fraction Schedule
+  AdaptiveASH55CentralLine;   !- Adaptive Comfort Model Type !!!! adaptive comfort models only apply to cooling mode 
+
+{% endif %}
+
+ZoneControl:Thermostat,
+  fl{{ fl }}_thz0 Thermostat,                    !- Name
+  fl{{ fl }}_thz0,                               !- Zone or ZoneList Name
+  schedule_thermostatControl_fl{{ fl }}_thz0,           !- Control Type Schedule Name
+  ThermostatSetpoint:DualSetpoint,        !- Control 1 Object Type
+  thermostatControl_fl{{ fl }}_thz0,      !- Control 1 Name
+  ,                                       !- Control 2 Object Type
+  ,                                       !- Control 2 Name
+  ,                                       !- Control 3 Object Type
+  ,                                       !- Control 3 Name
+  ,                                       !- Control 4 Object Type
+  ,                                       !- Control 4 Name
+  0;                                      !- Temperature Difference Between Cutout And Setpoint {deltaC}
+
+Schedule:Compact,
+  schedule_thermostatControl_fl{{ fl }}_thz0,           !- Name
+  schedule_limits_thermostatControl, !- Schedule Type Limits Name
+  Through: 12/31,                         !- Field 1
+  For: AllDays,                           !- Field 2
+  Until: 24:00,                           !- Field 3
+  4;                                      !- Field 4
+
+ThermostatSetpoint:DualSetpoint,
+  thermostatControl_fl{{ fl }}_thz0,      !- Name
+  schedule_heatingsetpoint_fl{{ fl }}_thz0,      !- Heating Setpoint Temperature Schedule Name
+  schedule_coolingsetpoint_fl{{ fl }}_thz0;      !- Cooling Setpoint Temperature Schedule Name
+
+!Schedule:Compact,
+!  schedule_heatingsetpoint_fl{{ fl }}_thz0,      !- Name
+!  Temperature,                            !- Schedule Type Limits Name
+!  Through: 12/31,                       
+!  For: AllDays,                         
+!  until: 9:00,                          
+!  {{ shSetpoint }},                                    
+!  Until: {{ DRstart }},                           
+!  21,                                   
+!  Until: {{ DRend }},
+!  21                          
+!  Until: 24:00,                        
+!  21;                               
+
+Schedule:Compact,
+  schedule_heatingsetpoint_fl{{ fl }}_thz0,              !- Name
+  Temperature,                          !- Schedule Type Limits Name
+  Through: 12/31,                       
+  For: AllDays, 
+  {% for time in list_hours %}
+  Until: {{ time }},                             !- Time preheating N {hh:mm}
+  {{ list_temps[loop.index0] }},          !- Value Until Time N T preheating
+  {% endfor %}
+  Until: {{ DRstart }},                          !- Time 1 {hh:mm}
+  {{ shSetpoint }},               !- Value Until Time 1
+  Until: {{ DRend }},                            !- Time 2 {hh:mm}
+  {{ DRsetpoint }},      !- Value Until Time 2
+  Until 24:00,                                  !- Time 3 {hh:mm}
+  {{ shSetpoint }};               !- Value Until Time 3
+
+
+
+Schedule:Compact,
+  schedule_coolingsetpoint_fl{{ fl }}_thz0,      !- Name
+  Temperature,                            !- Schedule Type Limits Name
+  Through: 12/31,                         !- Field 1
+  For: AllDays,                           !- Field 2
+  Until: 24:00,                           !- Field 3
+  28;                                     !- Field 4
+
+{% endfor %}

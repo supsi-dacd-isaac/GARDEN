@@ -1,0 +1,45 @@
+!- VENTILATION
+
+{% for fl in TOTAL_FLOORS_LIST %} ! (e.g. if 4 fls total_floors_list=[0...3])
+
+ZoneVentilation:WindandStackOpenArea,
+  forcedVentilation_fl{{ fl }}_thz0,             !- Name
+  fl{{ fl }}_thz0,                               !- Zone or Space Name
+  4,                                      !- Opening Area {m2}
+  schedule_forcedVentilation_fl{{ fl }}_thz0,    !- Opening Area Fraction Schedule Name
+  Autocalculate,                          !- Opening Effectiveness {dimensionless}
+  0,                                      !- Effective Angle {deg}
+  0,                                      !- Height Difference {m}
+  Autocalculate,                          !- Discharge Coefficient for Opening
+  25,                                     !- Minimum Indoor Temperature {C}
+  ,                                       !- Minimum Indoor Temperature Schedule Name
+  100,                                    !- Maximum Indoor Temperature {C}
+  ,                                       !- Maximum Indoor Temperature Schedule Name
+  1,                                      !- Delta Temperature {deltaC}
+  ,                                       !- Delta Temperature Schedule Name
+  10,                                     !- Minimum Outdoor Temperature {C}
+  ,                                       !- Minimum Outdoor Temperature Schedule Name
+  25,                                     !- Maximum Outdoor Temperature {C}
+  ,                                       !- Maximum Outdoor Temperature Schedule Name
+  40;                                     !- Maximum Wind Speed {m/s}
+
+
+Schedule:Compact,
+  schedule_forcedVentilation_fl{{ fl }}_thz0,    !- Name
+  FRACTIONAL,                               !- Schedule Type Limits Name
+  Through: 12/31,                         !- Field 1
+  For: AllDays,                           !- Field 2
+  until: 8:00,                            !- Field 3
+  1,                                      !- Field 4
+  Until: 23:00,                           !- Field 5
+  0,                                      !- Field 6
+  Until: 24:00,                           !- Field 7
+  1;                                      !- Field 8
+
+
+{% endfor %} !- END floor Loop
+
+
+
+!- END VENTILATION
+

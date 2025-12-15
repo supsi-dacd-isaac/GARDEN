@@ -1,0 +1,160 @@
+! ## EMS SYSTEM ##
+{% if IS_TANK_DHW %} ! (if IS_TANK_SH == True)
+
+EnergyManagementSystem:Sensor, !- Actual Temp of the DHW tank
+  DHW_Tank_T,                !- Name
+  tank_dhw,                  !- Output:Variable or Output:Meter Index Key Name
+  Water Heater Tank Temperature;  !- Output:Variable Name
+
+{% else %} ! IF THERE IS NO TANK USE TEMP OF CIRCUIT INSTEAD
+
+EnergyManagementSystem:Sensor, !- Equivalent Temp to the DHW tank
+  DHW_Tank_T,                 
+  node_dhw_5,                   
+  System Node Temperature;
+
+{% endif %}
+  
+
+{% if IS_TANK_SH %} ! (if IS_TANK_SH == True)
+
+EnergyManagementSystem:Sensor, !- Actual Temp of the SH tank
+  SH_Tank_T,                 
+  tank_sh,                   
+  Water Heater Tank Temperature;
+
+{% else %} ! IF THERE IS NO TANK USE TEMP OF CIRCUIT INSTEAD
+
+EnergyManagementSystem:Sensor, !- Equivalent Temp to the SH tank
+  SH_Tank_T,                 
+  node_sh_5,                   
+  System Node Temperature;
+
+{% endif %}
+
+EnergyManagementSystem:Sensor, !- Setpoint of the DHW tank
+  DHW_Setpoint,              !- Name
+  node_hx_dhw_6,                  
+  System Node Setpoint Temperature;
+
+EnergyManagementSystem:Sensor, !- Setpoint of the SH tank
+  SH_Setpoint,               
+  node_hx_sh_5,                   
+  System Node Setpoint Temperature;
+
+EnergyManagementSystem:Actuator,
+  HP_Temp_SP_Act,                          !- Actuator name
+  schedule_setpoint_loop_gen,                        !- Actuated Component Unique Name
+  Schedule:Constant,                       !- Actuated Component Type
+  Schedule Value;                          !- Actuated Component Control Type
+
+EnergyManagementSystem:Actuator,
+  HX_DHW_OnOff_Act,                            !- Actuator Name
+  HX_DHW_OnOff,                            !- Actuated Component Unique Name
+  Schedule:Constant,                       !- Actuated Component Type
+  Schedule Value;                          !- Actuated Component Control Type
+
+EnergyManagementSystem:Actuator,
+  HX_SH_OnOff_Act,                         !- Actuator name
+  HX_SH_OnOff,                             !- Actuated Component Unique Name
+  Schedule:Constant,                       !- Actuated Component Type
+  Schedule Value;                          !- Actuated Component Control Type
+
+EnergyManagementSystem:Actuator,
+  DHW_boiler_setpoint,                         !- Actuator name
+  schedule_setpoint_loop_hx_dhw,                             !- Actuated Component Unique Name
+  Schedule:Constant,                       !- Actuated Component Type
+  Schedule Value;                          !- Actuated Component Control Type
+
+
+EnergyManagementSystem:GlobalVariable,
+  ModeIsDHW;
+
+EnergyManagementSystem:Program,
+  HP_Init,
+  SET ModeIsDHW = 0;        ! safe default
+
+EnergyManagementSystem:ProgramCallingManager,
+  HP_Init_Caller,
+  BeginNewEnvironment,
+  HP_Init;
+
+EnergyManagementSystem:Program,
+  HP_Priority_Control,
+  SET hyster_dhw = 5, ! (4-7 is ok)
+  SET hyster_sh = 0.01, ! (0.1-0.5 is ok)
+
+  IF ((Hour >= {{ hour_start_increase[:2] }} ) && (Hour < {{ hour_stop_increase[:2] }})),
+    SET dhw_call = (DHW_Tank_T < ({{ dhw_flow_temperature_gen }} - hyster_dhw)), ! DHW priority
+    SET sh_call  = (SH_Tank_T  < (SH_Setpoint  - hyster_sh)), ! second activate SH if needed
+  ELSE,
+    SET dhw_call = (DHW_Tank_T < ({{ dhw_flow_temperature_gen }} - hyster_dhw)), ! DHW priority
+    SET sh_call  = (SH_Tank_T  < (SH_Setpoint  - hyster_sh)), ! second activate SH if needed
+
+
+!  SET dhw_call = (DHW_Tank_T < ({{ dhw_flow_temperature_gen }} - hyster_dhw)), ! DHW priority
+!  SET sh_call  = (SH_Tank_T  < (SH_Setpoint  - hyster_sh)), ! second activate SH if needed
+
+  IF (dhw_call),
+    SET ModeIsDHW = 1,
+  ELSEIF (sh_call),
+    SET ModeIsDHW = 0,
+  ENDIF,
+
+  IF {{ dhw_flow_temperature }} > {{ dhw_flow_temperature_gen }}, ! THIS IS IF WE WANT 60C AS DHW TEMP (NEED AUX HEATER)
+    IF (ModeIsDHW == 1),
+      IF ((Hour >= {{ hour_start_increase[:2] }} ) && (Hour < {{ hour_stop_increase[:2] }})),
+        SET HP_Temp_SP_Act = {{ dhw_flow_temperature_gen + increaseTankTemperature }},          
+      ELSE,
+        SET HP_Temp_SP_Act = {{ dhw_flow_temperature_gen }},
+      ENDIF,
+      SET HX_DHW_OnOff_Act     = 1,
+      SET HX_SH_OnOff_Act      = 0,
+      IF (DHW_Tank_T > {{ dhw_flow_temperature_gen - 1.0 }}),
+        SET DHW_boiler_setpoint  = {{ dhw_flow_temperature }},
+      ELSE,
+        SET DHW_boiler_setpoint  = 10,
+      ENDIF,
+    ELSE,
+      IF ((Hour >= {{ hour_start_increase[:2] }} ) && (Hour < {{ hour_stop_increase[:2] }})),
+        SET HP_Temp_SP_Act = {{ sh_flow_temperature + increaseTankTemperature }},         
+      ELSE,
+        SET HP_Temp_SP_Act = {{ sh_flow_temperature }},
+      ENDIF,
+      SET HX_DHW_OnOff_Act     = 0,
+      SET HX_SH_OnOff_Act      = 1,
+      SET DHW_boiler_setpoint  = 10,
+    ENDIF,
+  ELSE, ! THIS IS IF WE WANT <55C AS DHW TEMP (NO NEED OF AUX HEATER)
+    IF (ModeIsDHW == 1),
+      IF ((Hour >= 14) && (Hour < 17)),
+        SET HP_Temp_SP_Act = {{ dhw_flow_temperature }},          
+      ELSEIF ((Hour >= 17) && (Hour < 20)),
+        SET HP_Temp_SP_Act = {{ dhw_flow_temperature }},
+      ELSE,
+        SET HP_Temp_SP_Act = {{ dhw_flow_temperature }},
+      ENDIF,
+      SET HX_DHW_OnOff_Act     = 1,
+      SET HX_SH_OnOff_Act      = 0,
+    ELSE,
+      IF ((Hour >= {{ hour_start_increase[:2] }} ) && (Hour < {{ hour_stop_increase[:2] }})),
+        SET HP_Temp_SP_Act = {{ sh_flow_temperature + increaseTankTemperature }},         
+      ELSE,
+        SET HP_Temp_SP_Act = {{ sh_flow_temperature }},
+      ENDIF,
+      SET HX_DHW_OnOff_Act     = 0,
+      SET HX_SH_OnOff_Act      = 1,
+    ENDIF,
+  ENDIF,
+
+  IF ( (Month > 5 && Month < 9) || (Month == 5 && DayOfMonth >= 15) || (Month == 9 && DayOfMonth <= 30) ),  ! TURN OFF SH IN SUMMER
+    SET HX_SH_OnOff_Act = 0,
+  ENDIF;
+
+EnergyManagementSystem:ProgramCallingManager,
+  HP_Priority_Caller,
+  InsideHVACSystemIterationLoop,
+  HP_Priority_Control;
+
+
+!- END EMS
