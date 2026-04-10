@@ -1,3 +1,8 @@
+import os
+
+# Set EnergyPlus path - adjust this to match your installation
+os.environ["ENERGYPLUS_CMD"] = "/Applications/EnergyPlus-25-2-0/energyplus"
+
 from energyplus_runner import run_energyplus
 from idf_generator import generate_idf
 from parse_output_energyplus import parse_eso
@@ -6,7 +11,7 @@ import json
 
 if __name__ == '__main__':
 
-    input_directory = "input_files/automatically_generated"
+    input_directory = "building_simulation/input_files/automatically_generated"
     input_file = 'test_1.json'
     #read input file
 

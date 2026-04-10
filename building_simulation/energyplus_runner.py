@@ -9,8 +9,10 @@ BASE_DIR = Path(__file__).resolve().parent
 WEATHER_FILE = BASE_DIR / "weather" / "Tesserete_2020.epw"
 OUTPUT_DIR = BASE_DIR / "output"
 
-# EnergyPlus CLI command (adjust if not on PATH)
-ENERGYPLUS_CMD = os.getenv("ENERGYPLUS_CMD", "C:/EnergyPlusV24-2-0/energyplus.exe")
+# EnergyPlus CLI command - set via ENERGYPLUS_CMD environment variable
+ENERGYPLUS_CMD = os.getenv("ENERGYPLUS_CMD")
+if not ENERGYPLUS_CMD:
+    raise EnvironmentError("ENERGYPLUS_CMD environment variable not set. Set it to your EnergyPlus executable path.")
 
 def run_energyplus(idf_path: Path) -> Path:
     """

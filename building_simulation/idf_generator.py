@@ -11,6 +11,7 @@ import numpy as np
 
 BASE_DIR = Path(__file__).resolve().parent
 TEMPLATES_DIR = BASE_DIR / "templates"
+PROFILES_DIR = TEMPLATES_DIR / "profiles"
 
 env = Environment(loader=FileSystemLoader(str(TEMPLATES_DIR)), 
                   trim_blocks=True, lstrip_blocks=True)
@@ -25,7 +26,8 @@ def assign_infiltration_rate(str_year_construction):
                                '1981-1994':0.59,
                                '1995-2000':0.39,
                                '2001-2010':0.28,
-                               '2011':0.16}
+                               '2011':0.16,
+                               '>2011':0.16}
     
     afloat_infiltration_rate = adict_infiltration_rate[str_year_construction]
 
@@ -43,7 +45,8 @@ def assign_flow_temperature(str_year_construction, emitter):
                                 '1981-1994':42.5,
                                 '1995-2000':35,
                                 '2001-2010':35,
-                                '2011':32.5}
+                                '2011':32.5,
+                                '>2011':32.5}
     
 
     else: # radiator
@@ -54,7 +57,8 @@ def assign_flow_temperature(str_year_construction, emitter):
                                 '1981-1994':55,
                                 '1995-2000':55,
                                 '2001-2010':45,
-                                '2011':37.5}
+                                '2011':37.5,
+                                '>2011':37.5}
     
     afloat_flow_temperature = adict_flow_temp[str_year_construction]
 
@@ -110,6 +114,9 @@ def generate_idf(input_data: dict) -> Path:
 
     # copy the json sent by the frontend
     input_data = input_data.copy()
+
+    # Pass the profiles directory path for Schedule:File references (cross-platform)
+    input_data['profiles_dir'] = str(PROFILES_DIR)
 
     emitter = input_data['emitter']
 
