@@ -72,9 +72,11 @@ def parameter_slices(state_dim: int, input_dim: int, output_dim: int) -> Paramet
 class MetadataStateSpaceEmulator(eqx.Module):
     theta_net: MLP
     x0_net: MLP
+    input_encoder: MLP | None
     slices: ParameterSlices = eqx.field(static=True)
     state_dim: int = eqx.field(static=True)
     input_dim: int = eqx.field(static=True)
+    encoded_input_dim: int = eqx.field(static=True)
     output_dim: int = eqx.field(static=True)
     schur_gamma: float = eqx.field(static=True)
     schur_eps: float = eqx.field(static=True)
@@ -90,14 +92,23 @@ class MetadataStateSpaceEmulator(eqx.Module):
         output_dim: int = 1,
         hidden_dim: int = 64,
         depth: int = 3,
+        input_encoder_dim: int | None = None,
+        input_encoder_hidden_dim: int | None = None,
+        input_encoder_depth: int = 2,
         schur_gamma: float = 0.995,
         schur_eps: float = 1e-4,
         schur_mode: SchurMode = "near_identity",
         theta_scale: float = 0.05,
         key: jax.Array,
     ) -> None:
-        theta_key, x0_key = jax.random.split(key)
-        slices = parameter_slices(state_dim, input_dim, output_dim)
+        if input_encoder_dim is not None and input_encoder_dim < 1:
+            raise ValueError("input_encoder_dim must be positive or None")
+        if input_encoder_depth < 1:
+            raise ValueError("input_encoder_depth must be at least 1")
+
+        theta_key, x0_key, encoder_key = jax.random.split(key, 3)
+        encoded_input_dim = input_dim if input_encoder_dim is None else input_encoder_dim
+        slices = parameter_slices(state_dim, encoded_input_dim, output_dim)
         self.theta_net = MLP(
             metadata_dim,
             slices.total,
@@ -112,9 +123,19 @@ class MetadataStateSpaceEmulator(eqx.Module):
             depth=depth,
             key=x0_key,
         )
+        self.input_encoder = None
+        if input_encoder_dim is not None:
+            self.input_encoder = MLP(
+                input_dim,
+                input_encoder_dim,
+                hidden_dim=input_encoder_hidden_dim or hidden_dim,
+                depth=input_encoder_depth,
+                key=encoder_key,
+            )
         self.slices = slices
         self.state_dim = state_dim
         self.input_dim = input_dim
+        self.encoded_input_dim = encoded_input_dim
         self.output_dim = output_dim
         self.schur_gamma = schur_gamma
         self.schur_eps = schur_eps
@@ -132,15 +153,20 @@ class MetadataStateSpaceEmulator(eqx.Module):
             eps=self.schur_eps,
             mode=self.schur_mode,
         )
-        b = theta[slices.b].reshape((self.state_dim, self.input_dim))
+        b = theta[slices.b].reshape((self.state_dim, self.encoded_input_dim))
         c = theta[slices.c].reshape((self.output_dim, self.state_dim))
-        d = theta[slices.d].reshape((self.output_dim, self.input_dim))
+        d = theta[slices.d].reshape((self.output_dim, self.encoded_input_dim))
         state_bias = theta[slices.state_bias]
         output_bias = theta[slices.output_bias]
         return StateSpaceMatrices(a, b, c, d, state_bias, output_bias)
 
     def initial_state(self, metadata: jnp.ndarray, initial_output: jnp.ndarray) -> jnp.ndarray:
         return self.x0_net(jnp.concatenate([metadata, initial_output], axis=0))
+
+    def encode_inputs(self, inputs: jnp.ndarray) -> jnp.ndarray:
+        if self.input_encoder is None:
+            return inputs
+        return jax.vmap(self.input_encoder)(inputs)
 
     def __call__(
         self,
@@ -150,4 +176,5 @@ class MetadataStateSpaceEmulator(eqx.Module):
     ) -> jnp.ndarray:
         matrices = self.matrices(metadata)
         x0 = self.initial_state(metadata, initial_output)
-        return rollout_state_space(matrices, x0, inputs)
+        encoded_inputs = self.encode_inputs(inputs)
+        return rollout_state_space(matrices, x0, encoded_inputs)

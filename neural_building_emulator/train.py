@@ -40,11 +40,15 @@ class TrainConfig:
     test_fraction: float = 0.2
     seed: int = 13
     heating_mode: str = "A"
+    heat_input_normalization: str = "per_floor_area"
     sequence_length: int = 96
     stride: int = 96
     state_dim: int = 6
     hidden_dim: int = 64
     depth: int = 3
+    input_encoder_dim: int | None = None
+    input_encoder_hidden_dim: int | None = None
+    input_encoder_depth: int = 2
     schur_gamma: float = 0.995
     schur_mode: str = "near_identity"
     batch_size: int = 128
@@ -565,6 +569,19 @@ def run_training(config: TrainConfig) -> MetadataStateSpaceEmulator:
         raise ValueError("monotonicity_weight must be non-negative")
     if config.target_mode not in ("absolute", "delta", "residual"):
         raise ValueError("target_mode must be 'absolute', 'delta', or 'residual'")
+    if config.heat_input_normalization not in ("raw", "per_floor_area"):
+        raise ValueError("heat_input_normalization must be 'raw' or 'per_floor_area'")
+    if config.input_encoder_dim is not None and config.input_encoder_dim < 1:
+        raise ValueError("input_encoder_dim must be positive or None")
+    if config.input_encoder_hidden_dim is not None and config.input_encoder_hidden_dim < 1:
+        raise ValueError("input_encoder_hidden_dim must be positive or None")
+    if config.input_encoder_depth < 1:
+        raise ValueError("input_encoder_depth must be at least 1")
+    if config.input_encoder_dim is not None and config.monotonicity_weight > 0.0:
+        raise ValueError(
+            "monotonicity regularization currently assumes linear raw inputs; "
+            "disable --monotonicity-weight or omit --input-encoder-dim."
+        )
     if config.checkpoint_metric not in ("auto", "train_rmse_c", "test_rmse_c"):
         raise ValueError("checkpoint_metric must be 'auto', 'train_rmse_c', or 'test_rmse_c'")
     if config.early_stopping_patience is not None and config.early_stopping_patience < 1:
@@ -581,6 +598,7 @@ def run_training(config: TrainConfig) -> MetadataStateSpaceEmulator:
         max_profiles=config.max_profiles,
         test_fraction=config.test_fraction,
         seed=config.seed,
+        heat_input_normalization=config.heat_input_normalization,  # type: ignore[arg-type]
     )
     splits = load_result_splits(split_config, heating_mode=config.heating_mode)
     window_config = WindowConfig(sequence_length=config.sequence_length, stride=config.stride)
@@ -591,8 +609,12 @@ def run_training(config: TrainConfig) -> MetadataStateSpaceEmulator:
         splits.input_columns,
         config.monotonicity_features,
     )
-    train_profiles = to_profiles(splits.train, splits.heating_mode)
-    test_profiles = to_profiles(splits.test, splits.heating_mode) if splits.test_ids else []
+    train_profiles = to_profiles(splits.train, splits.heating_mode, splits.heat_input_normalization)
+    test_profiles = (
+        to_profiles(splits.test, splits.heating_mode, splits.heat_input_normalization)
+        if splits.test_ids
+        else []
+    )
     train_windows = make_windows(train_profiles, window_config)
     test_windows = None
     if splits.test_ids:
@@ -614,6 +636,9 @@ def run_training(config: TrainConfig) -> MetadataStateSpaceEmulator:
         state_dim=config.state_dim,
         hidden_dim=config.hidden_dim,
         depth=config.depth,
+        input_encoder_dim=config.input_encoder_dim,
+        input_encoder_hidden_dim=config.input_encoder_hidden_dim,
+        input_encoder_depth=config.input_encoder_depth,
         schur_gamma=config.schur_gamma,
         schur_mode=config.schur_mode,  # type: ignore[arg-type]
         key=key,
@@ -623,8 +648,18 @@ def run_training(config: TrainConfig) -> MetadataStateSpaceEmulator:
     rng = np.random.default_rng(config.seed)
 
     print(f"heating_mode={splits.heating_mode}")
+    print(f"heat_input_normalization={splits.heat_input_normalization}")
     print(f"target_mode={config.target_mode}")
     print(f"input_columns={list(splits.input_columns)}")
+    if config.input_encoder_dim is not None:
+        print(
+            "input_encoder=enabled "
+            f"encoded_dim={config.input_encoder_dim} "
+            f"hidden_dim={config.input_encoder_hidden_dim or config.hidden_dim} "
+            f"depth={config.input_encoder_depth}"
+        )
+    else:
+        print("input_encoder=disabled")
     print(f"train_profiles={len(splits.train_ids)} test_profiles={len(splits.test_ids)}")
     print(f"train_windows={train_windows.targets.shape[0]}")
     if test_windows is not None:
@@ -784,6 +819,12 @@ def parse_args() -> TrainConfig:
     parser.add_argument("--test-fraction", type=float, default=0.2)
     parser.add_argument("--seed", type=int, default=13)
     parser.add_argument("--heating-mode", choices=(*HEATING_INPUT_COLUMNS.keys(), "A", "B"), default="A")
+    parser.add_argument(
+        "--heat-input-normalization",
+        choices=("raw", "per_floor_area"),
+        default="per_floor_area",
+        help="Use selected heat input as raw W or divide it by floor_area to W/m2 before scaling.",
+    )
     parser.add_argument("--sequence-length", type=int, default=96)
     parser.add_argument("--stride", type=int, default=96)
     parser.add_argument(
@@ -798,6 +839,27 @@ def parse_args() -> TrainConfig:
     parser.add_argument("--state-dim", type=int, default=6)
     parser.add_argument("--hidden-dim", type=int, default=64)
     parser.add_argument("--depth", type=int, default=3)
+    parser.add_argument(
+        "--input-encoder-dim",
+        type=int,
+        default=None,
+        help=(
+            "Enable nonlinear z[t]=e(u[t]) forcing with this encoded input dimension. "
+            "Disabled by default, which keeps raw linear inputs."
+        ),
+    )
+    parser.add_argument(
+        "--input-encoder-hidden-dim",
+        type=int,
+        default=None,
+        help="Hidden width for the input encoder MLP. Defaults to --hidden-dim.",
+    )
+    parser.add_argument(
+        "--input-encoder-depth",
+        type=int,
+        default=2,
+        help="Number of linear layers in the input encoder MLP.",
+    )
     parser.add_argument("--schur-gamma", type=float, default=0.995)
     parser.add_argument("--schur-mode", choices=("dense", "near_identity"), default="near_identity")
     parser.add_argument("--batch-size", type=int, default=128)
@@ -860,12 +922,16 @@ def parse_args() -> TrainConfig:
         test_fraction=args.test_fraction,
         seed=args.seed,
         heating_mode=args.heating_mode,
+        heat_input_normalization=args.heat_input_normalization,
         sequence_length=args.sequence_length,
         stride=args.stride,
         target_mode=args.target_mode,
         state_dim=args.state_dim,
         hidden_dim=args.hidden_dim,
         depth=args.depth,
+        input_encoder_dim=args.input_encoder_dim,
+        input_encoder_hidden_dim=args.input_encoder_hidden_dim,
+        input_encoder_depth=args.input_encoder_depth,
         schur_gamma=args.schur_gamma,
         schur_mode=args.schur_mode,
         batch_size=args.batch_size,

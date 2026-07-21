@@ -17,6 +17,7 @@ import pandas as pd
 
 from .columns import (
     DATETIME_COLUMN,
+    HeatInputNormalization,
     HEATING_INPUT_COLUMNS,
     METADATA_COLUMNS,
     PROFILE_ID_COLUMN,
@@ -24,6 +25,7 @@ from .columns import (
     input_columns,
     normalize_heating_mode,
     required_columns,
+    source_input_columns,
 )
 
 DEFAULT_DATASET_PATH = Path(__file__).resolve().parent / "tessin_results.parquet"
@@ -37,6 +39,7 @@ class SplitConfig:
     seed: int = 13
     profile_selection: str = "random"  # "random" or "first"
     profile_id_column: str = PROFILE_ID_COLUMN
+    heat_input_normalization: HeatInputNormalization = "per_floor_area"
 
 
 @dataclass(frozen=True)
@@ -53,6 +56,7 @@ class BuildingDatasetSplits:
     test_ids: tuple[int, ...]
     selected_ids: tuple[int, ...]
     heating_mode: str
+    heat_input_normalization: HeatInputNormalization
     input_columns: tuple[str, ...]
     metadata_columns: tuple[str, ...]
 
@@ -77,8 +81,15 @@ class WindowedArrays:
 
 
 def _read_parquet(path: Path, *, columns: Sequence[str], filters=None) -> pd.DataFrame:
+    read_path: Path | list[Path]
+    if path.is_dir():
+        read_path = sorted(path.glob("*.parquet"))
+        if not read_path:
+            raise FileNotFoundError(f"No parquet files found in {path}")
+    else:
+        read_path = path
     try:
-        return pd.read_parquet(path, columns=list(columns), filters=filters)
+        return pd.read_parquet(read_path, columns=list(columns), filters=filters)
     except ImportError as exc:
         raise ImportError(
             "Reading the emulator parquet dataset requires pyarrow or fastparquet. "
@@ -178,21 +189,41 @@ def load_result_splits(config: SplitConfig, heating_mode: str = "zone_thermal") 
         test_ids=test_ids,
         selected_ids=selected_ids,
         heating_mode=mode,
-        input_columns=tuple(input_columns(mode)),
+        heat_input_normalization=config.heat_input_normalization,
+        input_columns=tuple(input_columns(mode, config.heat_input_normalization)),
         metadata_columns=tuple(METADATA_COLUMNS),
     )
 
 
-def to_profiles(df: pd.DataFrame, heating_mode: str) -> list[BuildingProfile]:
+def _validate_heat_input_normalization(heat_input_normalization: str) -> HeatInputNormalization:
+    if heat_input_normalization not in ("raw", "per_floor_area"):
+        raise ValueError("heat_input_normalization must be 'raw' or 'per_floor_area'")
+    return heat_input_normalization  # type: ignore[return-value]
+
+
+def to_profiles(
+    df: pd.DataFrame,
+    heating_mode: str,
+    heat_input_normalization: HeatInputNormalization = "per_floor_area",
+) -> list[BuildingProfile]:
     """Convert a dataframe split into per-building arrays."""
     mode = normalize_heating_mode(heating_mode)
-    in_cols = input_columns(mode)
+    normalization = _validate_heat_input_normalization(heat_input_normalization)
+    in_cols = source_input_columns(mode)
     profiles: list[BuildingProfile] = []
 
     for profile_id, group in df.groupby(PROFILE_ID_COLUMN, sort=True):
         group = group.sort_values(DATETIME_COLUMN)
         metadata = group.loc[:, METADATA_COLUMNS].iloc[0].to_numpy(dtype=np.float32)
         inputs = group.loc[:, in_cols].to_numpy(dtype=np.float32)
+        if normalization == "per_floor_area":
+            floor_area = float(group.loc[:, "floor_area"].iloc[0])
+            if not np.isfinite(floor_area) or floor_area <= 0.0:
+                raise ValueError(
+                    f"Profile {profile_id} has invalid floor_area={floor_area!r}; "
+                    "cannot normalize heat input to W/m2."
+                )
+            inputs[:, 0] = inputs[:, 0] / floor_area
         target = group.loc[:, [TARGET_COLUMN]].to_numpy(dtype=np.float32)
         profiles.append(
             BuildingProfile(
@@ -263,6 +294,12 @@ def main() -> None:
     parser.add_argument("--seed", type=int, default=13)
     parser.add_argument("--profile-selection", choices=("random", "first"), default="random")
     parser.add_argument("--heating-mode", choices=(*HEATING_INPUT_COLUMNS.keys(), "A", "B"), default="A")
+    parser.add_argument(
+        "--heat-input-normalization",
+        choices=("raw", "per_floor_area"),
+        default="per_floor_area",
+        help="Use the selected heat input as raw W or divide it by floor_area to W/m2.",
+    )
     parser.add_argument("--sequence-length", type=int, default=96)
     parser.add_argument("--stride", type=int, default=96)
     args = parser.parse_args()
@@ -273,15 +310,23 @@ def main() -> None:
         test_fraction=args.test_fraction,
         seed=args.seed,
         profile_selection=args.profile_selection,
+        heat_input_normalization=args.heat_input_normalization,
     )
     splits = load_result_splits(split_config, heating_mode=args.heating_mode)
     window_config = WindowConfig(sequence_length=args.sequence_length, stride=args.stride)
-    train_windows = make_windows(to_profiles(splits.train, splits.heating_mode), window_config)
+    train_windows = make_windows(
+        to_profiles(splits.train, splits.heating_mode, splits.heat_input_normalization),
+        window_config,
+    )
     test_windows = None
     if splits.test_ids:
-        test_windows = make_windows(to_profiles(splits.test, splits.heating_mode), window_config)
+        test_windows = make_windows(
+            to_profiles(splits.test, splits.heating_mode, splits.heat_input_normalization),
+            window_config,
+        )
 
     print(f"heating_mode={splits.heating_mode}")
+    print(f"heat_input_normalization={splits.heat_input_normalization}")
     print(f"input_columns={list(splits.input_columns)}")
     print(f"selected_ids={_format_ids(splits.selected_ids)}")
     print(f"train_ids={_format_ids(splits.train_ids)} rows={len(splits.train)} windows={len(train_windows.profile_ids)}")
