@@ -6,6 +6,7 @@ from typing import Literal
 
 HeatingMode = Literal["zone_thermal", "heating_electric"]
 HeatInputNormalization = Literal["raw", "per_floor_area"]
+InputFeatureMode = Literal["base", "heating_regime"]
 
 DATETIME_COLUMN = "datetime"
 PROFILE_ID_COLUMN = "egid"
@@ -65,14 +66,28 @@ def source_input_columns(heating_mode: str) -> list[str]:
 def input_columns(
     heating_mode: str,
     heat_input_normalization: HeatInputNormalization = "raw",
+    input_feature_mode: InputFeatureMode = "base",
+    heating_regime_window_steps: int = 96 * 7,
 ) -> list[str]:
     """Return model input names after optional heat-channel normalization."""
     raw_columns = source_input_columns(heating_mode)
     if heat_input_normalization == "raw":
-        return raw_columns
-    if heat_input_normalization == "per_floor_area":
-        return [f"{raw_columns[0]}_per_m2", *raw_columns[1:]]
-    raise ValueError("heat_input_normalization must be 'raw' or 'per_floor_area'")
+        columns = raw_columns
+    elif heat_input_normalization == "per_floor_area":
+        columns = [f"{raw_columns[0]}_per_m2", *raw_columns[1:]]
+    else:
+        raise ValueError("heat_input_normalization must be 'raw' or 'per_floor_area'")
+
+    if input_feature_mode == "base":
+        return columns
+    if input_feature_mode == "heating_regime":
+        heat_column = columns[0]
+        return [
+            *columns,
+            f"{heat_column}_is_on",
+            f"{heat_column}_recently_on_{heating_regime_window_steps}",
+        ]
+    raise ValueError("input_feature_mode must be 'base' or 'heating_regime'")
 
 
 def required_columns(heating_mode: str) -> list[str]:

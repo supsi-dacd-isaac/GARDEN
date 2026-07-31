@@ -10,7 +10,7 @@ from __future__ import annotations
 import argparse
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Iterable, Sequence
+from typing import Iterable, Literal, Sequence
 
 import numpy as np
 import pandas as pd
@@ -19,6 +19,7 @@ from .columns import (
     DATETIME_COLUMN,
     HeatInputNormalization,
     HEATING_INPUT_COLUMNS,
+    InputFeatureMode,
     METADATA_COLUMNS,
     PROFILE_ID_COLUMN,
     TARGET_COLUMN,
@@ -29,6 +30,7 @@ from .columns import (
 )
 
 DEFAULT_DATASET_PATH = Path(__file__).resolve().parent / "tessin_results.parquet"
+WindowTargetAlignment = Literal["same_time", "next_step"]
 
 
 @dataclass(frozen=True)
@@ -40,12 +42,15 @@ class SplitConfig:
     profile_selection: str = "random"  # "random" or "first"
     profile_id_column: str = PROFILE_ID_COLUMN
     heat_input_normalization: HeatInputNormalization = "per_floor_area"
+    input_feature_mode: InputFeatureMode = "base"
+    heating_regime_window_steps: int = 96 * 7
 
 
 @dataclass(frozen=True)
 class WindowConfig:
     sequence_length: int = 96
     stride: int = 96
+    target_alignment: WindowTargetAlignment = "same_time"
 
 
 @dataclass(frozen=True)
@@ -57,6 +62,8 @@ class BuildingDatasetSplits:
     selected_ids: tuple[int, ...]
     heating_mode: str
     heat_input_normalization: HeatInputNormalization
+    input_feature_mode: InputFeatureMode
+    heating_regime_window_steps: int
     input_columns: tuple[str, ...]
     metadata_columns: tuple[str, ...]
 
@@ -190,7 +197,16 @@ def load_result_splits(config: SplitConfig, heating_mode: str = "zone_thermal") 
         selected_ids=selected_ids,
         heating_mode=mode,
         heat_input_normalization=config.heat_input_normalization,
-        input_columns=tuple(input_columns(mode, config.heat_input_normalization)),
+        input_feature_mode=config.input_feature_mode,
+        heating_regime_window_steps=config.heating_regime_window_steps,
+        input_columns=tuple(
+            input_columns(
+                mode,
+                config.heat_input_normalization,
+                config.input_feature_mode,
+                config.heating_regime_window_steps,
+            )
+        ),
         metadata_columns=tuple(METADATA_COLUMNS),
     )
 
@@ -201,14 +217,42 @@ def _validate_heat_input_normalization(heat_input_normalization: str) -> HeatInp
     return heat_input_normalization  # type: ignore[return-value]
 
 
+def _validate_input_feature_mode(input_feature_mode: str) -> InputFeatureMode:
+    if input_feature_mode not in ("base", "heating_regime"):
+        raise ValueError("input_feature_mode must be 'base' or 'heating_regime'")
+    return input_feature_mode  # type: ignore[return-value]
+
+
+def _heating_regime_features(
+    heat: np.ndarray,
+    *,
+    heat_on_threshold: float,
+    window_steps: int,
+) -> np.ndarray:
+    if window_steps < 1:
+        raise ValueError("heating_regime_window_steps must be positive")
+    heat_on = (heat > np.float32(heat_on_threshold)).astype(np.float32)
+    recently_on = (
+        pd.Series(heat_on)
+        .rolling(window=window_steps, min_periods=1)
+        .max()
+        .to_numpy(dtype=np.float32)
+    )
+    return np.column_stack([heat_on, recently_on]).astype(np.float32)
+
+
 def to_profiles(
     df: pd.DataFrame,
     heating_mode: str,
     heat_input_normalization: HeatInputNormalization = "per_floor_area",
+    input_feature_mode: InputFeatureMode = "base",
+    heating_regime_window_steps: int = 96 * 7,
+    heat_on_threshold: float = 1e-6,
 ) -> list[BuildingProfile]:
     """Convert a dataframe split into per-building arrays."""
     mode = normalize_heating_mode(heating_mode)
     normalization = _validate_heat_input_normalization(heat_input_normalization)
+    feature_mode = _validate_input_feature_mode(input_feature_mode)
     in_cols = source_input_columns(mode)
     profiles: list[BuildingProfile] = []
 
@@ -224,6 +268,17 @@ def to_profiles(
                     "cannot normalize heat input to W/m2."
                 )
             inputs[:, 0] = inputs[:, 0] / floor_area
+        if feature_mode == "heating_regime":
+            inputs = np.column_stack(
+                [
+                    inputs,
+                    _heating_regime_features(
+                        inputs[:, 0],
+                        heat_on_threshold=heat_on_threshold,
+                        window_steps=heating_regime_window_steps,
+                    ),
+                ]
+            ).astype(np.float32)
         target = group.loc[:, [TARGET_COLUMN]].to_numpy(dtype=np.float32)
         profiles.append(
             BuildingProfile(
@@ -243,6 +298,8 @@ def make_windows(profiles: Iterable[BuildingProfile], config: WindowConfig) -> W
         raise ValueError("sequence_length must be at least 2")
     if config.stride < 1:
         raise ValueError("stride must be positive")
+    if config.target_alignment not in ("same_time", "next_step"):
+        raise ValueError("target_alignment must be 'same_time' or 'next_step'")
 
     profile_ids: list[int] = []
     start_indices: list[int] = []
@@ -253,16 +310,19 @@ def make_windows(profiles: Iterable[BuildingProfile], config: WindowConfig) -> W
 
     for profile in profiles:
         n_steps = profile.target.shape[0]
-        last_start = n_steps - config.sequence_length
+        target_offset = 1 if config.target_alignment == "next_step" else 0
+        last_start = n_steps - config.sequence_length - target_offset
         if last_start < 0:
             continue
         for start in range(0, last_start + 1, config.stride):
             end = start + config.sequence_length
+            target_start = start + target_offset
+            target_end = end + target_offset
             profile_ids.append(profile.profile_id)
             start_indices.append(start)
             metadata.append(profile.metadata)
             inputs.append(profile.inputs[start:end])
-            targets.append(profile.target[start:end])
+            targets.append(profile.target[target_start:target_end])
             initial_temperature.append(profile.target[start])
 
     if not inputs:
@@ -300,8 +360,12 @@ def main() -> None:
         default="per_floor_area",
         help="Use the selected heat input as raw W or divide it by floor_area to W/m2.",
     )
+    parser.add_argument("--input-feature-mode", choices=("base", "heating_regime"), default="base")
+    parser.add_argument("--heating-regime-window-steps", type=int, default=96 * 7)
+    parser.add_argument("--heat-on-threshold", type=float, default=1e-6)
     parser.add_argument("--sequence-length", type=int, default=96)
     parser.add_argument("--stride", type=int, default=96)
+    parser.add_argument("--target-alignment", choices=("same_time", "next_step"), default="same_time")
     args = parser.parse_args()
 
     split_config = SplitConfig(
@@ -311,22 +375,48 @@ def main() -> None:
         seed=args.seed,
         profile_selection=args.profile_selection,
         heat_input_normalization=args.heat_input_normalization,
+        input_feature_mode=args.input_feature_mode,
+        heating_regime_window_steps=args.heating_regime_window_steps,
     )
     splits = load_result_splits(split_config, heating_mode=args.heating_mode)
-    window_config = WindowConfig(sequence_length=args.sequence_length, stride=args.stride)
+    window_config = WindowConfig(
+        sequence_length=args.sequence_length,
+        stride=args.stride,
+        target_alignment=args.target_alignment,
+    )
     train_windows = make_windows(
-        to_profiles(splits.train, splits.heating_mode, splits.heat_input_normalization),
+        to_profiles(
+            splits.train,
+            splits.heating_mode,
+            splits.heat_input_normalization,
+            splits.input_feature_mode,
+            splits.heating_regime_window_steps,
+            args.heat_on_threshold,
+        ),
         window_config,
     )
     test_windows = None
     if splits.test_ids:
         test_windows = make_windows(
-            to_profiles(splits.test, splits.heating_mode, splits.heat_input_normalization),
+            to_profiles(
+                splits.test,
+                splits.heating_mode,
+                splits.heat_input_normalization,
+                splits.input_feature_mode,
+                splits.heating_regime_window_steps,
+                args.heat_on_threshold,
+            ),
             window_config,
         )
 
     print(f"heating_mode={splits.heating_mode}")
     print(f"heat_input_normalization={splits.heat_input_normalization}")
+    print(
+        "input_feature_mode="
+        f"{splits.input_feature_mode} "
+        f"heating_regime_window_steps={splits.heating_regime_window_steps}"
+    )
+    print(f"target_alignment={args.target_alignment}")
     print(f"input_columns={list(splits.input_columns)}")
     print(f"selected_ids={_format_ids(splits.selected_ids)}")
     print(f"train_ids={_format_ids(splits.train_ids)} rows={len(splits.train)} windows={len(train_windows.profile_ids)}")
