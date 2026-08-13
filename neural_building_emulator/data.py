@@ -14,22 +14,37 @@ from typing import Iterable, Literal, Sequence
 
 import numpy as np
 import pandas as pd
+import pyarrow.parquet as pq
 
 from .columns import (
+    CLOSED_LOOP_INPUT_COLUMNS,
+    CLOSED_LOOP_TARGET_COLUMNS,
     DATETIME_COLUMN,
+    DISTURBANCE_COLUMNS,
     HeatInputNormalization,
+    HEAT_PUMP_ELECTRIC_POWER_COLUMN,
     HEATING_INPUT_COLUMNS,
+    HP_MODE_IS_DHW_COLUMN,
+    HP_SIZE_BINDING_COLUMN,
     InputFeatureMode,
     METADATA_COLUMNS,
     PROFILE_ID_COLUMN,
+    SETPOINT_TIMESERIES_COLUMN,
+    SPACE_HEATING_HP_SIZE_BINDING,
     TARGET_COLUMN,
+    ZONE_THERMAL_HEATING_POWER_COLUMN,
+    closed_loop_required_columns,
     input_columns,
     normalize_heating_mode,
     required_columns,
     source_input_columns,
 )
 
-DEFAULT_DATASET_PATH = Path(__file__).resolve().parent / "tessin_results.parquet"
+DEFAULT_DATASET_PATH = (
+    Path(__file__).resolve().parent
+    / "tessin_results.parquet"
+    / "variable_setpoints"
+)
 WindowTargetAlignment = Literal["same_time", "next_step"]
 
 
@@ -69,6 +84,26 @@ class BuildingDatasetSplits:
 
 
 @dataclass(frozen=True)
+class ClosedLoopDatasetSplits:
+    train: pd.DataFrame
+    test: pd.DataFrame
+    train_ids: tuple[int, ...]
+    test_ids: tuple[int, ...]
+    selected_ids: tuple[int, ...]
+    candidate_ids: tuple[int, ...]
+    dropped_ids: tuple[int, ...]
+    dropped_non_hp_ids: tuple[int, ...]
+    dropped_non_sh_hp_ids: tuple[int, ...]
+    input_columns: tuple[str, ...]
+    target_columns: tuple[str, ...]
+    metadata_columns: tuple[str, ...]
+    heating_mode: str = "closed_loop_hp"
+    heat_input_normalization: HeatInputNormalization = "per_floor_area"
+    input_feature_mode: InputFeatureMode = "base"
+    heating_regime_window_steps: int = 0
+
+
+@dataclass(frozen=True)
 class BuildingProfile:
     profile_id: int
     datetime: np.ndarray
@@ -79,6 +114,26 @@ class BuildingProfile:
 
 @dataclass(frozen=True)
 class WindowedArrays:
+    profile_ids: np.ndarray
+    start_indices: np.ndarray
+    metadata: np.ndarray
+    inputs: np.ndarray
+    targets: np.ndarray
+    initial_temperature: np.ndarray
+
+
+@dataclass(frozen=True)
+class ClosedLoopProfile:
+    profile_id: int
+    datetime: np.ndarray
+    metadata: np.ndarray
+    inputs: np.ndarray
+    targets: np.ndarray
+    initial_temperature: np.ndarray
+
+
+@dataclass(frozen=True)
+class ClosedLoopWindowedArrays:
     profile_ids: np.ndarray
     start_indices: np.ndarray
     metadata: np.ndarray
@@ -102,6 +157,21 @@ def _read_parquet(path: Path, *, columns: Sequence[str], filters=None) -> pd.Dat
             "Reading the emulator parquet dataset requires pyarrow or fastparquet. "
             "Install the project dependencies, or run `uv add pyarrow`."
         ) from exc
+
+
+def _parquet_files(path: Path) -> list[Path]:
+    if path.is_dir():
+        files = sorted(path.glob("*.parquet"))
+        if not files:
+            raise FileNotFoundError(f"No parquet files found in {path}")
+        return files
+    return [path]
+
+
+def read_parquet_columns(path: Path) -> tuple[str, ...]:
+    """Read column names from the first parquet part without loading row data."""
+    files = _parquet_files(path)
+    return tuple(pq.read_schema(files[0]).names)
 
 
 def read_profile_ids(dataset_path: Path, profile_id_column: str = PROFILE_ID_COLUMN) -> tuple[int, ...]:
@@ -211,6 +281,109 @@ def load_result_splits(config: SplitConfig, heating_mode: str = "zone_thermal") 
     )
 
 
+def _check_required_columns(
+    dataset_path: Path,
+    required: Sequence[str],
+    *,
+    context: str,
+) -> None:
+    available = set(read_parquet_columns(dataset_path))
+    missing = [column for column in required if column not in available]
+    if missing:
+        formatted = "\n  - ".join(missing)
+        raise ValueError(
+            f"{context} requires missing parquet columns:\n  - {formatted}\n"
+            "Regenerate the EnergyPlus simulations with the updated output template."
+        )
+
+
+def load_closed_loop_result_splits(config: SplitConfig) -> ClosedLoopDatasetSplits:
+    """Load the profile split required by the closed-loop HP emulator."""
+    dataset_path = Path(config.dataset_path)
+    columns = closed_loop_required_columns()
+    _check_required_columns(
+        dataset_path,
+        columns,
+        context="--model-kind closed_loop_hp",
+    )
+
+    hp_filter_columns = [config.profile_id_column, "hp_ref_capacity_W", HP_SIZE_BINDING_COLUMN]
+    hp_filter_df = _read_parquet(dataset_path, columns=hp_filter_columns)
+    hp_filter_df[config.profile_id_column] = hp_filter_df[config.profile_id_column].astype(int)
+    hp_by_profile = hp_filter_df.groupby(config.profile_id_column)[
+        ["hp_ref_capacity_W", HP_SIZE_BINDING_COLUMN]
+    ].first()
+    positive_capacity_ids = tuple(
+        sorted(
+            int(profile_id)
+            for profile_id, row in hp_by_profile.iterrows()
+            if pd.notna(row["hp_ref_capacity_W"]) and float(row["hp_ref_capacity_W"]) > 0.0
+        )
+    )
+    hp_ids = tuple(
+        sorted(
+            int(profile_id)
+            for profile_id, row in hp_by_profile.iterrows()
+            if (
+                pd.notna(row["hp_ref_capacity_W"])
+                and float(row["hp_ref_capacity_W"]) > 0.0
+                and str(row[HP_SIZE_BINDING_COLUMN]).strip().upper()
+                == SPACE_HEATING_HP_SIZE_BINDING
+            )
+        )
+    )
+    all_ids = tuple(sorted(int(profile_id) for profile_id in hp_by_profile.index))
+    dropped_non_hp_ids = tuple(sorted(set(all_ids).difference(positive_capacity_ids)))
+    dropped_non_sh_hp_ids = tuple(sorted(set(positive_capacity_ids).difference(hp_ids)))
+    dropped_ids = tuple(sorted(set(all_ids).difference(hp_ids)))
+    if not hp_ids:
+        raise ValueError(
+            "--model-kind closed_loop_hp found no HP profiles. "
+            "Expected finite positive hp_ref_capacity_W and hp_size_binding='SH' "
+            "for at least one profile."
+        )
+    selected_ids = select_profile_ids(
+        hp_ids,
+        max_profiles=config.max_profiles,
+        seed=config.seed,
+        strategy=config.profile_selection,
+    )
+    train_ids, test_ids = split_profile_ids(
+        selected_ids,
+        test_fraction=config.test_fraction,
+        seed=config.seed + 1,
+    )
+
+    filters = [(config.profile_id_column, "in", list(selected_ids))]
+    try:
+        df = _read_parquet(dataset_path, columns=columns, filters=filters)
+    except (ValueError, NotImplementedError):
+        df = _read_parquet(dataset_path, columns=columns)
+        df = df[df[config.profile_id_column].isin(selected_ids)]
+
+    df = df[df[config.profile_id_column].isin(selected_ids)].copy()
+    df[config.profile_id_column] = df[config.profile_id_column].astype(int)
+    df = df.sort_values([config.profile_id_column, DATETIME_COLUMN]).reset_index(drop=True)
+
+    train = df[df[config.profile_id_column].isin(train_ids)].reset_index(drop=True)
+    test = df[df[config.profile_id_column].isin(test_ids)].reset_index(drop=True)
+
+    return ClosedLoopDatasetSplits(
+        train=train,
+        test=test,
+        train_ids=train_ids,
+        test_ids=test_ids,
+        selected_ids=selected_ids,
+        candidate_ids=hp_ids,
+        dropped_ids=dropped_ids,
+        dropped_non_hp_ids=dropped_non_hp_ids,
+        dropped_non_sh_hp_ids=dropped_non_sh_hp_ids,
+        input_columns=tuple(CLOSED_LOOP_INPUT_COLUMNS),
+        target_columns=tuple(CLOSED_LOOP_TARGET_COLUMNS),
+        metadata_columns=tuple(METADATA_COLUMNS),
+    )
+
+
 def _validate_heat_input_normalization(heat_input_normalization: str) -> HeatInputNormalization:
     if heat_input_normalization not in ("raw", "per_floor_area"):
         raise ValueError("heat_input_normalization must be 'raw' or 'per_floor_area'")
@@ -239,6 +412,95 @@ def _heating_regime_features(
         .to_numpy(dtype=np.float32)
     )
     return np.column_stack([heat_on, recently_on]).astype(np.float32)
+
+
+def _calendar_features(datetime_values: np.ndarray) -> np.ndarray:
+    datetimes = pd.to_datetime(pd.Series(datetime_values))
+    hour = (
+        datetimes.dt.hour.to_numpy(dtype=np.float32)
+        + datetimes.dt.minute.to_numpy(dtype=np.float32) / np.float32(60.0)
+    )
+    day_of_year = datetimes.dt.dayofyear.to_numpy(dtype=np.float32)
+    hour_angle = np.float32(2.0 * np.pi) * hour / np.float32(24.0)
+    year_angle = np.float32(2.0 * np.pi) * (day_of_year - np.float32(1.0)) / np.float32(365.0)
+    return np.column_stack(
+        [
+            np.sin(hour_angle),
+            np.cos(hour_angle),
+            np.sin(year_angle),
+            np.cos(year_angle),
+        ]
+    ).astype(np.float32)
+
+
+def _positive_heating_signal(values: np.ndarray, *, profile_id: int, column: str) -> np.ndarray:
+    values = values.astype(np.float32, copy=True)
+    negative = values < np.float32(-1e-3)
+    if bool(np.any(negative)):
+        min_value = float(np.min(values))
+        raise ValueError(
+            f"Profile {profile_id} has negative values in {column!r} down to {min_value:.6g}; "
+            "closed_loop_hp expects non-negative heating powers."
+        )
+    return np.maximum(values, np.float32(0.0))
+
+
+def to_closed_loop_profiles(df: pd.DataFrame) -> list[ClosedLoopProfile]:
+    """Convert a dataframe split into profile arrays for closed-loop HP training.
+
+    The alignment is explicit: exogenous inputs and power targets are taken at t,
+    while the temperature target is Tin[t+1]. The initial temperature is Tin[t].
+    """
+    profiles: list[ClosedLoopProfile] = []
+    for profile_id, group in df.groupby(PROFILE_ID_COLUMN, sort=True):
+        group = group.sort_values(DATETIME_COLUMN).reset_index(drop=True)
+        if len(group) < 2:
+            continue
+
+        metadata = group.loc[:, METADATA_COLUMNS].iloc[0].to_numpy(dtype=np.float32)
+        floor_area = float(group.loc[:, "floor_area"].iloc[0])
+        if not np.isfinite(floor_area) or floor_area <= 0.0:
+            raise ValueError(
+                f"Profile {profile_id} has invalid floor_area={floor_area!r}; "
+                "cannot build W/m2 closed-loop targets."
+            )
+
+        temperature = group.loc[:, TARGET_COLUMN].to_numpy(dtype=np.float32)
+        setpoint = group.loc[:, SETPOINT_TIMESERIES_COLUMN].to_numpy(dtype=np.float32)
+        disturbances = group.loc[:, DISTURBANCE_COLUMNS].to_numpy(dtype=np.float32)
+        calendar = _calendar_features(group.loc[:, DATETIME_COLUMN].to_numpy())
+
+        q_room = group.loc[:, ZONE_THERMAL_HEATING_POWER_COLUMN].to_numpy(dtype=np.float32)
+        p_el = group.loc[:, HEAT_PUMP_ELECTRIC_POWER_COLUMN].to_numpy(dtype=np.float32)
+        dhw_mode = group.loc[:, HP_MODE_IS_DHW_COLUMN].to_numpy(dtype=np.float32) > np.float32(0.5)
+        p_el = np.where(dhw_mode, np.float32(0.0), p_el)
+
+        q_room = _positive_heating_signal(
+            q_room,
+            profile_id=int(profile_id),
+            column=ZONE_THERMAL_HEATING_POWER_COLUMN,
+        )
+        p_el = _positive_heating_signal(
+            p_el,
+            profile_id=int(profile_id),
+            column=HEAT_PUMP_ELECTRIC_POWER_COLUMN,
+        )
+        q_room = q_room / np.float32(floor_area)
+        p_el = p_el / np.float32(floor_area)
+
+        inputs = np.column_stack([setpoint, disturbances, calendar]).astype(np.float32)
+        targets = np.column_stack([temperature[1:], q_room[:-1], p_el[:-1]]).astype(np.float32)
+        profiles.append(
+            ClosedLoopProfile(
+                profile_id=int(profile_id),
+                datetime=group.loc[1:, DATETIME_COLUMN].to_numpy(),
+                metadata=metadata,
+                inputs=inputs[:-1],
+                targets=targets,
+                initial_temperature=temperature[:-1, np.newaxis].astype(np.float32),
+            )
+        )
+    return profiles
 
 
 def to_profiles(
@@ -329,6 +591,50 @@ def make_windows(profiles: Iterable[BuildingProfile], config: WindowConfig) -> W
         raise ValueError("No windows were created; reduce sequence_length or load longer profiles")
 
     return WindowedArrays(
+        profile_ids=np.asarray(profile_ids, dtype=np.int64),
+        start_indices=np.asarray(start_indices, dtype=np.int64),
+        metadata=np.stack(metadata).astype(np.float32),
+        inputs=np.stack(inputs).astype(np.float32),
+        targets=np.stack(targets).astype(np.float32),
+        initial_temperature=np.stack(initial_temperature).astype(np.float32),
+    )
+
+
+def make_closed_loop_windows(
+    profiles: Iterable[ClosedLoopProfile],
+    config: WindowConfig,
+) -> ClosedLoopWindowedArrays:
+    """Slice closed-loop profiles into fixed-length rollout windows."""
+    if config.sequence_length < 2:
+        raise ValueError("sequence_length must be at least 2")
+    if config.stride < 1:
+        raise ValueError("stride must be positive")
+
+    profile_ids: list[int] = []
+    start_indices: list[int] = []
+    metadata: list[np.ndarray] = []
+    inputs: list[np.ndarray] = []
+    targets: list[np.ndarray] = []
+    initial_temperature: list[np.ndarray] = []
+
+    for profile in profiles:
+        n_steps = profile.targets.shape[0]
+        last_start = n_steps - config.sequence_length
+        if last_start < 0:
+            continue
+        for start in range(0, last_start + 1, config.stride):
+            end = start + config.sequence_length
+            profile_ids.append(profile.profile_id)
+            start_indices.append(start)
+            metadata.append(profile.metadata)
+            inputs.append(profile.inputs[start:end])
+            targets.append(profile.targets[start:end])
+            initial_temperature.append(profile.initial_temperature[start])
+
+    if not inputs:
+        raise ValueError("No windows were created; reduce sequence_length or load longer profiles")
+
+    return ClosedLoopWindowedArrays(
         profile_ids=np.asarray(profile_ids, dtype=np.int64),
         start_indices=np.asarray(start_indices, dtype=np.int64),
         metadata=np.stack(metadata).astype(np.float32),

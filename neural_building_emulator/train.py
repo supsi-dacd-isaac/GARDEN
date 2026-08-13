@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import argparse
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Iterator, Literal, Sequence
 
@@ -13,33 +13,95 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 import plotly.graph_objects as go
+from plotly.subplots import make_subplots
 
-from .columns import DISTURBANCE_COLUMNS, HEATING_INPUT_COLUMNS, InputFeatureMode
+from .columns import (
+    CLOSED_LOOP_TARGET_COLUMNS,
+    DISTURBANCE_COLUMNS,
+    HEATING_INPUT_COLUMNS,
+    InputFeatureMode,
+)
 from .data import (
     BuildingProfile,
+    ClosedLoopProfile,
+    ClosedLoopWindowedArrays,
     DEFAULT_DATASET_PATH,
     SplitConfig,
     WindowConfig,
     WindowTargetAlignment,
     WindowedArrays,
+    load_closed_loop_result_splits,
     load_result_splits,
+    make_closed_loop_windows,
     make_windows,
+    to_closed_loop_profiles,
     to_profiles,
 )
 from .metrics import regression_metrics
-from .model_io import save_training_artifact
-from .models import MetadataStateSpaceEmulator, ProbabilisticStableStateSpaceEmulator, SwitchingDynamics, spectral_radius
+from .model_io import load_training_artifact, save_training_artifact
+from .models import (
+    ClosedLoopHPEmulator,
+    ContractingClosedLoopHPEmulator,
+    HPElectricScenarioMode,
+    MetadataStateSpaceEmulator,
+    ProbabilisticClosedLoopHPEmulator,
+    ProbabilisticContractingClosedLoopHPEmulator,
+    ProbabilisticStableStateSpaceEmulator,
+    SwitchingDynamics,
+    spectral_radius,
+)
 from .models.state_space import OutputTiming
-from .scaling import WindowScalers, fit_window_scalers, inverse_target, transform_windows
+from .scaling import (
+    WindowScalers,
+    fit_window_scalers,
+    inverse_target,
+    transform_closed_loop_windows,
+    transform_windows,
+)
 
 TargetMode = Literal["absolute", "delta", "residual"]
 CheckpointMetric = Literal["auto", "train_rmse_c", "test_rmse_c"]
 LossNormalization = Literal["none", "window_std"]
 InputEncoderFeedbackMode = Literal["none", "predicted_temperature", "thermal_gaps"]
-ModelKind = Literal["deterministic", "probabilistic"]
 ProbProcessNoiseMode = Literal["none", "constant", "heteroscedastic"]
-EmulatorModel = MetadataStateSpaceEmulator | ProbabilisticStableStateSpaceEmulator
+ModelKind = Literal[
+    "deterministic",
+    "probabilistic",
+    "closed_loop_hp",
+    "closed_loop_hp_contracting",
+    "closed_loop_hp_probabilistic",
+    "closed_loop_hp_contracting_probabilistic",
+]
+EmulatorModel = (
+    MetadataStateSpaceEmulator
+    | ProbabilisticStableStateSpaceEmulator
+    | ClosedLoopHPEmulator
+    | ContractingClosedLoopHPEmulator
+    | ProbabilisticClosedLoopHPEmulator
+    | ProbabilisticContractingClosedLoopHPEmulator
+)
+ProbabilisticClosedLoopModel = (
+    ProbabilisticClosedLoopHPEmulator | ProbabilisticContractingClosedLoopHPEmulator
+)
 SETPOINT_METADATA_COLUMN = "shSetpoint"
+PROB_CLOSED_LOOP_LOSS_COMPONENT_NAMES = (
+    "energy",
+    "variogram",
+    "softopt",
+    "hp_bce",
+    "hp_active_nll",
+    "hp_inactive_leakage",
+    "physics",
+    "stability",
+)
+PROB_CLOSED_LOOP_AUX_ENERGY = 2
+PROB_CLOSED_LOOP_AUX_EXPECTED_PEL = 7
+PROB_CLOSED_LOOP_AUX_LOG_MU = 8
+PROB_CLOSED_LOOP_AUX_LOG_SIGMA = 9
+PROB_CLOSED_LOOP_AUX_X_STATE = 10
+PROB_CLOSED_LOOP_AUX_W_STATE = 11
+PROB_CLOSED_LOOP_AUX_TEMPERATURE_STATE = 12
+PROB_CLOSED_LOOP_AUX_XI = 13
 
 
 @dataclass(frozen=True)
@@ -105,6 +167,29 @@ class TrainConfig:
     prob_variogram_power: float = 0.5
     prob_physics_weight: float = 0.0
     prob_horizon_weight_power: float = 0.0
+    hp_controller_state_dim: int = 2
+    hp_dt_hours: float = 0.25
+    hp_mode_loss_weight: float = 0.1
+    hp_cop_floor: float = 1.0
+    hp_cop_cap: float = 8.0
+    hp_pel_cap_w_m2: float = 0.0
+    hp_qroom_cap_w_m2: float = 0.0
+    hp_energy_cap_wh_m2: float = 0.0
+    hp_energy_cap_hours: float = 24.0
+    hp_cap_factor: float = 1.25
+    closed_loop_stability_weight: float = 0.0
+    closed_loop_stability_gamma: float = 0.995
+    closed_loop_stability_samples: int = 8
+    closed_loop_stability_aggregation: Literal["mean", "max"] = "max"
+    init_from_deterministic_artifact: Path | None = None
+    init_xi_weight_scale: float = 0.05
+    init_hp_active_log_sigma: float = 0.25
+    contracting_gamma: float = 0.99
+    contracting_state_bound: float = 5.0
+    contracting_temperature_scale: float = 8.0
+    prob_hp_scenario_mode: HPElectricScenarioMode = "bernoulli"
+    hp_active_power_nll_weight: float = 1.0
+    hp_inactive_leakage_weight: float = 0.1
 
 
 def minibatches(
@@ -621,6 +706,610 @@ def probabilistic_train_step(
     return model, opt_state, loss
 
 
+def predict_closed_loop_batch(
+    model: ClosedLoopHPEmulator | ContractingClosedLoopHPEmulator,
+    metadata: jnp.ndarray,
+    inputs: jnp.ndarray,
+    initial_temperature: jnp.ndarray,
+) -> jnp.ndarray:
+    return jax.vmap(model)(metadata, inputs, initial_temperature)
+
+
+def _physical_target_component(
+    targets: jnp.ndarray,
+    scalers_target_mean: jnp.ndarray,
+    scalers_target_scale: jnp.ndarray,
+    index: int,
+) -> jnp.ndarray:
+    return targets[..., index] * scalers_target_scale[index] + scalers_target_mean[index]
+
+
+@eqx.filter_value_and_grad
+def closed_loop_loss_fn(
+    model: ClosedLoopHPEmulator | ContractingClosedLoopHPEmulator,
+    metadata: jnp.ndarray,
+    inputs: jnp.ndarray,
+    initial_temperature: jnp.ndarray,
+    targets: jnp.ndarray,
+    target_mean: jnp.ndarray,
+    target_scale: jnp.ndarray,
+    hp_mode_loss_weight: float,
+    heat_on_threshold: float,
+) -> jnp.ndarray:
+    predictions, aux = jax.vmap(
+        lambda row_metadata, row_inputs, row_initial_temperature: model.rollout_with_aux(
+            row_metadata,
+            row_inputs,
+            row_initial_temperature,
+        )
+    )(metadata, inputs, initial_temperature)
+    mse = jnp.mean((predictions - targets) ** 2)
+    if hp_mode_loss_weight <= 0.0:
+        return mse
+    pi = aux[0]
+    pel_target = _physical_target_component(targets, target_mean, target_scale, 2)
+    mode_target = (pel_target > heat_on_threshold).astype(predictions.dtype)
+    pi = jnp.clip(pi, 1e-5, 1.0 - 1e-5)
+    bce = -jnp.mean(mode_target * jnp.log(pi) + (1.0 - mode_target) * jnp.log(1.0 - pi))
+    return mse + hp_mode_loss_weight * bce
+
+
+@eqx.filter_jit
+def closed_loop_train_step(
+    model: ClosedLoopHPEmulator | ContractingClosedLoopHPEmulator,
+    opt_state: optax.OptState,
+    optimizer: optax.GradientTransformation,
+    metadata: jnp.ndarray,
+    inputs: jnp.ndarray,
+    initial_temperature: jnp.ndarray,
+    targets: jnp.ndarray,
+    target_mean: jnp.ndarray,
+    target_scale: jnp.ndarray,
+    hp_mode_loss_weight: float,
+    heat_on_threshold: float,
+) -> tuple[ClosedLoopHPEmulator | ContractingClosedLoopHPEmulator, optax.OptState, jnp.ndarray]:
+    loss, grads = closed_loop_loss_fn(
+        model,
+        metadata,
+        inputs,
+        initial_temperature,
+        targets,
+        target_mean,
+        target_scale,
+        hp_mode_loss_weight,
+        heat_on_threshold,
+    )
+    updates, opt_state = optimizer.update(grads, opt_state, eqx.filter(model, eqx.is_array))
+    model = eqx.apply_updates(model, updates)
+    return model, opt_state, loss
+
+
+def predict_probabilistic_closed_loop_batch(
+    model: ProbabilisticClosedLoopModel,
+    metadata: jnp.ndarray,
+    inputs: jnp.ndarray,
+    initial_temperature: jnp.ndarray,
+    *,
+    key: jax.Array,
+    num_particles: int,
+    sample_process_noise: bool,
+    hp_scenario_mode: HPElectricScenarioMode,
+) -> jnp.ndarray:
+    keys = jax.random.split(key, metadata.shape[0])
+    return jax.vmap(
+        lambda row_metadata, row_inputs, row_initial_temperature, row_key: model.sample(
+            row_metadata,
+            row_inputs,
+            row_initial_temperature,
+            key=row_key,
+            num_particles=num_particles,
+            sample_process_noise=sample_process_noise,
+            hp_scenario_mode=hp_scenario_mode,
+        )
+    )(metadata, inputs, initial_temperature, keys)
+
+
+def predict_probabilistic_closed_loop_batch_with_aux(
+    model: ProbabilisticClosedLoopModel,
+    metadata: jnp.ndarray,
+    inputs: jnp.ndarray,
+    initial_temperature: jnp.ndarray,
+    *,
+    key: jax.Array,
+    num_particles: int,
+    sample_process_noise: bool,
+    hp_scenario_mode: HPElectricScenarioMode,
+) -> tuple[jnp.ndarray, tuple[jnp.ndarray, ...]]:
+    keys = jax.random.split(key, metadata.shape[0])
+    return jax.vmap(
+        lambda row_metadata, row_inputs, row_initial_temperature, row_key: model.sample_with_aux(
+            row_metadata,
+            row_inputs,
+            row_initial_temperature,
+            key=row_key,
+            num_particles=num_particles,
+            sample_process_noise=sample_process_noise,
+            hp_scenario_mode=hp_scenario_mode,
+        )
+    )(metadata, inputs, initial_temperature, keys)
+
+
+def closed_loop_stability_penalty(
+    model: ProbabilisticClosedLoopModel,
+    metadata: jnp.ndarray,
+    inputs: jnp.ndarray,
+    aux: tuple[jnp.ndarray, ...],
+    key: jax.Array,
+    *,
+    gamma: float,
+    num_samples: int,
+    aggregation: Literal["mean", "max"],
+) -> jnp.ndarray:
+    """Sample local closed-loop Jacobians and penalize singular values above gamma."""
+    if num_samples < 1:
+        return jnp.asarray(0.0, dtype=inputs.dtype)
+    batch_size, num_particles, horizon = aux[PROB_CLOSED_LOOP_AUX_ENERGY].shape
+    batch_key, particle_key, time_key = jax.random.split(key, 3)
+    batch_indices = jax.random.randint(batch_key, (num_samples,), 0, batch_size)
+    particle_indices = jax.random.randint(particle_key, (num_samples,), 0, num_particles)
+    time_indices = jax.random.randint(time_key, (num_samples,), 0, horizon)
+
+    x_state = aux[PROB_CLOSED_LOOP_AUX_X_STATE]
+    w_state = aux[PROB_CLOSED_LOOP_AUX_W_STATE]
+    energy = aux[PROB_CLOSED_LOOP_AUX_ENERGY]
+    temperature = aux[PROB_CLOSED_LOOP_AUX_TEMPERATURE_STATE]
+    xi = aux[PROB_CLOSED_LOOP_AUX_XI]
+
+    def sampled_excess(
+        batch_index: jnp.ndarray,
+        particle_index: jnp.ndarray,
+        time_index: jnp.ndarray,
+    ) -> jnp.ndarray:
+        augmented_state = jnp.concatenate(
+            [
+                x_state[batch_index, particle_index, time_index],
+                w_state[batch_index, particle_index, time_index],
+                energy[batch_index, particle_index, time_index, jnp.newaxis],
+                temperature[batch_index, particle_index, time_index, jnp.newaxis],
+            ],
+            axis=0,
+        )
+        sigma_max = model.closed_loop_jacobian_spectral_norm(
+            metadata[batch_index],
+            inputs[batch_index, time_index],
+            xi[batch_index, particle_index],
+            augmented_state,
+        )
+        return jax.nn.relu(sigma_max - jnp.asarray(gamma, dtype=sigma_max.dtype)) ** 2
+
+    excess = jax.vmap(sampled_excess)(batch_indices, particle_indices, time_indices)
+    if aggregation == "max":
+        return jnp.max(excess)
+    return jnp.mean(excess)
+
+
+@eqx.filter_value_and_grad(has_aux=True)
+def probabilistic_closed_loop_loss_fn(
+    model: ProbabilisticClosedLoopModel,
+    metadata: jnp.ndarray,
+    inputs: jnp.ndarray,
+    initial_temperature: jnp.ndarray,
+    targets: jnp.ndarray,
+    key: jax.Array,
+    num_particles: int,
+    target_mean: jnp.ndarray,
+    target_scale: jnp.ndarray,
+    hp_mode_loss_weight: float,
+    heat_on_threshold: float,
+    hp_active_power_nll_weight: float,
+    hp_inactive_leakage_weight: float,
+    softopt_weight: float,
+    softopt_temperature: float,
+    variogram_weight: float,
+    variogram_lags: tuple[int, ...],
+    variogram_power: float,
+    physics_weight: float,
+    horizon_weight_power: float,
+    stability_weight: float,
+    stability_gamma: float,
+    stability_samples: int,
+    stability_aggregation: Literal["mean", "max"],
+) -> tuple[jnp.ndarray, jnp.ndarray]:
+    rollout_key, stability_key = jax.random.split(key)
+    predictions, aux = predict_probabilistic_closed_loop_batch_with_aux(
+        model,
+        metadata,
+        inputs,
+        initial_temperature,
+        key=rollout_key,
+        num_particles=num_particles,
+        sample_process_noise=True,
+        hp_scenario_mode="expected",
+    )
+    zero = jnp.asarray(0.0, dtype=predictions.dtype)
+    energy_component = energy_score(predictions, targets)
+    variogram_component = zero
+    if variogram_weight > 0.0:
+        variogram_component = variogram_weight * variogram_score(
+            predictions,
+            targets,
+            lags=variogram_lags,
+            power=variogram_power,
+        )
+    softopt_component = zero
+    if softopt_weight > 0.0:
+        softopt_component = softopt_weight * soft_optimistic_loss(
+            predictions,
+            targets,
+            temperature=softopt_temperature,
+            horizon_weight_power=horizon_weight_power,
+        )
+
+    pi = aux[0]
+    expected_pel = aux[PROB_CLOSED_LOOP_AUX_EXPECTED_PEL]
+    log_mu = aux[PROB_CLOSED_LOOP_AUX_LOG_MU]
+    log_sigma = aux[PROB_CLOSED_LOOP_AUX_LOG_SIGMA]
+    pel_target = _physical_target_component(targets, target_mean, target_scale, 2)
+    mode_target = (pel_target > heat_on_threshold).astype(predictions.dtype)
+    mode_target_particles = mode_target[:, jnp.newaxis, :]
+
+    hp_bce_component = zero
+    if hp_mode_loss_weight > 0.0:
+        clipped_pi = jnp.clip(pi, 1e-5, 1.0 - 1e-5)
+        bce = -jnp.mean(
+            mode_target_particles * jnp.log(clipped_pi)
+            + (1.0 - mode_target_particles) * jnp.log(1.0 - clipped_pi)
+        )
+        hp_bce_component = hp_mode_loss_weight * bce
+
+    hp_active_nll_component = zero
+    if hp_active_power_nll_weight > 0.0:
+        active_mask = jnp.broadcast_to(mode_target_particles, log_mu.shape)
+        log_target = jnp.log1p(jnp.maximum(pel_target, 0.0))[:, jnp.newaxis, :]
+        log_two_pi = jnp.asarray(np.log(2.0 * np.pi), dtype=predictions.dtype)
+        nll = 0.5 * ((log_target - log_mu) / log_sigma) ** 2 + jnp.log(log_sigma) + 0.5 * log_two_pi
+        active_count = jnp.maximum(jnp.sum(active_mask), 1.0)
+        active_nll = jnp.sum(active_mask * nll) / active_count
+        hp_active_nll_component = hp_active_power_nll_weight * active_nll
+
+    hp_inactive_leakage_component = zero
+    if hp_inactive_leakage_weight > 0.0:
+        inactive_mask = jnp.broadcast_to(1.0 - mode_target_particles, expected_pel.shape)
+        pel_scale = jnp.asarray(target_scale[2], dtype=predictions.dtype)
+        inactive_count = jnp.maximum(jnp.sum(inactive_mask), 1.0)
+        leakage = jnp.sum(inactive_mask * (expected_pel / pel_scale) ** 2) / inactive_count
+        hp_inactive_leakage_component = hp_inactive_leakage_weight * leakage
+
+    physics_component = zero
+    if physics_weight > 0.0:
+        regularization = jnp.mean(jax.vmap(model.parameter_regularization)(metadata))
+        physics_component = physics_weight * regularization
+
+    stability_component = zero
+    if stability_weight > 0.0 and stability_samples > 0:
+        stability_component = stability_weight * closed_loop_stability_penalty(
+            model,
+            metadata,
+            inputs,
+            aux,
+            stability_key,
+            gamma=stability_gamma,
+            num_samples=stability_samples,
+            aggregation=stability_aggregation,
+        )
+
+    components = jnp.stack(
+        [
+            energy_component,
+            variogram_component,
+            softopt_component,
+            hp_bce_component,
+            hp_active_nll_component,
+            hp_inactive_leakage_component,
+            physics_component,
+            stability_component,
+        ]
+    )
+    return jnp.sum(components), components
+
+
+@eqx.filter_jit
+def probabilistic_closed_loop_train_step(
+    model: ProbabilisticClosedLoopModel,
+    opt_state: optax.OptState,
+    optimizer: optax.GradientTransformation,
+    metadata: jnp.ndarray,
+    inputs: jnp.ndarray,
+    initial_temperature: jnp.ndarray,
+    targets: jnp.ndarray,
+    key: jax.Array,
+    num_particles: int,
+    target_mean: jnp.ndarray,
+    target_scale: jnp.ndarray,
+    hp_mode_loss_weight: float,
+    heat_on_threshold: float,
+    hp_active_power_nll_weight: float,
+    hp_inactive_leakage_weight: float,
+    softopt_weight: float,
+    softopt_temperature: float,
+    variogram_weight: float,
+    variogram_lags: tuple[int, ...],
+    variogram_power: float,
+    physics_weight: float,
+    horizon_weight_power: float,
+    stability_weight: float,
+    stability_gamma: float,
+    stability_samples: int,
+    stability_aggregation: Literal["mean", "max"],
+) -> tuple[ProbabilisticClosedLoopModel, optax.OptState, jnp.ndarray, jnp.ndarray]:
+    (loss, components), grads = probabilistic_closed_loop_loss_fn(
+        model,
+        metadata,
+        inputs,
+        initial_temperature,
+        targets,
+        key,
+        num_particles,
+        target_mean,
+        target_scale,
+        hp_mode_loss_weight,
+        heat_on_threshold,
+        hp_active_power_nll_weight,
+        hp_inactive_leakage_weight,
+        softopt_weight,
+        softopt_temperature,
+        variogram_weight,
+        variogram_lags,
+        variogram_power,
+        physics_weight,
+        horizon_weight_power,
+        stability_weight,
+        stability_gamma,
+        stability_samples,
+        stability_aggregation,
+    )
+    updates, opt_state = optimizer.update(grads, opt_state, eqx.filter(model, eqx.is_array))
+    model = eqx.apply_updates(model, updates)
+    return model, opt_state, loss, components
+
+
+def _component_metrics(
+    prediction: np.ndarray,
+    target: np.ndarray,
+    index: int,
+) -> dict[str, float]:
+    metrics = regression_metrics(prediction[..., index], target[..., index])
+    return {
+        "rmse": metrics.rmse,
+        "mae": metrics.mae,
+        "nmae": metrics.nmae,
+        "bias": metrics.bias,
+    }
+
+
+def closed_loop_metrics_dict(
+    prediction: np.ndarray,
+    target: np.ndarray,
+) -> dict[str, float]:
+    temp = _component_metrics(prediction, target, 0)
+    q_room = _component_metrics(prediction, target, 1)
+    p_el = _component_metrics(prediction, target, 2)
+    return {
+        "rmse_c": temp["rmse"],
+        "mae_c": temp["mae"],
+        "nmae": temp["nmae"],
+        "bias_c": temp["bias"],
+        "qroom_rmse_w_m2": q_room["rmse"],
+        "qroom_mae_w_m2": q_room["mae"],
+        "qroom_nmae": q_room["nmae"],
+        "qroom_bias_w_m2": q_room["bias"],
+        "pel_rmse_w_m2": p_el["rmse"],
+        "pel_mae_w_m2": p_el["mae"],
+        "pel_nmae": p_el["nmae"],
+        "pel_bias_w_m2": p_el["bias"],
+    }
+
+
+def add_closed_loop_temperature_diagnostics(
+    metrics: dict[str, float],
+    prediction: np.ndarray,
+    target: np.ndarray,
+    profile_ids: np.ndarray,
+    start_indices: np.ndarray,
+) -> dict[str, float]:
+    """Add worst-window temperature diagnostics to a closed-loop metric dict."""
+    temperature_prediction = prediction[..., 0]
+    temperature_target = target[..., 0]
+    for name in (
+        "max_abs_error_c",
+        "max_abs_error_profile_id",
+        "max_abs_error_start",
+        "max_abs_error_step",
+        "max_abs_error_pred_c",
+        "max_abs_error_target_c",
+        "min_pred_c",
+        "max_pred_c",
+    ):
+        metrics.setdefault(name, float("nan"))
+    finite_temperature_prediction = temperature_prediction[np.isfinite(temperature_prediction)]
+    if finite_temperature_prediction.size > 0:
+        metrics["min_pred_c"] = float(np.min(finite_temperature_prediction))
+        metrics["max_pred_c"] = float(np.max(finite_temperature_prediction))
+    absolute_error = np.abs(temperature_prediction - temperature_target)
+    if absolute_error.size == 0 or not np.isfinite(absolute_error).any():
+        return metrics
+    flat_index = int(np.nanargmax(absolute_error))
+    window_index, step_index = np.unravel_index(flat_index, absolute_error.shape)
+    metrics["max_abs_error_c"] = float(absolute_error[window_index, step_index])
+    metrics["max_abs_error_profile_id"] = float(profile_ids[window_index])
+    metrics["max_abs_error_start"] = float(start_indices[window_index])
+    metrics["max_abs_error_step"] = float(step_index)
+    metrics["max_abs_error_pred_c"] = float(temperature_prediction[window_index, step_index])
+    metrics["max_abs_error_target_c"] = float(temperature_target[window_index, step_index])
+    return metrics
+
+
+def metric_int(metrics: dict[str, float], name: str) -> str:
+    value = metrics.get(name, np.nan)
+    if not np.isfinite(value):
+        return "nan"
+    return str(int(value))
+
+
+def evaluate_closed_loop(
+    model: ClosedLoopHPEmulator | ContractingClosedLoopHPEmulator,
+    windows: ClosedLoopWindowedArrays,
+    scalers: WindowScalers,
+    *,
+    batch_size: int,
+) -> dict[str, float]:
+    predictions: list[np.ndarray] = []
+    targets: list[np.ndarray] = []
+    rng = np.random.default_rng(0)
+    for metadata, inputs, initial_temperature, target in minibatches(
+        windows,
+        batch_size=batch_size,
+        rng=rng,
+        shuffle=False,
+    ):
+        pred = predict_closed_loop_batch(
+            model,
+            jnp.asarray(metadata),
+            jnp.asarray(inputs),
+            jnp.asarray(initial_temperature),
+        )
+        predictions.append(np.asarray(pred))
+        targets.append(target)
+
+    pred_norm = np.concatenate(predictions, axis=0)
+    target_norm = np.concatenate(targets, axis=0)
+    physical_pred = inverse_target(pred_norm, scalers)
+    physical_target = inverse_target(target_norm, scalers)
+    metrics = closed_loop_metrics_dict(physical_pred, physical_target)
+    metrics["loss"] = regression_metrics(pred_norm, target_norm).rmse**2
+    add_closed_loop_temperature_diagnostics(
+        metrics,
+        physical_pred,
+        physical_target,
+        windows.profile_ids,
+        windows.start_indices,
+    )
+    return metrics
+
+
+def evaluate_probabilistic_closed_loop(
+    model: ProbabilisticClosedLoopModel,
+    windows: ClosedLoopWindowedArrays,
+    scalers: WindowScalers,
+    *,
+    batch_size: int,
+    num_particles: int,
+) -> dict[str, float]:
+    predictions: list[np.ndarray] = []
+    median_predictions: list[np.ndarray] = []
+    targets: list[np.ndarray] = []
+    key = jax.random.PRNGKey(2468)
+    particle_worst_error = -np.inf
+    particle_worst_profile_id = np.nan
+    particle_worst_start = np.nan
+    particle_worst_index = np.nan
+    particle_worst_step = np.nan
+    particle_worst_pred = np.nan
+    particle_worst_target = np.nan
+    particle_min_pred = np.inf
+    particle_max_pred = -np.inf
+    n_windows = windows.targets.shape[0]
+    for batch_start in range(0, n_windows, batch_size):
+        batch_end = min(batch_start + batch_size, n_windows)
+        metadata = windows.metadata[batch_start:batch_end]
+        inputs = windows.inputs[batch_start:batch_end]
+        initial_temperature = windows.initial_temperature[batch_start:batch_end]
+        target = windows.targets[batch_start:batch_end]
+        key, batch_key = jax.random.split(key)
+        particles = predict_probabilistic_closed_loop_batch(
+            model,
+            jnp.asarray(metadata),
+            jnp.asarray(inputs),
+            jnp.asarray(initial_temperature),
+            key=batch_key,
+            num_particles=num_particles,
+            sample_process_noise=False,
+            hp_scenario_mode="expected",
+        )
+        particles_np = np.asarray(particles)
+        predictions.append(np.mean(particles_np, axis=1))
+        median_predictions.append(np.median(particles_np, axis=1))
+        targets.append(target)
+
+        particle_physical = inverse_target(particles_np, scalers)
+        target_physical = inverse_target(target, scalers)
+        particle_temperature = particle_physical[..., 0]
+        finite_particle_temperature = particle_temperature[np.isfinite(particle_temperature)]
+        if finite_particle_temperature.size > 0:
+            particle_min_pred = min(particle_min_pred, float(np.min(finite_particle_temperature)))
+            particle_max_pred = max(particle_max_pred, float(np.max(finite_particle_temperature)))
+        particle_abs_error = np.abs(
+            particle_temperature - target_physical[:, np.newaxis, :, 0]
+        )
+        finite_abs_error = np.where(np.isfinite(particle_abs_error), particle_abs_error, np.nan)
+        if np.isfinite(finite_abs_error).any():
+            flat_index = int(np.nanargmax(finite_abs_error))
+            local_window_index, local_particle_index, step_index = np.unravel_index(
+                flat_index,
+                finite_abs_error.shape,
+            )
+            error = float(finite_abs_error[local_window_index, local_particle_index, step_index])
+            if error > particle_worst_error:
+                particle_worst_error = error
+                particle_worst_profile_id = float(windows.profile_ids[batch_start + local_window_index])
+                particle_worst_start = float(windows.start_indices[batch_start + local_window_index])
+                particle_worst_index = float(local_particle_index)
+                particle_worst_step = float(step_index)
+                particle_worst_pred = float(
+                    particle_temperature[local_window_index, local_particle_index, step_index]
+                )
+                particle_worst_target = float(target_physical[local_window_index, step_index, 0])
+
+    pred_norm = np.concatenate(predictions, axis=0)
+    median_pred_norm = np.concatenate(median_predictions, axis=0)
+    target_norm = np.concatenate(targets, axis=0)
+    physical_pred = inverse_target(pred_norm, scalers)
+    median_physical_pred = inverse_target(median_pred_norm, scalers)
+    physical_target = inverse_target(target_norm, scalers)
+    metrics = closed_loop_metrics_dict(physical_pred, physical_target)
+    median_metrics = closed_loop_metrics_dict(median_physical_pred, physical_target)
+    metrics.update({f"median_{name}": value for name, value in median_metrics.items()})
+    metrics["mean_median_rmse_c"] = regression_metrics(
+        physical_pred[..., 0],
+        median_physical_pred[..., 0],
+    ).rmse
+    metrics["loss"] = regression_metrics(pred_norm, target_norm).rmse**2
+    metrics["median_loss"] = regression_metrics(median_pred_norm, target_norm).rmse**2
+    metrics["particle_max_abs_error_c"] = (
+        float(particle_worst_error) if np.isfinite(particle_worst_error) else np.nan
+    )
+    metrics["particle_worst_profile_id"] = particle_worst_profile_id
+    metrics["particle_worst_start"] = particle_worst_start
+    metrics["particle_worst_index"] = particle_worst_index
+    metrics["particle_worst_step"] = particle_worst_step
+    metrics["particle_worst_pred_c"] = particle_worst_pred
+    metrics["particle_worst_target_c"] = particle_worst_target
+    metrics["particle_min_pred_c"] = (
+        float(particle_min_pred) if np.isfinite(particle_min_pred) else np.nan
+    )
+    metrics["particle_max_pred_c"] = (
+        float(particle_max_pred) if np.isfinite(particle_max_pred) else np.nan
+    )
+    add_closed_loop_temperature_diagnostics(
+        metrics,
+        physical_pred,
+        physical_target,
+        windows.profile_ids,
+        windows.start_indices,
+    )
+    return metrics
+
+
 def evaluate(
     model: EmulatorModel,
     windows: WindowedArrays,
@@ -838,7 +1527,161 @@ def evaluate_full_profiles(
     }
 
 
+def predict_closed_loop_full_profile(
+    model: ClosedLoopHPEmulator | ContractingClosedLoopHPEmulator,
+    profile: ClosedLoopProfile,
+    scalers: WindowScalers,
+) -> np.ndarray:
+    """Run one closed-loop rollout over a complete profile."""
+    metadata = scalers.metadata.transform(profile.metadata)
+    inputs = scalers.inputs.transform(profile.inputs)
+    target_mean = np.asarray(scalers.target.mean, dtype=np.float32).reshape(-1)
+    target_scale = np.asarray(scalers.target.scale, dtype=np.float32).reshape(-1)
+    initial_temperature = (
+        (profile.initial_temperature[0] - target_mean[:1]) / target_scale[:1]
+    ).astype(np.float32)
+    prediction = predict_closed_loop_batch(
+        model,
+        jnp.asarray(metadata)[jnp.newaxis, :],
+        jnp.asarray(inputs)[jnp.newaxis, :, :],
+        jnp.asarray(initial_temperature)[jnp.newaxis, :],
+    )
+    return inverse_target(np.asarray(prediction[0]), scalers)
+
+
+def predict_probabilistic_closed_loop_full_profile(
+    model: ProbabilisticClosedLoopModel,
+    profile: ClosedLoopProfile,
+    scalers: WindowScalers,
+    *,
+    key: jax.Array,
+    num_particles: int,
+) -> np.ndarray:
+    """Run one mean probabilistic closed-loop rollout over a complete profile."""
+    metadata = scalers.metadata.transform(profile.metadata)
+    inputs = scalers.inputs.transform(profile.inputs)
+    target_mean = np.asarray(scalers.target.mean, dtype=np.float32).reshape(-1)
+    target_scale = np.asarray(scalers.target.scale, dtype=np.float32).reshape(-1)
+    initial_temperature = (
+        (profile.initial_temperature[0] - target_mean[:1]) / target_scale[:1]
+    ).astype(np.float32)
+    particles = model.sample(
+        jnp.asarray(metadata),
+        jnp.asarray(inputs),
+        jnp.asarray(initial_temperature),
+        key=key,
+        num_particles=num_particles,
+        sample_process_noise=False,
+        hp_scenario_mode="expected",
+    )
+    prediction = np.asarray(jnp.mean(particles, axis=0))
+    return inverse_target(prediction, scalers)
+
+
+def sample_probabilistic_closed_loop_full_profile_scenarios(
+    model: ProbabilisticClosedLoopModel,
+    profile: ClosedLoopProfile,
+    scalers: WindowScalers,
+    *,
+    key: jax.Array,
+    num_particles: int,
+    hp_scenario_mode: HPElectricScenarioMode,
+) -> np.ndarray:
+    """Sample joint closed-loop scenarios in physical units.
+
+    The returned channels are [Tin, Qroom, Pel_SH], preserving the per-scenario
+    link between electric power, delivered heat, and temperature.
+    """
+    metadata = scalers.metadata.transform(profile.metadata)
+    inputs = scalers.inputs.transform(profile.inputs)
+    target_mean = np.asarray(scalers.target.mean, dtype=np.float32).reshape(-1)
+    target_scale = np.asarray(scalers.target.scale, dtype=np.float32).reshape(-1)
+    initial_temperature = (
+        (profile.initial_temperature[0] - target_mean[:1]) / target_scale[:1]
+    ).astype(np.float32)
+    raw_predictions = model.sample(
+        jnp.asarray(metadata),
+        jnp.asarray(inputs),
+        jnp.asarray(initial_temperature),
+        key=key,
+        num_particles=num_particles,
+        sample_process_noise=True,
+        hp_scenario_mode=hp_scenario_mode,
+    )
+    return inverse_target(np.asarray(raw_predictions), scalers)
+
+
+def evaluate_closed_loop_full_profiles(
+    model: ClosedLoopHPEmulator | ContractingClosedLoopHPEmulator,
+    profiles: list[ClosedLoopProfile],
+    scalers: WindowScalers,
+) -> dict[str, float]:
+    """Evaluate one continuous closed-loop rollout per full profile."""
+    if not profiles:
+        return {
+            "profile_count": 0.0,
+            "rmse_c": float("nan"),
+            "mae_c": float("nan"),
+            "nmae": float("nan"),
+            "bias_c": float("nan"),
+            "qroom_rmse_w_m2": float("nan"),
+            "pel_rmse_w_m2": float("nan"),
+        }
+    predictions = [predict_closed_loop_full_profile(model, profile, scalers) for profile in profiles]
+    targets = [profile.targets for profile in profiles]
+    metrics = closed_loop_metrics_dict(
+        np.concatenate(predictions, axis=0),
+        np.concatenate(targets, axis=0),
+    )
+    metrics["profile_count"] = float(len(profiles))
+    return metrics
+
+
+def evaluate_probabilistic_closed_loop_full_profiles(
+    model: ProbabilisticClosedLoopModel,
+    profiles: list[ClosedLoopProfile],
+    scalers: WindowScalers,
+    *,
+    num_particles: int,
+) -> dict[str, float]:
+    """Evaluate one continuous mean probabilistic closed-loop rollout per profile."""
+    if not profiles:
+        return {
+            "profile_count": 0.0,
+            "rmse_c": float("nan"),
+            "mae_c": float("nan"),
+            "nmae": float("nan"),
+            "bias_c": float("nan"),
+            "qroom_rmse_w_m2": float("nan"),
+            "pel_rmse_w_m2": float("nan"),
+        }
+    key = jax.random.PRNGKey(8642)
+    predictions = []
+    for profile in profiles:
+        key, profile_key = jax.random.split(key)
+        predictions.append(
+            predict_probabilistic_closed_loop_full_profile(
+                model,
+                profile,
+                scalers,
+                key=profile_key,
+                num_particles=num_particles,
+            )
+        )
+    targets = [profile.targets for profile in profiles]
+    metrics = closed_loop_metrics_dict(
+        np.concatenate(predictions, axis=0),
+        np.concatenate(targets, axis=0),
+    )
+    metrics["profile_count"] = float(len(profiles))
+    return metrics
+
+
 def _profile_by_id(profiles: list[BuildingProfile]) -> dict[int, BuildingProfile]:
+    return {profile.profile_id: profile for profile in profiles}
+
+
+def _closed_loop_profile_by_id(profiles: list[ClosedLoopProfile]) -> dict[int, ClosedLoopProfile]:
     return {profile.profile_id: profile for profile in profiles}
 
 
@@ -858,6 +1701,46 @@ def _prediction_metrics_text(prediction: np.ndarray, target: np.ndarray) -> str:
     )
 
 
+def _closed_loop_metrics_text(prediction: np.ndarray, target: np.ndarray) -> str:
+    metrics = closed_loop_metrics_dict(prediction, target)
+    return (
+        f"T RMSE={metrics['rmse_c']:.3f} degC, "
+        f"Q RMSE={metrics['qroom_rmse_w_m2']:.3f} W/m2, "
+        f"Pel RMSE={metrics['pel_rmse_w_m2']:.3f} W/m2"
+    )
+
+
+def _scenario_extreme_traces(
+    scenarios: np.ndarray,
+    simulated: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Return per-output closest and worst sampled traces versus simulation."""
+    scenario_values = np.asarray(scenarios)
+    simulated_values = np.asarray(simulated)
+    if scenario_values.ndim == 2:
+        scenario_values = scenario_values[..., np.newaxis]
+    if simulated_values.ndim == 1:
+        simulated_values = simulated_values[..., np.newaxis]
+    if scenario_values.ndim != 3:
+        raise ValueError("scenarios must have shape [scenario, time, output]")
+    if simulated_values.ndim != 2:
+        raise ValueError("simulated must have shape [time, output]")
+    if scenario_values.shape[1:] != simulated_values.shape:
+        raise ValueError(
+            "scenario and simulated traces must agree on time/output dimensions; "
+            f"got {scenario_values.shape[1:]} and {simulated_values.shape}"
+        )
+
+    errors = scenario_values - simulated_values[np.newaxis, :, :]
+    rmse_by_scenario_and_output = np.sqrt(np.nanmean(errors**2, axis=1))
+    best_indices = np.nanargmin(rmse_by_scenario_and_output, axis=0)
+    worst_indices = np.nanargmax(rmse_by_scenario_and_output, axis=0)
+    output_indices = np.arange(simulated_values.shape[1])
+    closest = scenario_values[best_indices, :, output_indices].T
+    worst = scenario_values[worst_indices, :, output_indices].T
+    return closest, worst
+
+
 def _write_temperature_comparison(
     *,
     path: Path,
@@ -867,6 +1750,8 @@ def _write_temperature_comparison(
     emulated: np.ndarray,
     lower: np.ndarray | None = None,
     upper: np.ndarray | None = None,
+    closest: np.ndarray | None = None,
+    worst: np.ndarray | None = None,
     interval_label: str = "95% scenario interval",
 ) -> None:
     fig = go.Figure()
@@ -902,6 +1787,26 @@ def _write_temperature_comparison(
                 hoverinfo="skip",
             )
         )
+    if closest is not None:
+        fig.add_trace(
+            go.Scattergl(
+                x=datetimes,
+                y=np.asarray(closest).ravel(),
+                mode="lines",
+                name="Closest scenario",
+                line={"color": "#2ca02c", "width": 1.5, "dash": "dash"},
+            )
+        )
+    if worst is not None:
+        fig.add_trace(
+            go.Scattergl(
+                x=datetimes,
+                y=np.asarray(worst).ravel(),
+                mode="lines",
+                name="Worst scenario",
+                line={"color": "#9467bd", "width": 1.5, "dash": "dot"},
+            )
+        )
     fig.add_trace(
         go.Scattergl(
             x=datetimes,
@@ -926,6 +1831,307 @@ def _write_temperature_comparison(
         },
     )
     fig.write_html(path, include_plotlyjs=True)
+
+
+def _write_closed_loop_comparison(
+    *,
+    path: Path,
+    title: str,
+    datetimes: np.ndarray,
+    simulated: np.ndarray,
+    emulated: np.ndarray,
+    lower: np.ndarray | None = None,
+    upper: np.ndarray | None = None,
+    closest: np.ndarray | None = None,
+    worst: np.ndarray | None = None,
+    interval_label: str = "95% scenario interval",
+) -> None:
+    fig = make_subplots(
+        rows=3,
+        cols=1,
+        shared_xaxes=True,
+        vertical_spacing=0.06,
+        subplot_titles=(
+            "Indoor temperature",
+            "Delivered room heat",
+            "Space-heating HP electric power",
+        ),
+    )
+    y_titles = ["Temperature [degC]", "Qroom [W/m2]", "Pel_SH [W/m2]"]
+    for row, index in enumerate(range(3), start=1):
+        fig.add_trace(
+            go.Scattergl(
+                x=datetimes,
+                y=simulated[:, index],
+                mode="lines",
+                name="Simulated" if row == 1 else "Simulated",
+                line={"color": "#1f77b4"},
+                showlegend=row == 1,
+            ),
+            row=row,
+            col=1,
+        )
+        if lower is not None and upper is not None:
+            fig.add_trace(
+                go.Scatter(
+                    x=datetimes,
+                    y=upper[:, index],
+                    mode="lines",
+                    line={"width": 0, "color": "rgba(214, 39, 40, 0)"},
+                    showlegend=False,
+                    hoverinfo="skip",
+                ),
+                row=row,
+                col=1,
+            )
+            fig.add_trace(
+                go.Scatter(
+                    x=datetimes,
+                    y=lower[:, index],
+                    mode="lines",
+                    fill="tonexty",
+                    fillcolor="rgba(214, 39, 40, 0.18)",
+                    line={"width": 0, "color": "rgba(214, 39, 40, 0)"},
+                    name=interval_label,
+                    showlegend=row == 1,
+                    hoverinfo="skip",
+                ),
+                row=row,
+                col=1,
+            )
+        if closest is not None:
+            fig.add_trace(
+                go.Scattergl(
+                    x=datetimes,
+                    y=closest[:, index],
+                    mode="lines",
+                    name="Closest scenario",
+                    line={"color": "#2ca02c", "width": 1.5, "dash": "dash"},
+                    showlegend=row == 1,
+                ),
+                row=row,
+                col=1,
+            )
+        if worst is not None:
+            fig.add_trace(
+                go.Scattergl(
+                    x=datetimes,
+                    y=worst[:, index],
+                    mode="lines",
+                    name="Worst scenario",
+                    line={"color": "#9467bd", "width": 1.5, "dash": "dot"},
+                    showlegend=row == 1,
+                ),
+                row=row,
+                col=1,
+            )
+        fig.add_trace(
+            go.Scattergl(
+                x=datetimes,
+                y=emulated[:, index],
+                mode="lines",
+                name="Emulated" if row == 1 else "Emulated",
+                line={"color": "#d62728"},
+                showlegend=row == 1,
+            ),
+            row=row,
+            col=1,
+        )
+        fig.update_yaxes(title_text=y_titles[index], row=row, col=1)
+    fig.update_layout(
+        title=f"{title}<br><sup>{_closed_loop_metrics_text(emulated, simulated)}</sup>",
+        template="plotly_white",
+        hovermode="x unified",
+        height=900,
+        legend={
+            "orientation": "h",
+            "yanchor": "bottom",
+            "y": 1.02,
+            "xanchor": "right",
+            "x": 1.0,
+        },
+    )
+    fig.update_xaxes(title_text="Time", row=3, col=1)
+    fig.write_html(path, include_plotlyjs=True)
+
+
+def save_closed_loop_prediction_visualizations(
+    model: ClosedLoopHPEmulator | ContractingClosedLoopHPEmulator,
+    test_windows: ClosedLoopWindowedArrays,
+    test_profiles: list[ClosedLoopProfile],
+    scalers: WindowScalers,
+    output_dir: Path,
+    num_window_plots: int,
+    num_full_profile_plots: int,
+    *,
+    filename_suffix: str = "_closed_loop_hp",
+    title_label: str = "closed-loop HP",
+) -> dict[str, Path]:
+    """Save closed-loop fixed-window and full-profile rollout plots."""
+    if test_windows.targets.shape[0] == 0 or not test_profiles:
+        return {}
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    profiles_by_id = _closed_loop_profile_by_id(test_profiles)
+    paths: dict[str, Path] = {}
+
+    for plot_number, window_index in enumerate(
+        _evenly_spaced_indices(num_window_plots, test_windows.targets.shape[0]),
+        start=1,
+    ):
+        window_profile_id = int(test_windows.profile_ids[window_index])
+        window_start = int(test_windows.start_indices[window_index])
+        window_profile = profiles_by_id[window_profile_id]
+        prediction_norm = predict_closed_loop_batch(
+            model,
+            jnp.asarray(test_windows.metadata[window_index])[jnp.newaxis, :],
+            jnp.asarray(test_windows.inputs[window_index])[jnp.newaxis, :, :],
+            jnp.asarray(test_windows.initial_temperature[window_index])[jnp.newaxis, :],
+        )
+        prediction = inverse_target(np.asarray(prediction_norm[0]), scalers)
+        target = inverse_target(test_windows.targets[window_index], scalers)
+        window_end = window_start + prediction.shape[0]
+        window_path = (
+            output_dir
+            / (
+                f"test_window_{plot_number:02d}_profile_{window_profile_id}"
+                f"_start_{window_start}{filename_suffix}.html"
+            )
+        )
+        _write_closed_loop_comparison(
+            path=window_path,
+            title=f"{prediction.shape[0]}-step {title_label} rollout, profile {window_profile_id}",
+            datetimes=window_profile.datetime[window_start:window_end],
+            simulated=target,
+            emulated=prediction,
+        )
+        paths[f"test_window_{plot_number:02d}"] = window_path
+
+    for plot_number, profile_index in enumerate(
+        _evenly_spaced_indices(num_full_profile_plots, len(test_profiles)),
+        start=1,
+    ):
+        full_profile = test_profiles[profile_index]
+        prediction = predict_closed_loop_full_profile(model, full_profile, scalers)
+        full_path = output_dir / (
+            f"test_full_profile_{plot_number:02d}_{full_profile.profile_id}{filename_suffix}.html"
+        )
+        _write_closed_loop_comparison(
+            path=full_path,
+            title=f"Full-profile {title_label} rollout, profile {full_profile.profile_id}",
+            datetimes=full_profile.datetime,
+            simulated=full_profile.targets,
+            emulated=prediction,
+        )
+        paths[f"full_profile_{plot_number:02d}"] = full_path
+
+    return paths
+
+
+def save_probabilistic_closed_loop_prediction_visualizations(
+    model: ProbabilisticClosedLoopModel,
+    test_windows: ClosedLoopWindowedArrays,
+    test_profiles: list[ClosedLoopProfile],
+    scalers: WindowScalers,
+    output_dir: Path,
+    num_window_plots: int,
+    num_full_profile_plots: int,
+    *,
+    num_particles: int,
+    hp_scenario_mode: HPElectricScenarioMode,
+    filename_suffix: str = "_closed_loop_hp_prob",
+    title_label: str = "probabilistic closed-loop HP",
+) -> dict[str, Path]:
+    """Save probabilistic closed-loop rollout plots with joint scenario intervals."""
+    if test_windows.targets.shape[0] == 0 or not test_profiles:
+        return {}
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    profiles_by_id = _closed_loop_profile_by_id(test_profiles)
+    paths: dict[str, Path] = {}
+    key = jax.random.PRNGKey(121314)
+
+    for plot_number, window_index in enumerate(
+        _evenly_spaced_indices(num_window_plots, test_windows.targets.shape[0]),
+        start=1,
+    ):
+        key, window_key = jax.random.split(key)
+        window_profile_id = int(test_windows.profile_ids[window_index])
+        window_start = int(test_windows.start_indices[window_index])
+        window_profile = profiles_by_id[window_profile_id]
+        scenarios_norm = model.sample(
+            jnp.asarray(test_windows.metadata[window_index]),
+            jnp.asarray(test_windows.inputs[window_index]),
+            jnp.asarray(test_windows.initial_temperature[window_index]),
+            key=window_key,
+            num_particles=num_particles,
+            sample_process_noise=True,
+            hp_scenario_mode=hp_scenario_mode,
+        )
+        scenarios = inverse_target(np.asarray(scenarios_norm), scalers)
+        prediction = np.mean(scenarios, axis=0)
+        lower = np.quantile(scenarios, 0.025, axis=0)
+        upper = np.quantile(scenarios, 0.975, axis=0)
+        target = inverse_target(test_windows.targets[window_index], scalers)
+        closest, worst = _scenario_extreme_traces(scenarios, target)
+        window_end = window_start + prediction.shape[0]
+        window_path = (
+            output_dir
+            / (
+                f"test_window_{plot_number:02d}_profile_{window_profile_id}"
+                f"_start_{window_start}{filename_suffix}.html"
+            )
+        )
+        _write_closed_loop_comparison(
+            path=window_path,
+            title=f"{prediction.shape[0]}-step {title_label} rollout, profile {window_profile_id}",
+            datetimes=window_profile.datetime[window_start:window_end],
+            simulated=target,
+            emulated=prediction,
+            lower=lower,
+            upper=upper,
+            closest=closest,
+            worst=worst,
+            interval_label=f"95% scenario interval ({num_particles} samples)",
+        )
+        paths[f"test_window_{plot_number:02d}"] = window_path
+
+    for plot_number, profile_index in enumerate(
+        _evenly_spaced_indices(num_full_profile_plots, len(test_profiles)),
+        start=1,
+    ):
+        key, profile_key = jax.random.split(key)
+        full_profile = test_profiles[profile_index]
+        scenarios = sample_probabilistic_closed_loop_full_profile_scenarios(
+            model,
+            full_profile,
+            scalers,
+            key=profile_key,
+            num_particles=num_particles,
+            hp_scenario_mode=hp_scenario_mode,
+        )
+        prediction = np.mean(scenarios, axis=0)
+        lower = np.quantile(scenarios, 0.025, axis=0)
+        upper = np.quantile(scenarios, 0.975, axis=0)
+        closest, worst = _scenario_extreme_traces(scenarios, full_profile.targets)
+        full_path = output_dir / (
+            f"test_full_profile_{plot_number:02d}_{full_profile.profile_id}{filename_suffix}.html"
+        )
+        _write_closed_loop_comparison(
+            path=full_path,
+            title=f"Full-profile {title_label} rollout, profile {full_profile.profile_id}",
+            datetimes=full_profile.datetime,
+            simulated=full_profile.targets,
+            emulated=prediction,
+            lower=lower,
+            upper=upper,
+            closest=closest,
+            worst=worst,
+            interval_label=f"95% scenario interval ({num_particles} samples)",
+        )
+        paths[f"full_profile_{plot_number:02d}"] = full_path
+
+    return paths
 
 
 def save_prediction_visualizations(
@@ -1003,6 +2209,8 @@ def save_prediction_visualizations(
         full_profile = test_profiles[profile_index]
         lower = None
         upper = None
+        closest = None
+        worst = None
         interval_label = "95% scenario interval"
         if model_kind == "probabilistic":
             assert isinstance(model, ProbabilisticStableStateSpaceEmulator)
@@ -1031,6 +2239,8 @@ def save_prediction_visualizations(
                 num_particles=num_particles,
             )
         _, full_target, full_datetimes, _ = full_profile_arrays(full_profile, target_alignment)
+        if model_kind == "probabilistic":
+            closest, worst = _scenario_extreme_traces(scenarios, full_target)
         full_path = (
             output_dir
             / f"test_full_profile_{plot_number:02d}_{full_profile.profile_id}{filename_suffix}.html"
@@ -1046,6 +2256,8 @@ def save_prediction_visualizations(
             emulated=full_prediction,
             lower=lower,
             upper=upper,
+            closest=closest,
+            worst=worst,
             interval_label=interval_label,
         )
         paths[f"full_profile_{plot_number:02d}"] = full_path
@@ -1060,6 +2272,8 @@ def sample_spectral_radius(
 ) -> float:
     count = min(n, windows.metadata.shape[0])
     radii = []
+    if isinstance(model, (ContractingClosedLoopHPEmulator, ProbabilisticContractingClosedLoopHPEmulator)):
+        return float(model.contraction_gamma)
     for metadata in windows.metadata[:count]:
         if getattr(model, "switching_dynamics", "none") != "none":
             off_matrices, on_matrices = model.regime_matrices(jnp.asarray(metadata))
@@ -1161,9 +2375,1085 @@ def switching_dynamics_scaler_kwargs(
     }
 
 
+def _linear_with_copied_weights(
+    source: eqx.nn.Linear,
+    target: eqx.nn.Linear,
+    *,
+    allow_extra_input_columns: bool = False,
+    extra_input_key: jax.Array | None = None,
+    extra_input_scale: float = 0.0,
+) -> eqx.nn.Linear:
+    source_weight = jnp.asarray(source.weight)
+    target_weight = jnp.asarray(target.weight)
+    if source_weight.shape == target_weight.shape:
+        new_weight = source_weight.astype(target_weight.dtype)
+    elif (
+        allow_extra_input_columns
+        and source_weight.shape[0] == target_weight.shape[0]
+        and source_weight.shape[1] < target_weight.shape[1]
+    ):
+        new_weight = jnp.zeros_like(target_weight).at[:, : source_weight.shape[1]].set(
+            source_weight.astype(target_weight.dtype)
+        )
+        if extra_input_key is not None and extra_input_scale > 0.0:
+            extra_width = target_weight.shape[1] - source_weight.shape[1]
+            source_std = jnp.maximum(jnp.std(source_weight), jnp.asarray(1e-6, dtype=source_weight.dtype))
+            noise = (
+                jax.random.normal(extra_input_key, (target_weight.shape[0], extra_width))
+                * jnp.asarray(extra_input_scale, dtype=target_weight.dtype)
+                * source_std.astype(target_weight.dtype)
+            )
+            new_weight = new_weight.at[:, source_weight.shape[1] :].set(noise)
+    else:
+        raise ValueError(
+            "Cannot copy linear layer with incompatible shapes: "
+            f"source={source_weight.shape}, target={target_weight.shape}"
+        )
+    source_bias = jnp.asarray(source.bias)
+    target_bias = jnp.asarray(target.bias)
+    if source_bias.shape != target_bias.shape:
+        raise ValueError(
+            "Cannot copy linear bias with incompatible shapes: "
+            f"source={source_bias.shape}, target={target_bias.shape}"
+        )
+    layer = eqx.tree_at(lambda item: item.weight, target, new_weight)
+    return eqx.tree_at(lambda item: item.bias, layer, source_bias.astype(target_bias.dtype))
+
+
+def _copy_mlp(
+    source,
+    target,
+    *,
+    allow_extra_input_columns: bool = False,
+    extra_input_key: jax.Array | None = None,
+    extra_input_scale: float = 0.0,
+):
+    if len(source.layers) != len(target.layers):
+        raise ValueError(
+            "Cannot copy MLP with different depths: "
+            f"source={len(source.layers)}, target={len(target.layers)}"
+        )
+    layers = tuple(
+        _linear_with_copied_weights(
+            source_layer,
+            target_layer,
+            allow_extra_input_columns=allow_extra_input_columns and index == 0,
+            extra_input_key=extra_input_key if index == 0 else None,
+            extra_input_scale=extra_input_scale,
+        )
+        for index, (source_layer, target_layer) in enumerate(zip(source.layers, target.layers))
+    )
+    return eqx.tree_at(lambda item: item.layers, target, layers)
+
+
+def _constant_output_mlp(target, output: jnp.ndarray):
+    output = jnp.asarray(output)
+    layers = []
+    for index, layer in enumerate(target.layers):
+        weight = jnp.zeros_like(layer.weight)
+        if index == len(target.layers) - 1:
+            if output.shape != layer.bias.shape:
+                raise ValueError(
+                    "Cannot set constant MLP output with incompatible shapes: "
+                    f"output={output.shape}, bias={layer.bias.shape}"
+                )
+            bias = output.astype(layer.bias.dtype)
+        else:
+            bias = jnp.zeros_like(layer.bias)
+        layer = eqx.tree_at(lambda item: item.weight, layer, weight)
+        layer = eqx.tree_at(lambda item: item.bias, layer, bias)
+        layers.append(layer)
+    return eqx.tree_at(lambda item: item.layers, target, tuple(layers))
+
+
+def _shift_final_bias(target, shift: float):
+    final_index = len(target.layers) - 1
+    final_layer = target.layers[final_index]
+    shifted_layer = eqx.tree_at(
+        lambda item: item.bias,
+        final_layer,
+        final_layer.bias + jnp.asarray(shift, dtype=final_layer.bias.dtype),
+    )
+    layers = list(target.layers)
+    layers[final_index] = shifted_layer
+    return eqx.tree_at(lambda item: item.layers, target, tuple(layers))
+
+
+def _raw_for_hp_active_log_sigma(log_sigma: float) -> jnp.ndarray:
+    """Invert log_sigma = 0.05 + 0.70 * sigmoid(raw)."""
+    normalized = (log_sigma - 0.05) / 0.70
+    if not 0.0 < normalized < 1.0:
+        raise ValueError("--init-hp-active-log-sigma must be in (0.05, 0.75)")
+    raw = np.log(normalized / (1.0 - normalized))
+    return jnp.asarray([raw], dtype=jnp.float32)
+
+
+def initialize_probabilistic_closed_loop_from_deterministic(
+    probabilistic_model: ProbabilisticClosedLoopHPEmulator,
+    deterministic_model: ClosedLoopHPEmulator,
+    *,
+    key: jax.Array,
+    xi_weight_scale: float,
+    hp_active_log_sigma: float,
+) -> ProbabilisticClosedLoopHPEmulator:
+    """Initialize probabilistic closed-loop model around a deterministic solution."""
+    compatibility_fields = (
+        "metadata_dim",
+        "input_dim",
+        "state_dim",
+        "encoded_input_dim",
+        "controller_state_dim",
+    )
+    for field in compatibility_fields:
+        if getattr(probabilistic_model, field) != getattr(deterministic_model, field):
+            raise ValueError(
+                "Deterministic artifact is incompatible with the probabilistic model: "
+                f"{field} differs ({getattr(deterministic_model, field)} != "
+                f"{getattr(probabilistic_model, field)})"
+            )
+    model = probabilistic_model
+    theta_key, x0_key, w0_key, e0_key = jax.random.split(key, 4)
+    model = eqx.tree_at(
+        lambda item: item.theta_net,
+        model,
+        _copy_mlp(
+            deterministic_model.theta_net,
+            model.theta_net,
+            allow_extra_input_columns=True,
+            extra_input_key=theta_key,
+            extra_input_scale=xi_weight_scale,
+        ),
+    )
+    model = eqx.tree_at(
+        lambda item: item.x0_net,
+        model,
+        _copy_mlp(
+            deterministic_model.x0_net,
+            model.x0_net,
+            allow_extra_input_columns=True,
+            extra_input_key=x0_key,
+            extra_input_scale=xi_weight_scale,
+        ),
+    )
+    model = eqx.tree_at(
+        lambda item: item.w0_net,
+        model,
+        _copy_mlp(
+            deterministic_model.w0_net,
+            model.w0_net,
+            allow_extra_input_columns=True,
+            extra_input_key=w0_key,
+            extra_input_scale=xi_weight_scale,
+        ),
+    )
+    model = eqx.tree_at(
+        lambda item: item.e0_net,
+        model,
+        _copy_mlp(
+            deterministic_model.e0_net,
+            model.e0_net,
+            allow_extra_input_columns=True,
+            extra_input_key=e0_key,
+            extra_input_scale=xi_weight_scale,
+        ),
+    )
+    model = eqx.tree_at(
+        lambda item: item.mode_net,
+        model,
+        _copy_mlp(deterministic_model.mode_net, model.mode_net),
+    )
+    pel_mu_net = _copy_mlp(deterministic_model.pel_net, model.pel_mu_net)
+    pel_scale = float(model.target_scale[model.pel_target_index])
+    pel_mean = float(model.target_mean[model.pel_target_index])
+    max_active = max(pel_mean + 8.0 * pel_scale, 2.0 * pel_scale)
+    if model.hp_pel_cap_w_m2 > 0.0:
+        max_active = model.hp_pel_cap_w_m2
+    reference_ratio = np.clip(np.log1p(1.0) * pel_scale / max_active, 1e-4, 0.95)
+    bias_shift = float(np.log(reference_ratio / (1.0 - reference_ratio)))
+    model = eqx.tree_at(
+        lambda item: item.pel_mu_net,
+        model,
+        _shift_final_bias(pel_mu_net, bias_shift),
+    )
+    model = eqx.tree_at(
+        lambda item: item.pel_sigma_net,
+        model,
+        _constant_output_mlp(
+            model.pel_sigma_net,
+            _raw_for_hp_active_log_sigma(hp_active_log_sigma),
+        ),
+    )
+    model = eqx.tree_at(
+        lambda item: item.qroom_net,
+        model,
+        _copy_mlp(deterministic_model.qroom_net, model.qroom_net),
+    )
+    model = eqx.tree_at(
+        lambda item: item.w_net,
+        model,
+        _copy_mlp(deterministic_model.w_net, model.w_net),
+    )
+    if deterministic_model.thermal_encoder is None:
+        if model.thermal_encoder is not None:
+            raise ValueError("Deterministic artifact has no thermal encoder, but probabilistic model does")
+    else:
+        if model.thermal_encoder is None:
+            raise ValueError("Deterministic artifact has a thermal encoder, but probabilistic model does not")
+        model = eqx.tree_at(
+            lambda item: item.thermal_encoder,
+            model,
+            _copy_mlp(deterministic_model.thermal_encoder, model.thermal_encoder),
+        )
+
+    cop_intercept = jnp.asarray(deterministic_model.cop_intercept)
+    cop_slope = jnp.asarray(deterministic_model.cop_slope)
+    raw_energy_loss_rate = jnp.asarray(deterministic_model.raw_energy_loss_rate)
+    hp_raw = jnp.stack(
+        [
+            (cop_intercept - 3.0) / 0.1,
+            (cop_slope - 0.02) / 0.005,
+            (raw_energy_loss_rate + 4.0) / 0.1,
+        ]
+    ).astype(jnp.float32)
+    model = eqx.tree_at(
+        lambda item: item.hp_param_net,
+        model,
+        _constant_output_mlp(model.hp_param_net, hp_raw),
+    )
+    return model
+
+
+def initialize_probabilistic_closed_loop_from_artifact(
+    probabilistic_model: ProbabilisticClosedLoopHPEmulator,
+    artifact_path: Path,
+    *,
+    key: jax.Array,
+    xi_weight_scale: float,
+    hp_active_log_sigma: float,
+) -> ProbabilisticClosedLoopHPEmulator:
+    artifact = load_training_artifact(artifact_path)
+    if artifact.metadata.get("model_kind") != "closed_loop_hp":
+        raise ValueError(
+            "--init-from-deterministic-artifact must point to a closed_loop_hp artifact; "
+            f"found {artifact.metadata.get('model_kind')!r}"
+        )
+    deterministic_model = artifact.model
+    if not isinstance(deterministic_model, ClosedLoopHPEmulator):
+        raise ValueError("Loaded artifact is not a ClosedLoopHPEmulator")
+    return initialize_probabilistic_closed_loop_from_deterministic(
+        probabilistic_model,
+        deterministic_model,
+        key=key,
+        xi_weight_scale=xi_weight_scale,
+        hp_active_log_sigma=hp_active_log_sigma,
+    )
+
+
+def observed_nonnegative_cap(
+    values: np.ndarray,
+    *,
+    requested_cap: float,
+    factor: float,
+    floor: float,
+) -> float:
+    """Resolve a positive physical cap from a requested value or observed training data."""
+    if requested_cap > 0.0:
+        return float(requested_cap)
+    finite_values = values[np.isfinite(values)]
+    finite_values = finite_values[finite_values > 0.0]
+    if finite_values.size == 0:
+        return float(floor)
+    return float(max(factor * float(np.max(finite_values)), floor))
+
+
+def resolve_closed_loop_caps(
+    train_windows: ClosedLoopWindowedArrays,
+    config: TrainConfig,
+) -> tuple[float, float, float, float]:
+    """Resolve physical closed-loop caps in W/m2, Wh/m2, and COP units."""
+    pel_cap_w_m2 = observed_nonnegative_cap(
+        train_windows.targets[..., 2],
+        requested_cap=config.hp_pel_cap_w_m2,
+        factor=config.hp_cap_factor,
+        floor=config.heat_on_threshold,
+    )
+    qroom_cap_w_m2 = observed_nonnegative_cap(
+        train_windows.targets[..., 1],
+        requested_cap=config.hp_qroom_cap_w_m2,
+        factor=config.hp_cap_factor,
+        floor=1.0,
+    )
+    cop_cap = float(config.hp_cop_cap)
+    if config.hp_energy_cap_wh_m2 > 0.0:
+        energy_cap_wh_m2 = float(config.hp_energy_cap_wh_m2)
+    else:
+        cop_for_energy = cop_cap if cop_cap > 0.0 else max(config.hp_cop_floor, 6.0)
+        energy_cap_wh_m2 = max(
+            config.hp_energy_cap_hours * qroom_cap_w_m2,
+            config.hp_dt_hours * cop_for_energy * pel_cap_w_m2,
+            1.0,
+        )
+    return pel_cap_w_m2, qroom_cap_w_m2, cop_cap, float(energy_cap_wh_m2)
+
+
+def run_closed_loop_training(
+    config: TrainConfig,
+) -> ClosedLoopHPEmulator | ContractingClosedLoopHPEmulator | ProbabilisticClosedLoopModel:
+    is_probabilistic = config.model_kind in (
+        "closed_loop_hp_probabilistic",
+        "closed_loop_hp_contracting_probabilistic",
+    )
+    is_contracting = config.model_kind in (
+        "closed_loop_hp_contracting",
+        "closed_loop_hp_contracting_probabilistic",
+    )
+    is_contracting_probabilistic = config.model_kind == "closed_loop_hp_contracting_probabilistic"
+    if config.target_mode != "absolute":
+        raise ValueError(f"--model-kind {config.model_kind} requires --target-mode absolute")
+    if config.target_alignment != "same_time":
+        raise ValueError(
+            f"--model-kind {config.model_kind} uses fixed u[t] -> (Tin[t+1], Qroom[t], Pel[t]) "
+            "alignment; leave --target-alignment same_time."
+        )
+    if config.heat_input_normalization != "per_floor_area":
+        raise ValueError(f"--model-kind {config.model_kind} requires --heat-input-normalization per_floor_area")
+    if config.hp_controller_state_dim < 1:
+        raise ValueError("hp_controller_state_dim must be positive")
+    if config.hp_dt_hours <= 0.0:
+        raise ValueError("hp_dt_hours must be positive")
+    if config.hp_mode_loss_weight < 0.0:
+        raise ValueError("hp_mode_loss_weight must be non-negative")
+    if config.hp_cop_floor <= 0.0:
+        raise ValueError("hp_cop_floor must be positive")
+    if config.hp_cop_cap < 0.0:
+        raise ValueError("hp_cop_cap must be non-negative; use 0 to disable the COP upper cap")
+    if config.hp_cop_cap > 0.0 and config.hp_cop_cap <= config.hp_cop_floor:
+        raise ValueError("hp_cop_cap must be larger than hp_cop_floor when enabled")
+    if config.hp_pel_cap_w_m2 < 0.0:
+        raise ValueError("hp_pel_cap_w_m2 must be non-negative; use 0 for an automatic cap")
+    if config.hp_qroom_cap_w_m2 < 0.0:
+        raise ValueError("hp_qroom_cap_w_m2 must be non-negative; use 0 for an automatic cap")
+    if config.hp_energy_cap_wh_m2 < 0.0:
+        raise ValueError("hp_energy_cap_wh_m2 must be non-negative; use 0 for an automatic cap")
+    if config.hp_energy_cap_hours <= 0.0:
+        raise ValueError("hp_energy_cap_hours must be positive")
+    if config.hp_cap_factor <= 0.0:
+        raise ValueError("hp_cap_factor must be positive")
+    if config.monotonicity_weight > 0.0:
+        raise ValueError(f"monotonicity regularization is not implemented for --model-kind {config.model_kind}")
+    if config.loss_normalization != "none":
+        raise ValueError(f"--model-kind {config.model_kind} already uses per-output target scaling; use --loss-normalization none")
+    if config.schur_mode not in ("dense", "near_identity", "pf"):
+        raise ValueError("schur_mode must be 'dense', 'near_identity', or 'pf'")
+    if config.pf_lambda_min < 0.0:
+        raise ValueError("pf_lambda_min must be non-negative")
+    if config.pf_lambda_min >= config.schur_gamma:
+        raise ValueError("pf_lambda_min must be smaller than schur_gamma")
+    if config.input_encoder_dim is not None and config.input_encoder_dim < 1:
+        raise ValueError("input_encoder_dim must be positive or None")
+    if config.input_encoder_hidden_dim is not None and config.input_encoder_hidden_dim < 1:
+        raise ValueError("input_encoder_hidden_dim must be positive or None")
+    if config.input_encoder_depth < 1:
+        raise ValueError("input_encoder_depth must be at least 1")
+    if is_contracting:
+        if not 0.0 < config.contracting_gamma < 1.0:
+            raise ValueError("contracting_gamma must be in (0, 1)")
+        if config.contracting_state_bound <= 0.0:
+            raise ValueError("contracting_state_bound must be positive")
+        if config.contracting_temperature_scale <= 0.0:
+            raise ValueError("contracting_temperature_scale must be positive")
+    if is_probabilistic:
+        if config.prob_particles < 1:
+            raise ValueError("prob_particles must be positive")
+        if config.prob_eval_particles < 1:
+            raise ValueError("prob_eval_particles must be positive")
+        if config.prob_plot_particles < 1:
+            raise ValueError("prob_plot_particles must be positive")
+        if config.prob_latent_dim < 1:
+            raise ValueError("prob_latent_dim must be positive")
+        if config.prob_process_noise not in ("none", "constant", "heteroscedastic"):
+            raise ValueError("prob_process_noise must be 'none', 'constant', or 'heteroscedastic'")
+        if config.prob_hp_scenario_mode not in ("expected", "bernoulli"):
+            raise ValueError("prob_hp_scenario_mode must be 'expected' or 'bernoulli'")
+        if config.hp_active_power_nll_weight < 0.0:
+            raise ValueError("hp_active_power_nll_weight must be non-negative")
+        if config.hp_inactive_leakage_weight < 0.0:
+            raise ValueError("hp_inactive_leakage_weight must be non-negative")
+        if config.prob_softopt_weight < 0.0:
+            raise ValueError("prob_softopt_weight must be non-negative")
+        if config.prob_softopt_temperature <= 0.0:
+            raise ValueError("prob_softopt_temperature must be positive")
+        if config.prob_variogram_weight < 0.0:
+            raise ValueError("prob_variogram_weight must be non-negative")
+        if config.prob_variogram_power <= 0.0:
+            raise ValueError("prob_variogram_power must be positive")
+        if config.prob_physics_weight < 0.0:
+            raise ValueError("prob_physics_weight must be non-negative")
+        if config.prob_horizon_weight_power < 0.0:
+            raise ValueError("prob_horizon_weight_power must be non-negative")
+        if any(lag < 1 for lag in config.prob_variogram_lags):
+            raise ValueError("prob_variogram_lags must be positive")
+        if config.closed_loop_stability_weight < 0.0:
+            raise ValueError("closed_loop_stability_weight must be non-negative")
+        if not (0.0 < config.closed_loop_stability_gamma < 1.0):
+            raise ValueError("closed_loop_stability_gamma must be in (0, 1)")
+        if config.closed_loop_stability_samples < 0:
+            raise ValueError("closed_loop_stability_samples must be non-negative")
+        if config.closed_loop_stability_aggregation not in ("mean", "max"):
+            raise ValueError("closed_loop_stability_aggregation must be 'mean' or 'max'")
+        if config.init_xi_weight_scale < 0.0:
+            raise ValueError("init_xi_weight_scale must be non-negative")
+        if not (0.05 < config.init_hp_active_log_sigma < 0.75):
+            raise ValueError("init_hp_active_log_sigma must be in (0.05, 0.75)")
+        if is_contracting_probabilistic and config.init_from_deterministic_artifact is not None:
+            raise ValueError(
+                "--init-from-deterministic-artifact is only implemented for "
+                "--model-kind closed_loop_hp_probabilistic"
+            )
+    elif config.init_from_deterministic_artifact is not None:
+        raise ValueError("--init-from-deterministic-artifact requires --model-kind closed_loop_hp_probabilistic")
+    if config.checkpoint_metric not in ("auto", "train_rmse_c", "test_rmse_c"):
+        raise ValueError("checkpoint_metric must be 'auto', 'train_rmse_c', or 'test_rmse_c'")
+    if config.early_stopping_patience is not None and config.early_stopping_patience < 1:
+        raise ValueError("early_stopping_patience must be positive or None")
+    if config.early_stopping_min_delta < 0.0:
+        raise ValueError("early_stopping_min_delta must be non-negative")
+    if config.save_model_every_epochs < 0:
+        raise ValueError("save_model_every_epochs must be non-negative")
+    if config.num_window_plots < 0:
+        raise ValueError("num_window_plots must be non-negative")
+    if config.num_full_profile_plots < 0:
+        raise ValueError("num_full_profile_plots must be non-negative")
+
+    split_config = SplitConfig(
+        dataset_path=config.dataset_path,
+        max_profiles=config.max_profiles,
+        test_fraction=config.test_fraction,
+        seed=config.seed,
+        heat_input_normalization="per_floor_area",
+        input_feature_mode="base",
+    )
+    splits = load_closed_loop_result_splits(split_config)
+    window_config = WindowConfig(
+        sequence_length=config.sequence_length,
+        stride=config.stride,
+        target_alignment="same_time",
+    )
+    train_profiles = to_closed_loop_profiles(splits.train)
+    test_profiles = to_closed_loop_profiles(splits.test) if splits.test_ids else []
+    train_windows = make_closed_loop_windows(train_profiles, window_config)
+    test_windows = make_closed_loop_windows(test_profiles, window_config) if splits.test_ids else None
+    hp_pel_cap_w_m2, hp_qroom_cap_w_m2, hp_cop_cap, hp_energy_cap_wh_m2 = resolve_closed_loop_caps(
+        train_windows,
+        config,
+    )
+    artifact_config = replace(
+        config,
+        hp_pel_cap_w_m2=hp_pel_cap_w_m2,
+        hp_qroom_cap_w_m2=hp_qroom_cap_w_m2,
+        hp_cop_cap=hp_cop_cap,
+        hp_energy_cap_wh_m2=hp_energy_cap_wh_m2,
+    )
+    resolved_checkpoint_metric = resolve_checkpoint_metric(
+        config.checkpoint_metric,
+        has_test_windows=test_windows is not None,
+    )
+
+    scalers = fit_window_scalers(train_windows)  # type: ignore[arg-type]
+    input_mean = tuple(float(value) for value in np.asarray(scalers.inputs.mean, dtype=np.float32).reshape(-1))
+    input_scale = tuple(float(value) for value in np.asarray(scalers.inputs.scale, dtype=np.float32).reshape(-1))
+    target_mean_np = np.asarray(scalers.target.mean, dtype=np.float32).reshape(-1)
+    target_scale_np = np.asarray(scalers.target.scale, dtype=np.float32).reshape(-1)
+    target_mean = jnp.asarray(target_mean_np, dtype=jnp.float32)
+    target_scale = jnp.asarray(target_scale_np, dtype=jnp.float32)
+    train_windows = transform_closed_loop_windows(train_windows, scalers)
+    if test_windows is not None:
+        test_windows = transform_closed_loop_windows(test_windows, scalers)
+
+    key = jax.random.PRNGKey(config.seed)
+    model: ClosedLoopHPEmulator | ContractingClosedLoopHPEmulator | ProbabilisticClosedLoopModel
+    if is_contracting_probabilistic:
+        model = ProbabilisticContractingClosedLoopHPEmulator(
+            metadata_dim=train_windows.metadata.shape[-1],
+            input_dim=train_windows.inputs.shape[-1],
+            state_dim=config.state_dim,
+            controller_state_dim=config.hp_controller_state_dim,
+            latent_dim=config.prob_latent_dim,
+            hidden_dim=config.hidden_dim,
+            depth=config.depth,
+            input_encoder_dim=config.input_encoder_dim,
+            input_encoder_hidden_dim=config.input_encoder_hidden_dim,
+            input_encoder_depth=config.input_encoder_depth,
+            process_noise_mode=config.prob_process_noise,
+            process_noise_init=config.prob_process_noise_init,
+            contraction_gamma=config.contracting_gamma,
+            state_bound=config.contracting_state_bound,
+            temperature_output_scale=config.contracting_temperature_scale,
+            hp_dt_hours=config.hp_dt_hours,
+            hp_cop_floor=config.hp_cop_floor,
+            hp_cop_cap=hp_cop_cap,
+            hp_pel_cap_w_m2=hp_pel_cap_w_m2,
+            hp_qroom_cap_w_m2=hp_qroom_cap_w_m2,
+            hp_energy_cap_wh_m2=hp_energy_cap_wh_m2,
+            input_mean=input_mean,
+            input_scale=input_scale,
+            target_mean=tuple(float(value) for value in target_mean_np),
+            target_scale=tuple(float(value) for value in target_scale_np),
+            key=key,
+        )
+    elif is_probabilistic:
+        model = ProbabilisticClosedLoopHPEmulator(
+            metadata_dim=train_windows.metadata.shape[-1],
+            input_dim=train_windows.inputs.shape[-1],
+            state_dim=config.state_dim,
+            controller_state_dim=config.hp_controller_state_dim,
+            latent_dim=config.prob_latent_dim,
+            hidden_dim=config.hidden_dim,
+            depth=config.depth,
+            input_encoder_dim=config.input_encoder_dim,
+            input_encoder_hidden_dim=config.input_encoder_hidden_dim,
+            input_encoder_depth=config.input_encoder_depth,
+            process_noise_mode=config.prob_process_noise,
+            process_noise_init=config.prob_process_noise_init,
+            hp_dt_hours=config.hp_dt_hours,
+            hp_cop_floor=config.hp_cop_floor,
+            hp_cop_cap=hp_cop_cap,
+            hp_pel_cap_w_m2=hp_pel_cap_w_m2,
+            hp_qroom_cap_w_m2=hp_qroom_cap_w_m2,
+            hp_energy_cap_wh_m2=hp_energy_cap_wh_m2,
+            schur_gamma=config.schur_gamma,
+            pf_lambda_min=config.pf_lambda_min,
+            schur_mode=config.schur_mode,  # type: ignore[arg-type]
+            input_mean=input_mean,
+            input_scale=input_scale,
+            target_mean=tuple(float(value) for value in target_mean_np),
+            target_scale=tuple(float(value) for value in target_scale_np),
+            key=key,
+        )
+        if config.init_from_deterministic_artifact is not None:
+            key, init_key = jax.random.split(key)
+            model = initialize_probabilistic_closed_loop_from_artifact(
+                model,
+                config.init_from_deterministic_artifact,
+                key=init_key,
+                xi_weight_scale=config.init_xi_weight_scale,
+                hp_active_log_sigma=config.init_hp_active_log_sigma,
+            )
+    elif is_contracting:
+        model = ContractingClosedLoopHPEmulator(
+            metadata_dim=train_windows.metadata.shape[-1],
+            input_dim=train_windows.inputs.shape[-1],
+            state_dim=config.state_dim,
+            hidden_dim=config.hidden_dim,
+            depth=config.depth,
+            input_encoder_dim=config.input_encoder_dim,
+            input_encoder_hidden_dim=config.input_encoder_hidden_dim,
+            input_encoder_depth=config.input_encoder_depth,
+            contraction_gamma=config.contracting_gamma,
+            state_bound=config.contracting_state_bound,
+            temperature_output_scale=config.contracting_temperature_scale,
+            hp_dt_hours=config.hp_dt_hours,
+            hp_cop_floor=config.hp_cop_floor,
+            hp_cop_cap=hp_cop_cap,
+            hp_pel_cap_w_m2=hp_pel_cap_w_m2,
+            hp_qroom_cap_w_m2=hp_qroom_cap_w_m2,
+            hp_energy_cap_wh_m2=hp_energy_cap_wh_m2,
+            input_mean=input_mean,
+            input_scale=input_scale,
+            target_mean=tuple(float(value) for value in target_mean_np),
+            target_scale=tuple(float(value) for value in target_scale_np),
+            key=key,
+        )
+    else:
+        model = ClosedLoopHPEmulator(
+            metadata_dim=train_windows.metadata.shape[-1],
+            input_dim=train_windows.inputs.shape[-1],
+            state_dim=config.state_dim,
+            controller_state_dim=config.hp_controller_state_dim,
+            hidden_dim=config.hidden_dim,
+            depth=config.depth,
+            input_encoder_dim=config.input_encoder_dim,
+            input_encoder_hidden_dim=config.input_encoder_hidden_dim,
+            input_encoder_depth=config.input_encoder_depth,
+            hp_dt_hours=config.hp_dt_hours,
+            hp_cop_floor=config.hp_cop_floor,
+            hp_cop_cap=hp_cop_cap,
+            hp_pel_cap_w_m2=hp_pel_cap_w_m2,
+            hp_qroom_cap_w_m2=hp_qroom_cap_w_m2,
+            hp_energy_cap_wh_m2=hp_energy_cap_wh_m2,
+            schur_gamma=config.schur_gamma,
+            pf_lambda_min=config.pf_lambda_min,
+            schur_mode=config.schur_mode,  # type: ignore[arg-type]
+            input_mean=input_mean,
+            input_scale=input_scale,
+            target_mean=tuple(float(value) for value in target_mean_np),
+            target_scale=tuple(float(value) for value in target_scale_np),
+            key=key,
+        )
+    optimizer = optax.adam(config.learning_rate)
+    opt_state = optimizer.init(eqx.filter(model, eqx.is_array))
+    rng = np.random.default_rng(config.seed)
+    model_checkpoint_dir = config.model_checkpoint_dir or config.output_dir / "model_checkpoints"
+    model_artifact_dir = model_checkpoint_dir / config.model_kind
+
+    print(f"model_kind={config.model_kind}")
+    if config.init_from_deterministic_artifact is not None:
+        print(
+            "probabilistic_initialization=deterministic "
+            f"artifact={config.init_from_deterministic_artifact} "
+            f"xi_weight_scale={config.init_xi_weight_scale} "
+            f"hp_active_log_sigma={config.init_hp_active_log_sigma}"
+        )
+    print("temperature_alignment=u[t] -> Tin[t+1]")
+    print("power_alignment=u[t] -> Qroom[t], Pel_SH[t]")
+    print(f"target_columns={list(CLOSED_LOOP_TARGET_COLUMNS)}")
+    print(f"input_columns={list(splits.input_columns)}")
+    print(
+        "closed_loop_hp_profile_filter=hp_ref_capacity_W>0,hp_size_binding=SH "
+        f"kept_candidates={len(splits.candidate_ids)} "
+        f"dropped_non_hp={len(splits.dropped_non_hp_ids)} "
+        f"dropped_non_sh_hp={len(splits.dropped_non_sh_hp_ids)} "
+        f"dropped_total={len(splits.dropped_ids)} "
+        f"selected={len(splits.selected_ids)}"
+    )
+    print(f"train_profiles={len(splits.train_ids)} test_profiles={len(splits.test_ids)}")
+    print(f"train_windows={train_windows.targets.shape[0]}")
+    if test_windows is not None:
+        print(f"test_windows={test_windows.targets.shape[0]}")
+    if is_contracting:
+        print(
+            "closed_loop_hp_contracting=enabled "
+            f"gamma={config.contracting_gamma} "
+            f"state_bound={config.contracting_state_bound} "
+            f"temperature_output_scale={config.contracting_temperature_scale} "
+            "latent_state_guarantee=||dF/ds||_2<=gamma"
+        )
+    else:
+        print(
+            "closed_loop_hp "
+            f"controller_state_dim={config.hp_controller_state_dim} "
+            f"dt_hours={config.hp_dt_hours} "
+            f"mode_loss_weight={config.hp_mode_loss_weight} "
+            f"cop_floor={config.hp_cop_floor}"
+        )
+    if is_contracting:
+        print(
+            "closed_loop_hp_contracting_caps "
+            f"pel_cap_w_m2={hp_pel_cap_w_m2:.6g} "
+            f"qroom_cap_w_m2={hp_qroom_cap_w_m2:.6g} "
+            f"cop_cap={hp_cop_cap:.6g} "
+            f"energy_cap_wh_m2={hp_energy_cap_wh_m2:.6g} "
+            f"auto_cap_factor={config.hp_cap_factor:.6g}"
+        )
+    else:
+        print(
+            "closed_loop_hp_caps "
+            f"pel_cap_w_m2={hp_pel_cap_w_m2:.6g} "
+            f"qroom_cap_w_m2={hp_qroom_cap_w_m2:.6g} "
+            f"cop_cap={hp_cop_cap:.6g} "
+            f"energy_cap_wh_m2={hp_energy_cap_wh_m2:.6g} "
+            f"auto_cap_factor={config.hp_cap_factor:.6g}"
+        )
+    if is_probabilistic:
+        print(
+            f"{config.model_kind}=enabled "
+            f"particles={config.prob_particles} "
+            f"eval_particles={config.prob_eval_particles} "
+            f"plot_particles={config.prob_plot_particles} "
+            f"latent_dim={config.prob_latent_dim} "
+            f"process_noise={config.prob_process_noise} "
+            f"hp_scenario_mode={config.prob_hp_scenario_mode}"
+        )
+        print(
+            "probabilistic_closed_loop_loss "
+            "energy_score_weight=1.0 "
+            f"variogram_weight={config.prob_variogram_weight} "
+            f"variogram_lags={list(config.prob_variogram_lags)} "
+            f"softopt_weight={config.prob_softopt_weight} "
+            f"softopt_temperature={config.prob_softopt_temperature} "
+            f"physics_weight={config.prob_physics_weight} "
+            f"hp_active_power_nll_weight={config.hp_active_power_nll_weight} "
+            f"hp_inactive_leakage_weight={config.hp_inactive_leakage_weight}"
+        )
+        print(
+            "closed_loop_stability="
+            f"{'enabled' if config.closed_loop_stability_weight > 0.0 else 'disabled'} "
+            f"weight={config.closed_loop_stability_weight} "
+            f"gamma={config.closed_loop_stability_gamma} "
+            f"samples={config.closed_loop_stability_samples} "
+            f"aggregation={config.closed_loop_stability_aggregation} "
+            "state=[x,w,E,T]"
+        )
+    if config.input_encoder_feedback != "none":
+        print(
+            "warning=closed_loop_hp_ignores_input_encoder_feedback; "
+            "temperature, outdoor gap, and setpoint gap are always included internally"
+        )
+    print(
+        "thermal_input_encoder="
+        f"{'enabled' if config.input_encoder_dim is not None else 'disabled'} "
+        f"encoded_dim={config.input_encoder_dim or 7} "
+        f"hidden_dim={config.input_encoder_hidden_dim or config.hidden_dim} "
+        f"depth={config.input_encoder_depth}"
+    )
+    if is_contracting:
+        print(
+            "stable_parametrization=contractive_time_varying_matrix "
+            f"contraction_gamma={config.contracting_gamma}"
+        )
+    else:
+        print(
+            f"schur_mode={config.schur_mode} "
+            f"schur_gamma={config.schur_gamma} "
+            f"pf_lambda_min={config.pf_lambda_min}"
+        )
+    print(f"checkpoint_metric={resolved_checkpoint_metric}")
+    if config.early_stopping_patience is not None:
+        print(
+            "early_stopping=enabled "
+            f"patience={config.early_stopping_patience} "
+            f"min_delta={config.early_stopping_min_delta}"
+        )
+    if config.save_model or config.save_model_every_epochs > 0:
+        print(f"model_checkpoint_dir={model_checkpoint_dir}")
+        print(f"model_artifact_dir={model_artifact_dir}")
+    if config.save_model:
+        print("save_selected_model=enabled")
+    if config.save_model_every_epochs > 0:
+        print(f"save_model_every_epochs={config.save_model_every_epochs}")
+
+    best_model = model
+    best_epoch = 0
+    best_metric = float("inf")
+    best_train_eval: dict[str, float] | None = None
+    best_test_eval: dict[str, float] | None = None
+    epochs_without_improvement = 0
+
+    for epoch in range(1, config.epochs + 1):
+        losses = []
+        prob_loss_components = []
+        for batch_idx, (metadata, inputs, initial_temperature, targets) in enumerate(
+            minibatches(train_windows, batch_size=config.batch_size, rng=rng, shuffle=True),
+            start=1,
+        ):
+            if is_probabilistic:
+                assert isinstance(
+                    model,
+                    (ProbabilisticClosedLoopHPEmulator, ProbabilisticContractingClosedLoopHPEmulator),
+                )
+                key, step_key = jax.random.split(key)
+                model, opt_state, loss, components = probabilistic_closed_loop_train_step(
+                    model,
+                    opt_state,
+                    optimizer,
+                    jnp.asarray(metadata),
+                    jnp.asarray(inputs),
+                    jnp.asarray(initial_temperature),
+                    jnp.asarray(targets),
+                    step_key,
+                    config.prob_particles,
+                    target_mean,
+                    target_scale,
+                    config.hp_mode_loss_weight,
+                    config.heat_on_threshold,
+                    config.hp_active_power_nll_weight,
+                    config.hp_inactive_leakage_weight,
+                    config.prob_softopt_weight,
+                    config.prob_softopt_temperature,
+                    config.prob_variogram_weight,
+                    config.prob_variogram_lags,
+                    config.prob_variogram_power,
+                    config.prob_physics_weight,
+                    config.prob_horizon_weight_power,
+                    config.closed_loop_stability_weight,
+                    config.closed_loop_stability_gamma,
+                    config.closed_loop_stability_samples,
+                    config.closed_loop_stability_aggregation,
+                )
+                prob_loss_components.append(np.asarray(components))
+            else:
+                model, opt_state, loss = closed_loop_train_step(
+                    model,
+                    opt_state,
+                    optimizer,
+                    jnp.asarray(metadata),
+                    jnp.asarray(inputs),
+                    jnp.asarray(initial_temperature),
+                    jnp.asarray(targets),
+                    target_mean,
+                    target_scale,
+                    config.hp_mode_loss_weight,
+                    config.heat_on_threshold,
+                )
+            losses.append(float(loss))
+            if config.max_train_batches is not None and batch_idx >= config.max_train_batches:
+                break
+
+        if is_probabilistic:
+            assert isinstance(
+                model,
+                (ProbabilisticClosedLoopHPEmulator, ProbabilisticContractingClosedLoopHPEmulator),
+            )
+            train_eval = evaluate_probabilistic_closed_loop(
+                model,
+                train_windows,
+                scalers,
+                batch_size=config.batch_size,
+                num_particles=config.prob_eval_particles,
+            )
+        else:
+            train_eval = evaluate_closed_loop(
+                model,
+                train_windows,
+                scalers,
+                batch_size=config.batch_size,
+            )
+        message = (
+            f"epoch={epoch:03d} train_loss={np.mean(losses):.6f} "
+            f"train_rmse_c={train_eval['rmse_c']:.4f} "
+            f"train_qroom_rmse_w_m2={train_eval['qroom_rmse_w_m2']:.4f} "
+            f"train_pel_rmse_w_m2={train_eval['pel_rmse_w_m2']:.4f} "
+            f"rho_max={sample_spectral_radius(model, train_windows)}"
+        )
+        if is_probabilistic and prob_loss_components:
+            component_means = np.mean(np.stack(prob_loss_components), axis=0)
+            message += " " + " ".join(
+                f"train_loss_{name}={value:.6f}"
+                for name, value in zip(PROB_CLOSED_LOOP_LOSS_COMPONENT_NAMES, component_means)
+            )
+            message += (
+                f" train_median_rmse_c={train_eval['median_rmse_c']:.4f}"
+                f" train_mean_median_rmse_c={train_eval['mean_median_rmse_c']:.4f}"
+                f" train_max_abs_error_c={train_eval['max_abs_error_c']:.4f}"
+                f" train_worst_profile={metric_int(train_eval, 'max_abs_error_profile_id')}"
+                f" train_worst_start={metric_int(train_eval, 'max_abs_error_start')}"
+                f" train_worst_step={metric_int(train_eval, 'max_abs_error_step')}"
+                f" train_worst_pred_c={train_eval['max_abs_error_pred_c']:.4f}"
+                f" train_worst_target_c={train_eval['max_abs_error_target_c']:.4f}"
+                f" train_pred_range_c=[{train_eval['min_pred_c']:.4f},{train_eval['max_pred_c']:.4f}]"
+                f" train_particle_max_abs_error_c={train_eval['particle_max_abs_error_c']:.4f}"
+                f" train_particle_worst_profile={metric_int(train_eval, 'particle_worst_profile_id')}"
+                f" train_particle_worst_start={metric_int(train_eval, 'particle_worst_start')}"
+                f" train_particle_worst_k={metric_int(train_eval, 'particle_worst_index')}"
+                f" train_particle_worst_step={metric_int(train_eval, 'particle_worst_step')}"
+                f" train_particle_worst_pred_c={train_eval['particle_worst_pred_c']:.4f}"
+                f" train_particle_worst_target_c={train_eval['particle_worst_target_c']:.4f}"
+                f" train_particle_pred_range_c=[{train_eval['particle_min_pred_c']:.4f},"
+                f"{train_eval['particle_max_pred_c']:.4f}]"
+            )
+        test_eval: dict[str, float] | None = None
+        if test_windows is not None:
+            if is_probabilistic:
+                assert isinstance(
+                    model,
+                    (ProbabilisticClosedLoopHPEmulator, ProbabilisticContractingClosedLoopHPEmulator),
+                )
+                test_eval = evaluate_probabilistic_closed_loop(
+                    model,
+                    test_windows,
+                    scalers,
+                    batch_size=config.batch_size,
+                    num_particles=config.prob_eval_particles,
+                )
+            else:
+                test_eval = evaluate_closed_loop(
+                    model,
+                    test_windows,
+                    scalers,
+                    batch_size=config.batch_size,
+                )
+            message += (
+                f" test_rmse_c={test_eval['rmse_c']:.4f}"
+                f" test_qroom_rmse_w_m2={test_eval['qroom_rmse_w_m2']:.4f}"
+                f" test_pel_rmse_w_m2={test_eval['pel_rmse_w_m2']:.4f}"
+            )
+            if is_probabilistic:
+                message += (
+                    f" test_median_rmse_c={test_eval['median_rmse_c']:.4f}"
+                    f" test_mean_median_rmse_c={test_eval['mean_median_rmse_c']:.4f}"
+                    f" test_max_abs_error_c={test_eval['max_abs_error_c']:.4f}"
+                    f" test_worst_profile={metric_int(test_eval, 'max_abs_error_profile_id')}"
+                    f" test_worst_start={metric_int(test_eval, 'max_abs_error_start')}"
+                    f" test_worst_step={metric_int(test_eval, 'max_abs_error_step')}"
+                    f" test_worst_pred_c={test_eval['max_abs_error_pred_c']:.4f}"
+                    f" test_worst_target_c={test_eval['max_abs_error_target_c']:.4f}"
+                    f" test_pred_range_c=[{test_eval['min_pred_c']:.4f},{test_eval['max_pred_c']:.4f}]"
+                    f" test_particle_max_abs_error_c={test_eval['particle_max_abs_error_c']:.4f}"
+                    f" test_particle_worst_profile={metric_int(test_eval, 'particle_worst_profile_id')}"
+                    f" test_particle_worst_start={metric_int(test_eval, 'particle_worst_start')}"
+                    f" test_particle_worst_k={metric_int(test_eval, 'particle_worst_index')}"
+                    f" test_particle_worst_step={metric_int(test_eval, 'particle_worst_step')}"
+                    f" test_particle_worst_pred_c={test_eval['particle_worst_pred_c']:.4f}"
+                    f" test_particle_worst_target_c={test_eval['particle_worst_target_c']:.4f}"
+                    f" test_particle_pred_range_c=[{test_eval['particle_min_pred_c']:.4f},"
+                    f"{test_eval['particle_max_pred_c']:.4f}]"
+                )
+        metric_value = checkpoint_metric_value(
+            resolved_checkpoint_metric,
+            train_eval,
+            test_eval if test_windows is not None else None,
+        )
+        if metric_value < best_metric - config.early_stopping_min_delta:
+            best_model = model
+            best_epoch = epoch
+            best_metric = metric_value
+            best_train_eval = train_eval
+            best_test_eval = test_eval if test_windows is not None else None
+            epochs_without_improvement = 0
+            message += f" checkpoint=best_{resolved_checkpoint_metric}"
+        else:
+            epochs_without_improvement += 1
+            message += f" checkpoint_wait={epochs_without_improvement}"
+        print(message)
+
+        if config.save_model_every_epochs > 0 and epoch % config.save_model_every_epochs == 0:
+            artifact_path = save_training_artifact(
+                model_artifact_dir / f"epoch_{epoch:03d}",
+                model=model,
+                scalers=scalers,
+                train_config=artifact_config,
+                splits=splits,
+                metadata_dim=train_windows.metadata.shape[-1],
+                input_dim=train_windows.inputs.shape[-1],
+                checkpoint_epoch=epoch,
+                checkpoint_metric=resolved_checkpoint_metric,
+                checkpoint_metric_value=metric_value,
+                train_metrics=train_eval,
+                test_metrics=test_eval,
+            )
+            print(f"saved_epoch_model={artifact_path}")
+
+        if (
+            config.early_stopping_patience is not None
+            and epochs_without_improvement >= config.early_stopping_patience
+        ):
+            print(
+                "early_stopped "
+                f"epoch={epoch} "
+                f"best_epoch={best_epoch} "
+                f"best_{resolved_checkpoint_metric}={best_metric:.4f}"
+            )
+            break
+
+    model = best_model
+    print(
+        "selected_checkpoint "
+        f"epoch={best_epoch} "
+        f"{resolved_checkpoint_metric}={best_metric:.4f}"
+    )
+    if best_train_eval is not None:
+        print(
+            "selected_train_metrics "
+            f"rmse_c={best_train_eval['rmse_c']:.4f} "
+            f"qroom_rmse_w_m2={best_train_eval['qroom_rmse_w_m2']:.4f} "
+            f"pel_rmse_w_m2={best_train_eval['pel_rmse_w_m2']:.4f}"
+        )
+    if best_test_eval is not None:
+        print(
+            "selected_test_metrics "
+            f"rmse_c={best_test_eval['rmse_c']:.4f} "
+            f"qroom_rmse_w_m2={best_test_eval['qroom_rmse_w_m2']:.4f} "
+            f"pel_rmse_w_m2={best_test_eval['pel_rmse_w_m2']:.4f}"
+        )
+    if config.save_model:
+        artifact_path = save_training_artifact(
+            model_artifact_dir / "selected",
+            model=model,
+            scalers=scalers,
+            train_config=artifact_config,
+            splits=splits,
+            metadata_dim=train_windows.metadata.shape[-1],
+            input_dim=train_windows.inputs.shape[-1],
+            checkpoint_epoch=best_epoch,
+            checkpoint_metric=resolved_checkpoint_metric,
+            checkpoint_metric_value=best_metric,
+            train_metrics=best_train_eval,
+            test_metrics=best_test_eval,
+        )
+        print(f"saved_selected_model={artifact_path}")
+
+    if test_windows is not None:
+        if is_probabilistic:
+            assert isinstance(
+                model,
+                (ProbabilisticClosedLoopHPEmulator, ProbabilisticContractingClosedLoopHPEmulator),
+            )
+            full_profile_eval = evaluate_probabilistic_closed_loop_full_profiles(
+                model,
+                test_profiles,
+                scalers,
+                num_particles=config.prob_eval_particles,
+            )
+        else:
+            full_profile_eval = evaluate_closed_loop_full_profiles(model, test_profiles, scalers)
+        print(
+            "full_profile_test "
+            f"profiles={int(full_profile_eval['profile_count'])} "
+            f"rmse_c={full_profile_eval['rmse_c']:.4f} "
+            f"mae_c={full_profile_eval['mae_c']:.4f} "
+            f"qroom_rmse_w_m2={full_profile_eval['qroom_rmse_w_m2']:.4f} "
+            f"pel_rmse_w_m2={full_profile_eval['pel_rmse_w_m2']:.4f}"
+        )
+        if is_probabilistic:
+            assert isinstance(
+                model,
+                (ProbabilisticClosedLoopHPEmulator, ProbabilisticContractingClosedLoopHPEmulator),
+            )
+            visualization_paths = save_probabilistic_closed_loop_prediction_visualizations(
+                model,
+                test_windows,
+                test_profiles,
+                scalers,
+                config.output_dir,
+                config.num_window_plots,
+                config.num_full_profile_plots,
+                num_particles=config.prob_plot_particles,
+                hp_scenario_mode=config.prob_hp_scenario_mode,
+                filename_suffix=(
+                    "_closed_loop_hp_contracting_prob"
+                    if is_contracting_probabilistic
+                    else "_closed_loop_hp_prob"
+                ),
+                title_label=(
+                    "probabilistic contractive closed-loop HP"
+                    if is_contracting_probabilistic
+                    else "probabilistic closed-loop HP"
+                ),
+            )
+        else:
+            suffix = "_closed_loop_hp_contracting" if is_contracting else "_closed_loop_hp"
+            title_label = "contracting closed-loop HP" if is_contracting else "closed-loop HP"
+            visualization_paths = save_closed_loop_prediction_visualizations(
+                model,
+                test_windows,
+                test_profiles,
+                scalers,
+                config.output_dir,
+                config.num_window_plots,
+                config.num_full_profile_plots,
+                filename_suffix=suffix,
+                title_label=title_label,
+            )
+        for name, path in visualization_paths.items():
+            print(f"saved_{name}_plot={path}")
+
+    return model
+
+
 def run_training(config: TrainConfig) -> EmulatorModel:
+    if config.model_kind in (
+        "closed_loop_hp",
+        "closed_loop_hp_contracting",
+        "closed_loop_hp_probabilistic",
+        "closed_loop_hp_contracting_probabilistic",
+    ):
+        return run_closed_loop_training(config)
     if config.model_kind not in ("deterministic", "probabilistic"):
-        raise ValueError("model_kind must be 'deterministic' or 'probabilistic'")
+        raise ValueError(
+            "model_kind must be 'deterministic', 'probabilistic', "
+            "'closed_loop_hp', 'closed_loop_hp_contracting', "
+            "'closed_loop_hp_probabilistic', or 'closed_loop_hp_contracting_probabilistic'"
+        )
     if config.monotonicity_weight < 0.0:
         raise ValueError("monotonicity_weight must be non-negative")
     if config.target_mode not in ("absolute", "delta", "residual"):
@@ -1381,6 +3671,7 @@ def run_training(config: TrainConfig) -> EmulatorModel:
     opt_state = optimizer.init(eqx.filter(model, eqx.is_array))
     rng = np.random.default_rng(config.seed)
     model_checkpoint_dir = config.model_checkpoint_dir or config.output_dir / "model_checkpoints"
+    model_artifact_dir = model_checkpoint_dir / config.model_kind
 
     print(f"heating_mode={splits.heating_mode}")
     print(f"heat_input_normalization={splits.heat_input_normalization}")
@@ -1479,6 +3770,7 @@ def run_training(config: TrainConfig) -> EmulatorModel:
         )
     if config.save_model or config.save_model_every_epochs > 0:
         print(f"model_checkpoint_dir={model_checkpoint_dir}")
+        print(f"model_artifact_dir={model_artifact_dir}")
     if config.save_model:
         print("save_selected_model=enabled")
     if config.save_model_every_epochs > 0:
@@ -1597,7 +3889,7 @@ def run_training(config: TrainConfig) -> EmulatorModel:
 
         if config.save_model_every_epochs > 0 and epoch % config.save_model_every_epochs == 0:
             artifact_path = save_training_artifact(
-                model_checkpoint_dir / f"epoch_{epoch:03d}",
+                model_artifact_dir / f"epoch_{epoch:03d}",
                 model=model,
                 scalers=scalers,
                 train_config=config,
@@ -1644,7 +3936,7 @@ def run_training(config: TrainConfig) -> EmulatorModel:
         )
     if config.save_model:
         artifact_path = save_training_artifact(
-            model_checkpoint_dir / "selected",
+            model_artifact_dir / "selected",
             model=model,
             scalers=scalers,
             train_config=config,
@@ -1706,9 +3998,20 @@ def parse_args() -> TrainConfig:
     parser.add_argument("--heating-mode", choices=(*HEATING_INPUT_COLUMNS.keys(), "A", "B"), default="A")
     parser.add_argument(
         "--model-kind",
-        choices=("deterministic", "probabilistic"),
+        choices=(
+            "deterministic",
+            "probabilistic",
+            "closed_loop_hp",
+            "closed_loop_hp_contracting",
+            "closed_loop_hp_probabilistic",
+            "closed_loop_hp_contracting_probabilistic",
+        ),
         default="deterministic",
-        help="Select the original deterministic SS model or the probabilistic stable SS model.",
+        help=(
+            "Select the original deterministic SS model, the probabilistic stable SS model, "
+            "the closed-loop HP plus thermal model, its contractive data-driven variant, "
+            "or either probabilistic closed-loop variant."
+        ),
     )
     parser.add_argument(
         "--heat-input-normalization",
@@ -2006,6 +4309,166 @@ def parse_args() -> TrainConfig:
         default=0.0,
         help="Power for increasing horizon weights in soft Best-of-K trajectory errors.",
     )
+    parser.add_argument(
+        "--closed-loop-stability-weight",
+        type=float,
+        default=0.0,
+        help=(
+            "Weight for sampled closed-loop contraction penalty in "
+            "--model-kind closed_loop_hp_probabilistic."
+        ),
+    )
+    parser.add_argument(
+        "--closed-loop-stability-gamma",
+        type=float,
+        default=0.995,
+        help="Target upper bound for sampled ||dF/ds||_2 with s=[x,w,E,T].",
+    )
+    parser.add_argument(
+        "--closed-loop-stability-samples",
+        type=int,
+        default=8,
+        help="Number of random batch/particle/time Jacobians sampled per training batch.",
+    )
+    parser.add_argument(
+        "--closed-loop-stability-aggregation",
+        choices=("mean", "max"),
+        default="max",
+        help="Aggregate sampled Jacobian violations with mean or max.",
+    )
+    parser.add_argument(
+        "--init-from-deterministic-artifact",
+        type=Path,
+        default=None,
+        help=(
+            "Warm-start --model-kind closed_loop_hp_probabilistic from a saved "
+            "closed_loop_hp artifact directory."
+        ),
+    )
+    parser.add_argument(
+        "--init-xi-weight-scale",
+        type=float,
+        default=0.05,
+        help=(
+            "Relative standard deviation for nonzero xi-column perturbations when "
+            "warm-starting closed_loop_hp_probabilistic from a deterministic artifact. "
+            "Use 0 to recover the old xi-blind warm start."
+        ),
+    )
+    parser.add_argument(
+        "--init-hp-active-log-sigma",
+        type=float,
+        default=0.25,
+        help=(
+            "Initial log-space sigma for active HP electric power when warm-starting "
+            "closed_loop_hp_probabilistic from a deterministic artifact. Must be in (0.05, 0.75)."
+        ),
+    )
+    parser.add_argument(
+        "--contracting-gamma",
+        type=float,
+        default=0.99,
+        help=(
+            "Global recurrent-state contraction bound for --model-kind closed_loop_hp_contracting. "
+            "The model guarantees ||dF/ds||_2 <= this value."
+        ),
+    )
+    parser.add_argument(
+        "--contracting-state-bound",
+        type=float,
+        default=5.0,
+        help="Bound on each normalized recurrent state coordinate in closed_loop_hp_contracting.",
+    )
+    parser.add_argument(
+        "--contracting-temperature-scale",
+        type=float,
+        default=8.0,
+        help=(
+            "Bound on the normalized temperature output magnitude for "
+            "--model-kind closed_loop_hp_contracting."
+        ),
+    )
+    parser.add_argument(
+        "--prob-hp-scenario-mode",
+        choices=("expected", "bernoulli"),
+        default="bernoulli",
+        help=(
+            "HP electric scenario mode for --model-kind closed_loop_hp_probabilistic plots. "
+            "'bernoulli' samples on/off and active power; 'expected' propagates expected power."
+        ),
+    )
+    parser.add_argument(
+        "--hp-controller-state-dim",
+        type=int,
+        default=2,
+        help="Latent controller/buffer state dimension for --model-kind closed_loop_hp.",
+    )
+    parser.add_argument(
+        "--hp-dt-hours",
+        type=float,
+        default=0.25,
+        help="Closed-loop HP energy balance timestep in hours.",
+    )
+    parser.add_argument(
+        "--hp-mode-loss-weight",
+        type=float,
+        default=0.1,
+        help="Binary cross-entropy weight for HP on/off in --model-kind closed_loop_hp.",
+    )
+    parser.add_argument(
+        "--hp-cop-floor",
+        type=float,
+        default=1.0,
+        help="Lower bound added to the learnable linear COP in --model-kind closed_loop_hp.",
+    )
+    parser.add_argument(
+        "--hp-cop-cap",
+        type=float,
+        default=8.0,
+        help="Upper bound for closed-loop HP COP; use 0 to disable.",
+    )
+    parser.add_argument(
+        "--hp-pel-cap-w-m2",
+        type=float,
+        default=0.0,
+        help="Upper bound for space-heating HP electric power in W/m2; use 0 for train-data auto cap.",
+    )
+    parser.add_argument(
+        "--hp-qroom-cap-w-m2",
+        type=float,
+        default=0.0,
+        help="Upper bound for delivered room heat in W/m2; use 0 for train-data auto cap.",
+    )
+    parser.add_argument(
+        "--hp-energy-cap-wh-m2",
+        type=float,
+        default=0.0,
+        help="Upper bound for latent stored heat in Wh/m2; use 0 for automatic cap.",
+    )
+    parser.add_argument(
+        "--hp-energy-cap-hours",
+        type=float,
+        default=24.0,
+        help="Automatic energy cap duration: Emax=max(this * Qcap, dt * COPcap * Pelcap).",
+    )
+    parser.add_argument(
+        "--hp-cap-factor",
+        type=float,
+        default=1.25,
+        help="Multiplier applied to observed train maxima when resolving automatic HP/Q caps.",
+    )
+    parser.add_argument(
+        "--hp-active-power-nll-weight",
+        type=float,
+        default=1.0,
+        help="Conditional log-power NLL weight for --model-kind closed_loop_hp_probabilistic.",
+    )
+    parser.add_argument(
+        "--hp-inactive-leakage-weight",
+        type=float,
+        default=0.1,
+        help="Penalty weight for nonzero expected HP power on inactive timesteps.",
+    )
     args = parser.parse_args()
     return TrainConfig(
         dataset_path=args.dataset,
@@ -2069,6 +4532,29 @@ def parse_args() -> TrainConfig:
         prob_variogram_power=args.prob_variogram_power,
         prob_physics_weight=args.prob_physics_weight,
         prob_horizon_weight_power=args.prob_horizon_weight_power,
+        prob_hp_scenario_mode=args.prob_hp_scenario_mode,
+        hp_controller_state_dim=args.hp_controller_state_dim,
+        hp_dt_hours=args.hp_dt_hours,
+        hp_mode_loss_weight=args.hp_mode_loss_weight,
+        hp_cop_floor=args.hp_cop_floor,
+        hp_cop_cap=args.hp_cop_cap,
+        hp_pel_cap_w_m2=args.hp_pel_cap_w_m2,
+        hp_qroom_cap_w_m2=args.hp_qroom_cap_w_m2,
+        hp_energy_cap_wh_m2=args.hp_energy_cap_wh_m2,
+        hp_energy_cap_hours=args.hp_energy_cap_hours,
+        hp_cap_factor=args.hp_cap_factor,
+        closed_loop_stability_weight=args.closed_loop_stability_weight,
+        closed_loop_stability_gamma=args.closed_loop_stability_gamma,
+        closed_loop_stability_samples=args.closed_loop_stability_samples,
+        closed_loop_stability_aggregation=args.closed_loop_stability_aggregation,
+        init_from_deterministic_artifact=args.init_from_deterministic_artifact,
+        init_xi_weight_scale=args.init_xi_weight_scale,
+        init_hp_active_log_sigma=args.init_hp_active_log_sigma,
+        contracting_gamma=args.contracting_gamma,
+        contracting_state_bound=args.contracting_state_bound,
+        contracting_temperature_scale=args.contracting_temperature_scale,
+        hp_active_power_nll_weight=args.hp_active_power_nll_weight,
+        hp_inactive_leakage_weight=args.hp_inactive_leakage_weight,
     )
 
 

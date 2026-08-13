@@ -11,11 +11,18 @@ InputFeatureMode = Literal["base", "heating_regime"]
 DATETIME_COLUMN = "datetime"
 PROFILE_ID_COLUMN = "egid"
 TARGET_COLUMN = "FL0_THZ0, Zone Air Temperature"
+SETPOINT_TIMESERIES_COLUMN = "FL0_THZ0, Zone Thermostat Heating Setpoint Temperature"
+HP_MODE_IS_DHW_COLUMN = "hp_mode_is_dhw"
+HP_SIZE_BINDING_COLUMN = "hp_size_binding"
+SPACE_HEATING_HP_SIZE_BINDING = "SH"
 
 HEATING_INPUT_COLUMNS: dict[str, str] = {
     "zone_thermal": "zone_thermal_heating_power",
     "heating_electric": "heat_pump_electric_power",
 }
+
+ZONE_THERMAL_HEATING_POWER_COLUMN = HEATING_INPUT_COLUMNS["zone_thermal"]
+HEAT_PUMP_ELECTRIC_POWER_COLUMN = HEATING_INPUT_COLUMNS["heating_electric"]
 
 OPTION_TO_HEATING_MODE: dict[str, HeatingMode] = {
     "A": "zone_thermal",
@@ -26,6 +33,25 @@ DISTURBANCE_COLUMNS = [
     "Environment, Site Outdoor Air Drybulb Temperature",
     "Environment, Site Global Horizontal Solar Radiation Rate per Area",
     "FL0_THZ0, Zone Ventilation Standard Density Volume Flow Rate",
+]
+
+CLOSED_LOOP_CALENDAR_COLUMNS = [
+    "hour_sin",
+    "hour_cos",
+    "day_of_year_sin",
+    "day_of_year_cos",
+]
+
+CLOSED_LOOP_INPUT_COLUMNS = [
+    SETPOINT_TIMESERIES_COLUMN,
+    *DISTURBANCE_COLUMNS,
+    *CLOSED_LOOP_CALENDAR_COLUMNS,
+]
+
+CLOSED_LOOP_TARGET_COLUMNS = [
+    "indoor_temperature_c",
+    "zone_thermal_heating_power_sh_w_m2",
+    "heat_pump_electric_power_sh_w_m2",
 ]
 
 METADATA_COLUMNS = [
@@ -97,5 +123,20 @@ def required_columns(heating_mode: str) -> list[str]:
         PROFILE_ID_COLUMN,
         TARGET_COLUMN,
         *source_input_columns(heating_mode),
+        *METADATA_COLUMNS,
+    ]
+
+
+def closed_loop_required_columns() -> list[str]:
+    """Return the parquet columns needed by the closed-loop HP emulator."""
+    return [
+        DATETIME_COLUMN,
+        PROFILE_ID_COLUMN,
+        TARGET_COLUMN,
+        SETPOINT_TIMESERIES_COLUMN,
+        *DISTURBANCE_COLUMNS,
+        ZONE_THERMAL_HEATING_POWER_COLUMN,
+        HEAT_PUMP_ELECTRIC_POWER_COLUMN,
+        HP_MODE_IS_DHW_COLUMN,
         *METADATA_COLUMNS,
     ]

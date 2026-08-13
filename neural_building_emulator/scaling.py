@@ -6,7 +6,7 @@ from dataclasses import dataclass
 
 import numpy as np
 
-from .data import WindowedArrays
+from .data import ClosedLoopWindowedArrays, WindowedArrays
 
 
 @dataclass(frozen=True)
@@ -51,6 +51,25 @@ def transform_windows(windows: WindowedArrays, scalers: WindowScalers) -> Window
         inputs=scalers.inputs.transform(windows.inputs),
         targets=scalers.target.transform(windows.targets),
         initial_temperature=scalers.target.transform(windows.initial_temperature),
+    )
+
+
+def transform_closed_loop_windows(
+    windows: ClosedLoopWindowedArrays,
+    scalers: WindowScalers,
+) -> ClosedLoopWindowedArrays:
+    target_mean = np.asarray(scalers.target.mean, dtype=np.float32).reshape(-1)
+    target_scale = np.asarray(scalers.target.scale, dtype=np.float32).reshape(-1)
+    initial_temperature = (
+        (windows.initial_temperature - target_mean[:1]) / target_scale[:1]
+    ).astype(np.float32)
+    return ClosedLoopWindowedArrays(
+        profile_ids=windows.profile_ids,
+        start_indices=windows.start_indices,
+        metadata=scalers.metadata.transform(windows.metadata),
+        inputs=scalers.inputs.transform(windows.inputs),
+        targets=scalers.target.transform(windows.targets),
+        initial_temperature=initial_temperature,
     )
 
 
