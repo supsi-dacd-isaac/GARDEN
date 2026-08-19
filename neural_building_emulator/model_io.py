@@ -384,6 +384,7 @@ def _build_model_skeleton(
             contraction_gamma=float(config.get("contracting_gamma", 0.99)),
             state_bound=float(config.get("contracting_state_bound", 5.0)),
             temperature_output_scale=float(config.get("contracting_temperature_scale", 8.0)),
+            temperature_delta_max_c=float(config.get("contracting_temperature_delta_max_c", 0.0)),
             hp_dt_hours=float(config.get("hp_dt_hours", 0.25)),
             hp_cop_floor=float(config.get("hp_cop_floor", 1.0)),
             hp_cop_cap=float(config.get("hp_cop_cap", 0.0)),
@@ -415,9 +416,11 @@ def _build_model_skeleton(
             input_encoder_depth=int(config["input_encoder_depth"]),
             process_noise_mode=config.get("prob_process_noise", "constant"),
             process_noise_init=float(config.get("prob_process_noise_init", -6.0)),
+            hp_emission_mode=config.get("prob_hp_emission_mode", "legacy_lognormal_mean"),
             contraction_gamma=float(config.get("contracting_gamma", 0.99)),
             state_bound=float(config.get("contracting_state_bound", 5.0)),
             temperature_output_scale=float(config.get("contracting_temperature_scale", 8.0)),
+            temperature_delta_max_c=float(config.get("contracting_temperature_delta_max_c", 0.0)),
             hp_dt_hours=float(config.get("hp_dt_hours", 0.25)),
             hp_cop_floor=float(config.get("hp_cop_floor", 1.0)),
             hp_cop_cap=float(config.get("hp_cop_cap", 0.0)),
@@ -449,6 +452,7 @@ def _build_model_skeleton(
             input_encoder_depth=int(config["input_encoder_depth"]),
             process_noise_mode=config.get("prob_process_noise", "constant"),
             process_noise_init=float(config.get("prob_process_noise_init", -6.0)),
+            hp_emission_mode=config.get("prob_hp_emission_mode", "legacy_lognormal_mean"),
             hp_dt_hours=float(config.get("hp_dt_hours", 0.25)),
             hp_cop_floor=float(config.get("hp_cop_floor", 1.0)),
             hp_cop_cap=float(config.get("hp_cop_cap", 0.0)),
@@ -468,10 +472,19 @@ def _build_model_skeleton(
     raise ValueError(f"Unknown model_kind in artifact: {model_kind!r}")
 
 
-def load_training_artifact(artifact_dir: Path) -> SavedModelArtifact:
+def load_training_artifact(
+    artifact_dir: Path,
+    *,
+    train_config_overrides: dict[str, Any] | None = None,
+) -> SavedModelArtifact:
     """Load a trained model artifact saved by ``save_training_artifact``."""
     artifact_dir = Path(artifact_dir)
     metadata = json.loads(_find_metadata_file(artifact_dir).read_text())
+    if train_config_overrides:
+        metadata = dict(metadata)
+        train_config = dict(metadata.get("train_config", {}))
+        train_config.update(train_config_overrides)
+        metadata["train_config"] = train_config
     scalers = _load_scalers(artifact_dir / metadata["scalers_file"])
     skeleton = _build_model_skeleton(metadata, scalers)
     model = eqx.tree_deserialise_leaves(artifact_dir / metadata["model_file"], skeleton)

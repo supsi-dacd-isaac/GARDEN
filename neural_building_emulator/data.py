@@ -396,6 +396,57 @@ def _validate_input_feature_mode(input_feature_mode: str) -> InputFeatureMode:
     return input_feature_mode  # type: ignore[return-value]
 
 
+def _next_non_leap_year(year: int) -> int:
+    candidate = year + 1
+    while pd.Timestamp(year=candidate, month=1, day=1).is_leap_year:
+        candidate += 1
+    return candidate
+
+
+def _has_missing_leap_day_gap(datetimes: pd.Series) -> bool:
+    if len(datetimes) < 2:
+        return False
+    previous = datetimes.iloc[:-1].reset_index(drop=True)
+    following = datetimes.iloc[1:].reset_index(drop=True)
+    gaps = following - previous
+    leap_gap = (
+        (previous.dt.month == 2)
+        & (previous.dt.day == 28)
+        & (following.dt.month == 3)
+        & (following.dt.day == 1)
+        & (gaps > pd.Timedelta(hours=1))
+    )
+    return bool(leap_gap.any())
+
+
+def _simulation_calendar_datetimes(datetime_values: np.ndarray) -> np.ndarray:
+    """Return timestamps on a calendar consistent with the simulated time base.
+
+    Some EnergyPlus output folders contain 365-day simulations labeled with
+    leap-year timestamps, e.g. 2020-02-28 23:45 followed by 2020-03-01 00:00.
+    Relabeling those profiles to the next non-leap year removes the artificial
+    plotting gap and keeps day-of-year features aligned with the 365-day
+    simulation index.
+    """
+    datetimes = pd.to_datetime(pd.Series(datetime_values))
+    if datetimes.empty or datetimes.isna().any():
+        return datetimes.to_numpy()
+
+    years = datetimes.dt.year.unique()
+    if len(years) != 1:
+        return datetimes.to_numpy()
+
+    year = int(years[0])
+    is_leap_year = bool(pd.Timestamp(year=year, month=1, day=1).is_leap_year)
+    has_feb29 = bool(((datetimes.dt.month == 2) & (datetimes.dt.day == 29)).any())
+    if not is_leap_year or has_feb29 or not _has_missing_leap_day_gap(datetimes):
+        return datetimes.to_numpy()
+
+    target_year = _next_non_leap_year(year)
+    remapped = datetimes.map(lambda value: value.replace(year=target_year))
+    return remapped.to_numpy()
+
+
 def _heating_regime_features(
     heat: np.ndarray,
     *,
@@ -415,7 +466,7 @@ def _heating_regime_features(
 
 
 def _calendar_features(datetime_values: np.ndarray) -> np.ndarray:
-    datetimes = pd.to_datetime(pd.Series(datetime_values))
+    datetimes = pd.to_datetime(pd.Series(_simulation_calendar_datetimes(datetime_values)))
     hour = (
         datetimes.dt.hour.to_numpy(dtype=np.float32)
         + datetimes.dt.minute.to_numpy(dtype=np.float32) / np.float32(60.0)
@@ -457,6 +508,7 @@ def to_closed_loop_profiles(df: pd.DataFrame) -> list[ClosedLoopProfile]:
         if len(group) < 2:
             continue
 
+        profile_datetime = _simulation_calendar_datetimes(group.loc[:, DATETIME_COLUMN].to_numpy())
         metadata = group.loc[:, METADATA_COLUMNS].iloc[0].to_numpy(dtype=np.float32)
         floor_area = float(group.loc[:, "floor_area"].iloc[0])
         if not np.isfinite(floor_area) or floor_area <= 0.0:
@@ -468,7 +520,7 @@ def to_closed_loop_profiles(df: pd.DataFrame) -> list[ClosedLoopProfile]:
         temperature = group.loc[:, TARGET_COLUMN].to_numpy(dtype=np.float32)
         setpoint = group.loc[:, SETPOINT_TIMESERIES_COLUMN].to_numpy(dtype=np.float32)
         disturbances = group.loc[:, DISTURBANCE_COLUMNS].to_numpy(dtype=np.float32)
-        calendar = _calendar_features(group.loc[:, DATETIME_COLUMN].to_numpy())
+        calendar = _calendar_features(profile_datetime)
 
         q_room = group.loc[:, ZONE_THERMAL_HEATING_POWER_COLUMN].to_numpy(dtype=np.float32)
         p_el = group.loc[:, HEAT_PUMP_ELECTRIC_POWER_COLUMN].to_numpy(dtype=np.float32)
@@ -493,7 +545,7 @@ def to_closed_loop_profiles(df: pd.DataFrame) -> list[ClosedLoopProfile]:
         profiles.append(
             ClosedLoopProfile(
                 profile_id=int(profile_id),
-                datetime=group.loc[1:, DATETIME_COLUMN].to_numpy(),
+                datetime=profile_datetime[1:],
                 metadata=metadata,
                 inputs=inputs[:-1],
                 targets=targets,
@@ -520,6 +572,7 @@ def to_profiles(
 
     for profile_id, group in df.groupby(PROFILE_ID_COLUMN, sort=True):
         group = group.sort_values(DATETIME_COLUMN)
+        profile_datetime = _simulation_calendar_datetimes(group.loc[:, DATETIME_COLUMN].to_numpy())
         metadata = group.loc[:, METADATA_COLUMNS].iloc[0].to_numpy(dtype=np.float32)
         inputs = group.loc[:, in_cols].to_numpy(dtype=np.float32)
         if normalization == "per_floor_area":
@@ -545,7 +598,7 @@ def to_profiles(
         profiles.append(
             BuildingProfile(
                 profile_id=int(profile_id),
-                datetime=group.loc[:, DATETIME_COLUMN].to_numpy(),
+                datetime=profile_datetime,
                 metadata=metadata,
                 inputs=inputs,
                 target=target,

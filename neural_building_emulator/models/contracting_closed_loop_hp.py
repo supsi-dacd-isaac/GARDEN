@@ -34,6 +34,7 @@ class ContractingClosedLoopHPEmulator(eqx.Module):
     x0_net: MLP
     e0_net: MLP
     output_net: MLP
+    temperature_net: MLP
     cop_intercept: jax.Array
     cop_slope: jax.Array
     raw_energy_loss_rate: jax.Array
@@ -41,11 +42,13 @@ class ContractingClosedLoopHPEmulator(eqx.Module):
     input_dim: int = eqx.field(static=True)
     state_dim: int = eqx.field(static=True)
     encoded_input_dim: int = eqx.field(static=True)
+    thermal_forcing_dim: int = eqx.field(static=True)
     hidden_dim: int = eqx.field(static=True)
     depth: int = eqx.field(static=True)
     contraction_gamma: float = eqx.field(static=True)
     state_bound: float = eqx.field(static=True)
     temperature_output_scale: float = eqx.field(static=True)
+    temperature_delta_max_c: float = eqx.field(static=True)
     hp_dt_hours: float = eqx.field(static=True)
     hp_cop_floor: float = eqx.field(static=True)
     hp_cop_cap: float = eqx.field(static=True)
@@ -79,6 +82,7 @@ class ContractingClosedLoopHPEmulator(eqx.Module):
         contraction_gamma: float = 0.99,
         state_bound: float = 5.0,
         temperature_output_scale: float = 8.0,
+        temperature_delta_max_c: float = 0.0,
         hp_dt_hours: float = 0.25,
         hp_cop_floor: float = 1.0,
         hp_cop_cap: float = 0.0,
@@ -105,6 +109,8 @@ class ContractingClosedLoopHPEmulator(eqx.Module):
             raise ValueError("state_bound must be positive")
         if temperature_output_scale <= 0.0:
             raise ValueError("temperature_output_scale must be positive")
+        if temperature_delta_max_c < 0.0:
+            raise ValueError("temperature_delta_max_c must be non-negative")
         if hp_dt_hours <= 0.0:
             raise ValueError("hp_dt_hours must be positive")
         if hp_cop_floor <= 0.0:
@@ -122,9 +128,10 @@ class ContractingClosedLoopHPEmulator(eqx.Module):
         if len(target_mean) != 3 or len(target_scale) != 3:
             raise ValueError("closed_loop_hp target scalers must have exactly 3 outputs")
 
-        encoder_key, transition_key, x0_key, e0_key, output_key = jax.random.split(key, 5)
+        encoder_key, transition_key, x0_key, e0_key, output_key, temperature_key = jax.random.split(key, 6)
         encoded_input_dim = input_dim if input_encoder_dim is None else input_encoder_dim
-        transition_input_dim = metadata_dim + encoded_input_dim
+        thermal_forcing_dim = input_dim + 2
+        transition_input_dim = metadata_dim + thermal_forcing_dim
         transition_output_dim = state_dim * state_dim + state_dim
 
         self.input_encoder = None
@@ -158,11 +165,18 @@ class ContractingClosedLoopHPEmulator(eqx.Module):
             key=e0_key,
         )
         self.output_net = MLP(
-            state_dim + encoded_input_dim,
-            4,
+            metadata_dim + encoded_input_dim + 3,
+            3,
             hidden_dim=hidden_dim,
             depth=depth,
             key=output_key,
+        )
+        self.temperature_net = MLP(
+            state_dim,
+            1,
+            hidden_dim=hidden_dim,
+            depth=depth,
+            key=temperature_key,
         )
         self.cop_intercept = jnp.asarray(3.0, dtype=jnp.float32)
         self.cop_slope = jnp.asarray(0.02, dtype=jnp.float32)
@@ -172,11 +186,13 @@ class ContractingClosedLoopHPEmulator(eqx.Module):
         self.input_dim = input_dim
         self.state_dim = state_dim
         self.encoded_input_dim = encoded_input_dim
+        self.thermal_forcing_dim = thermal_forcing_dim
         self.hidden_dim = hidden_dim
         self.depth = depth
         self.contraction_gamma = contraction_gamma
         self.state_bound = state_bound
         self.temperature_output_scale = temperature_output_scale
+        self.temperature_delta_max_c = temperature_delta_max_c
         self.hp_dt_hours = hp_dt_hours
         self.hp_cop_floor = hp_cop_floor
         self.hp_cop_cap = hp_cop_cap
@@ -251,6 +267,103 @@ class ContractingClosedLoopHPEmulator(eqx.Module):
             value - jnp.asarray(self.target_mean[index], dtype=value.dtype)
         ) / jnp.asarray(self.target_scale[index], dtype=value.dtype)
 
+    def _temperature_output(
+        self,
+        raw_temperature: jnp.ndarray,
+        previous_temperature_scaled: jnp.ndarray,
+    ) -> jnp.ndarray:
+        bound = jnp.asarray(self.temperature_output_scale, dtype=raw_temperature.dtype)
+        if self.temperature_delta_max_c <= 0.0:
+            return bound * jnp.tanh(raw_temperature)
+        target_scale = jnp.maximum(
+            jnp.abs(jnp.asarray(self.target_scale[self.temperature_target_index], dtype=raw_temperature.dtype)),
+            jnp.asarray(1e-6, dtype=raw_temperature.dtype),
+        )
+        delta_bound = jnp.asarray(self.temperature_delta_max_c, dtype=raw_temperature.dtype) / target_scale
+        temperature_scaled = previous_temperature_scaled + delta_bound * jnp.tanh(raw_temperature)
+        return jnp.clip(temperature_scaled, -bound, bound)
+
+    def _temperature_physical(self, temperature_scaled: jnp.ndarray) -> jnp.ndarray:
+        return (
+            temperature_scaled
+            * jnp.asarray(self.target_scale[self.temperature_target_index], dtype=temperature_scaled.dtype)
+            + jnp.asarray(self.target_mean[self.temperature_target_index], dtype=temperature_scaled.dtype)
+        )
+
+    def _energy_scaled(self, energy_t: jnp.ndarray) -> jnp.ndarray:
+        return energy_t / jnp.asarray(max(self.energy_scale, 1.0), dtype=energy_t.dtype)
+
+    def _setpoint_gap_scaled(
+        self,
+        input_t: jnp.ndarray,
+        temperature_t: jnp.ndarray,
+    ) -> jnp.ndarray:
+        setpoint_c = self._physical_input(input_t, self.setpoint_input_index)
+        temperature_c = self._temperature_physical(temperature_t)
+        target_scale = jnp.maximum(
+            jnp.abs(jnp.asarray(self.target_scale[self.temperature_target_index], dtype=input_t.dtype)),
+            jnp.asarray(1e-6, dtype=input_t.dtype),
+        )
+        return (setpoint_c - temperature_c) / target_scale
+
+    def _outdoor_gap_scaled(
+        self,
+        input_t: jnp.ndarray,
+        temperature_t: jnp.ndarray,
+    ) -> jnp.ndarray:
+        outdoor_c = self._physical_input(input_t, self.outdoor_input_index)
+        temperature_c = self._temperature_physical(temperature_t)
+        target_scale = jnp.maximum(
+            jnp.abs(jnp.asarray(self.target_scale[self.temperature_target_index], dtype=input_t.dtype)),
+            jnp.asarray(1e-6, dtype=input_t.dtype),
+        )
+        return (outdoor_c - temperature_c) / target_scale
+
+    def hp_features(
+        self,
+        metadata: jnp.ndarray,
+        encoded_input_t: jnp.ndarray,
+        input_t: jnp.ndarray,
+        energy_t: jnp.ndarray,
+        temperature_t: jnp.ndarray,
+    ) -> jnp.ndarray:
+        return jnp.concatenate(
+            [
+                metadata,
+                encoded_input_t,
+                jnp.asarray([temperature_t], dtype=encoded_input_t.dtype),
+                jnp.asarray([self._setpoint_gap_scaled(input_t, temperature_t)], dtype=encoded_input_t.dtype),
+                jnp.asarray([self._energy_scaled(energy_t)], dtype=encoded_input_t.dtype),
+            ],
+            axis=0,
+        )
+
+    def thermal_forcing(
+        self,
+        input_t: jnp.ndarray,
+        qroom_scaled_t: jnp.ndarray,
+        temperature_t: jnp.ndarray,
+    ) -> jnp.ndarray:
+        return jnp.concatenate(
+            [
+                input_t[1:],
+                jnp.asarray([qroom_scaled_t], dtype=input_t.dtype),
+                jnp.asarray([temperature_t], dtype=input_t.dtype),
+                jnp.asarray([self._outdoor_gap_scaled(input_t, temperature_t)], dtype=input_t.dtype),
+            ],
+            axis=0,
+        )
+
+    def decode_temperature(
+        self,
+        state_t: jnp.ndarray,
+        previous_temperature_scaled: jnp.ndarray,
+    ) -> jnp.ndarray:
+        raw_temperature = self.temperature_net(
+            state_t / jnp.asarray(self.state_bound, dtype=state_t.dtype)
+        )[0]
+        return self._temperature_output(raw_temperature, previous_temperature_scaled)
+
     def _cop(self, input_t: jnp.ndarray) -> jnp.ndarray:
         outdoor_c = self._physical_input(input_t, self.outdoor_input_index)
         cop = jnp.maximum(self.hp_cop_floor, self.cop_intercept + self.cop_slope * outdoor_c)
@@ -289,12 +402,14 @@ class ContractingClosedLoopHPEmulator(eqx.Module):
     def transition_matrix_and_bias(
         self,
         metadata: jnp.ndarray,
-        encoded_input_t: jnp.ndarray,
+        thermal_forcing_t: jnp.ndarray,
     ) -> tuple[jnp.ndarray, jnp.ndarray]:
-        raw = self.transition_net(jnp.concatenate([metadata, encoded_input_t], axis=0))
+        raw = self.transition_net(jnp.concatenate([metadata, thermal_forcing_t], axis=0))
         raw_matrix = raw[: self.state_dim * self.state_dim].reshape((self.state_dim, self.state_dim))
         raw_bias = raw[self.state_dim * self.state_dim :]
-        frobenius = jnp.linalg.norm(raw_matrix)
+        frobenius = jnp.sqrt(
+            jnp.sum(raw_matrix**2) + jnp.asarray(1e-12, dtype=raw_matrix.dtype)
+        )
         divisor = jnp.maximum(frobenius, jnp.asarray(1.0, dtype=raw_matrix.dtype))
         matrix = (
             jnp.asarray(self.contraction_gamma, dtype=raw_matrix.dtype)
@@ -307,33 +422,24 @@ class ContractingClosedLoopHPEmulator(eqx.Module):
     def one_step_state(
         self,
         metadata: jnp.ndarray,
-        encoded_input_t: jnp.ndarray,
+        thermal_forcing_t: jnp.ndarray,
         state_t: jnp.ndarray,
     ) -> jnp.ndarray:
-        matrix, bias = self.transition_matrix_and_bias(metadata, encoded_input_t)
+        matrix, bias = self.transition_matrix_and_bias(metadata, thermal_forcing_t)
         scaled_state = state_t / jnp.asarray(self.state_bound, dtype=state_t.dtype)
         raw_next = matrix @ scaled_state + bias
         return jnp.asarray(self.state_bound, dtype=state_t.dtype) * jnp.tanh(raw_next)
 
-    def decode_output(
+    def decode_hp(
         self,
-        state_t: jnp.ndarray,
+        metadata: jnp.ndarray,
         encoded_input_t: jnp.ndarray,
         input_t: jnp.ndarray,
         energy_t: jnp.ndarray,
-    ) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
-        features = jnp.concatenate(
-            [
-                state_t / jnp.asarray(self.state_bound, dtype=state_t.dtype),
-                encoded_input_t,
-            ],
-            axis=0,
-        )
-        raw_temperature, qroom_logit, pel_logit, mode_logit = self.output_net(features)
-        temperature_scaled = (
-            jnp.asarray(self.temperature_output_scale, dtype=raw_temperature.dtype)
-            * jnp.tanh(raw_temperature)
-        )
+        temperature_t: jnp.ndarray,
+    ) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+        features = self.hp_features(metadata, encoded_input_t, input_t, energy_t, temperature_t)
+        qroom_logit, pel_logit, mode_logit = self.output_net(features)
         pi_t = jax.nn.sigmoid(mode_logit)
         requested_qroom_t = self._positive_capped_from_logit(
             qroom_logit,
@@ -351,13 +457,10 @@ class ContractingClosedLoopHPEmulator(eqx.Module):
             energy_t,
             cop_t * pel_t,
             requested_qroom_t,
-            jnp.asarray(self.hp_dt_hours, dtype=state_t.dtype),
+            jnp.asarray(self.hp_dt_hours, dtype=input_t.dtype),
             jax.nn.softplus(self.raw_energy_loss_rate),
         )
-        qroom_scaled_t = self._target_scaled(qroom_t, self.qroom_target_index)
-        pel_scaled_t = self._target_scaled(pel_t, self.pel_target_index)
-        prediction_t = jnp.stack([temperature_scaled, qroom_scaled_t, pel_scaled_t])
-        return prediction_t, pi_t, qroom_t, pel_t, energy_next, available_power_t, requested_qroom_t
+        return pi_t, qroom_t, pel_t, energy_next, available_power_t, requested_qroom_t
 
     def rollout_with_aux(
         self,
@@ -369,22 +472,35 @@ class ContractingClosedLoopHPEmulator(eqx.Module):
         energy0 = self.initial_energy(metadata, initial_temperature)
 
         def step(
-            carry: tuple[jnp.ndarray, jnp.ndarray],
+            carry: tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray],
             input_t: jnp.ndarray,
-        ) -> tuple[tuple[jnp.ndarray, jnp.ndarray], tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]]:
-            state_t, energy_t = carry
+        ) -> tuple[tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray], tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]]:
+            state_t, energy_t, temperature_t = carry
             encoded_input_t = self.encode_input(input_t)
-            state_next = self.one_step_state(metadata, encoded_input_t, state_t)
-            prediction_t, pi_t, qroom_t, pel_t, energy_next, _, _ = self.decode_output(
-                state_next,
+            pi_t, qroom_t, pel_t, energy_next, _, _ = self.decode_hp(
+                metadata,
                 encoded_input_t,
                 input_t,
                 energy_t,
+                temperature_t,
             )
-            matrix, _ = self.transition_matrix_and_bias(metadata, encoded_input_t)
-            return (state_next, energy_next), (prediction_t, pi_t, qroom_t, pel_t, state_next, jnp.linalg.norm(matrix))
+            qroom_scaled_t = self._target_scaled(qroom_t, self.qroom_target_index)
+            pel_scaled_t = self._target_scaled(pel_t, self.pel_target_index)
+            thermal_forcing_t = self.thermal_forcing(input_t, qroom_scaled_t, temperature_t)
+            state_next = self.one_step_state(metadata, thermal_forcing_t, state_t)
+            temperature_next = self.decode_temperature(state_next, temperature_t)
+            prediction_t = jnp.stack([temperature_next, qroom_scaled_t, pel_scaled_t])
+            matrix, _ = self.transition_matrix_and_bias(metadata, thermal_forcing_t)
+            return (state_next, energy_next, temperature_next), (
+                prediction_t,
+                pi_t,
+                qroom_t,
+                pel_t,
+                state_next,
+                jnp.linalg.norm(matrix),
+            )
 
-        _, outputs = jax.lax.scan(step, (state0, energy0), inputs)
+        _, outputs = jax.lax.scan(step, (state0, energy0, initial_temperature[0]), inputs)
         predictions, pi, qroom, pel, state, matrix_norm = outputs
         aux = (pi, qroom, pel, state, matrix_norm)
         return predictions, aux

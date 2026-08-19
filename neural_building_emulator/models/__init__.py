@@ -3,7 +3,11 @@
 from .closed_loop_hp import ClosedLoopHPEmulator
 from .contracting_closed_loop_hp import ContractingClosedLoopHPEmulator
 from .emulator import InputEncoderFeedback, MetadataStateSpaceEmulator, SwitchingDynamics
-from .probabilistic_closed_loop_hp import HPElectricScenarioMode, ProbabilisticClosedLoopHPEmulator
+from .probabilistic_closed_loop_hp import (
+    HPElectricScenarioMode,
+    ProbabilisticClosedLoopHPEmulator,
+    ProbHpEmissionMode,
+)
 from .probabilistic_contracting_closed_loop_hp import ProbabilisticContractingClosedLoopHPEmulator
 from .probabilistic_emulator import ProbabilisticStableStateSpaceEmulator
 from .schur import simba_schur_matrix, spectral_radius
@@ -18,6 +22,7 @@ __all__ = [
     "SwitchingDynamics",
     "ProbabilisticClosedLoopHPEmulator",
     "ProbabilisticContractingClosedLoopHPEmulator",
+    "ProbHpEmissionMode",
     "ProbabilisticStableStateSpaceEmulator",
     "StateSpaceMatrices",
     "rollout_state_space",

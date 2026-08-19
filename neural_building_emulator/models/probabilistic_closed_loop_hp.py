@@ -14,6 +14,7 @@ from .state_space import StateSpaceMatrices
 
 ProcessNoiseMode = Literal["none", "constant", "heteroscedastic"]
 HPElectricScenarioMode = Literal["expected", "bernoulli"]
+ProbHpEmissionMode = Literal["bounded", "legacy_lognormal_mean"]
 ProbClosedLoopAux = tuple[
     jnp.ndarray,
     jnp.ndarray,
@@ -59,6 +60,7 @@ class ProbabilisticClosedLoopHPEmulator(eqx.Module):
     process_noise_init: float = eqx.field(static=True)
     process_noise_floor: float = eqx.field(static=True)
     process_noise_cap: float = eqx.field(static=True)
+    hp_emission_mode: ProbHpEmissionMode = eqx.field(static=True)
     hp_dt_hours: float = eqx.field(static=True)
     hp_cop_floor: float = eqx.field(static=True)
     hp_cop_cap: float = eqx.field(static=True)
@@ -100,6 +102,7 @@ class ProbabilisticClosedLoopHPEmulator(eqx.Module):
         process_noise_init: float = -6.0,
         process_noise_floor: float = 1e-5,
         process_noise_cap: float = 0.25,
+        hp_emission_mode: ProbHpEmissionMode = "bounded",
         hp_dt_hours: float = 0.25,
         hp_cop_floor: float = 1.0,
         hp_cop_cap: float = 0.0,
@@ -141,6 +144,8 @@ class ProbabilisticClosedLoopHPEmulator(eqx.Module):
             raise ValueError("process_noise_mode must be 'none', 'constant', or 'heteroscedastic'")
         if process_noise_cap <= 0.0:
             raise ValueError("process_noise_cap must be positive")
+        if hp_emission_mode not in ("bounded", "legacy_lognormal_mean"):
+            raise ValueError("hp_emission_mode must be 'bounded' or 'legacy_lognormal_mean'")
         if len(input_mean) != input_dim or len(input_scale) != input_dim:
             raise ValueError("input_mean and input_scale must match input_dim")
         if len(target_mean) != 3 or len(target_scale) != 3:
@@ -227,6 +232,7 @@ class ProbabilisticClosedLoopHPEmulator(eqx.Module):
         self.process_noise_init = process_noise_init
         self.process_noise_floor = process_noise_floor
         self.process_noise_cap = process_noise_cap
+        self.hp_emission_mode = hp_emission_mode
         self.hp_dt_hours = hp_dt_hours
         self.hp_cop_floor = hp_cop_floor
         self.hp_cop_cap = hp_cop_cap
@@ -421,27 +427,59 @@ class ProbabilisticClosedLoopHPEmulator(eqx.Module):
         features: jnp.ndarray,
     ) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
         pi_t = jax.nn.sigmoid(self.mode_net(features)[0])
-        pel_scale = jnp.asarray(self.target_scale[self.pel_target_index], dtype=features.dtype)
-        pel_mean = jnp.asarray(self.target_mean[self.pel_target_index], dtype=features.dtype)
-        max_active = jnp.maximum(
-            pel_mean + jnp.asarray(8.0, dtype=features.dtype) * pel_scale,
-            jnp.asarray(2.0, dtype=features.dtype) * pel_scale,
-        )
-        if self.hp_pel_cap_w_m2 > 0.0:
-            max_active = jnp.asarray(self.hp_pel_cap_w_m2, dtype=features.dtype)
-        active_level = max_active * jax.nn.sigmoid(self.pel_mu_net(features)[0])
-        log_mu = jnp.log1p(active_level + jnp.asarray(1e-6, dtype=features.dtype))
+        raw_mu = self.pel_mu_net(features)[0]
+        raw_sigma = self.pel_sigma_net(features)[0]
+        if self.hp_emission_mode == "legacy_lognormal_mean":
+            active_level = self._max_active_power(features.dtype) * jax.nn.sigmoid(raw_mu)
+            log_mu = jnp.log1p(active_level + jnp.asarray(1e-6, dtype=features.dtype))
+            log_sigma = (
+                jnp.asarray(0.05, dtype=features.dtype)
+                + jnp.asarray(0.70, dtype=features.dtype) * jax.nn.sigmoid(raw_sigma)
+            )
+            expected_active = jnp.maximum(
+                jnp.expm1(log_mu + 0.5 * log_sigma**2),
+                jnp.asarray(0.0, dtype=features.dtype),
+            )
+            expected_active = self._nonnegative_capped(expected_active, self.hp_pel_cap_w_m2)
+            expected_total = self._nonnegative_capped(pi_t * expected_active, self.hp_pel_cap_w_m2)
+            return pi_t, log_mu, log_sigma, expected_active, expected_total
+
+        max_log_active = self._max_log_active_power(features.dtype)
+        log_mu = max_log_active * jax.nn.sigmoid(raw_mu)
         log_sigma = (
             jnp.asarray(0.05, dtype=features.dtype)
-            + jnp.asarray(0.70, dtype=features.dtype) * jax.nn.sigmoid(self.pel_sigma_net(features)[0])
+            + jnp.asarray(0.45, dtype=features.dtype) * jax.nn.sigmoid(raw_sigma)
         )
-        expected_active = jnp.maximum(
-            jnp.expm1(log_mu + 0.5 * log_sigma**2),
-            jnp.asarray(0.0, dtype=features.dtype),
-        )
-        expected_active = self._nonnegative_capped(expected_active, self.hp_pel_cap_w_m2)
-        expected_total = self._nonnegative_capped(pi_t * expected_active, self.hp_pel_cap_w_m2)
+        expected_active = self._active_power_from_log(log_mu)
+        expected_total = pi_t * expected_active
         return pi_t, log_mu, log_sigma, expected_active, expected_total
+
+    def _max_active_power(self, dtype: jnp.dtype) -> jnp.ndarray:
+        if self.hp_pel_cap_w_m2 > 0.0:
+            return jnp.asarray(self.hp_pel_cap_w_m2, dtype=dtype)
+        pel_scale = jnp.asarray(self.target_scale[self.pel_target_index], dtype=dtype)
+        pel_mean = jnp.asarray(self.target_mean[self.pel_target_index], dtype=dtype)
+        fallback_cap = jnp.maximum(
+            pel_mean + jnp.asarray(8.0, dtype=dtype) * pel_scale,
+            jnp.asarray(2.0, dtype=dtype) * pel_scale,
+        )
+        return jnp.maximum(fallback_cap, jnp.asarray(1e-3, dtype=dtype))
+
+    def _max_log_active_power(self, dtype: jnp.dtype) -> jnp.ndarray:
+        return jnp.log1p(self._max_active_power(dtype))
+
+    def _active_power_from_log(self, log_active: jnp.ndarray) -> jnp.ndarray:
+        capped_log_active = jnp.clip(
+            log_active,
+            jnp.asarray(0.0, dtype=log_active.dtype),
+            self._max_log_active_power(log_active.dtype),
+        )
+        return jnp.expm1(capped_log_active)
+
+    def _sample_active_power_from_log(self, log_active: jnp.ndarray) -> jnp.ndarray:
+        if self.hp_emission_mode == "legacy_lognormal_mean":
+            return self._nonnegative_capped(jnp.expm1(log_active), self.hp_pel_cap_w_m2)
+        return self._active_power_from_log(log_active)
 
     def one_step_augmented_state(
         self,
@@ -579,10 +617,7 @@ class ProbabilisticClosedLoopHPEmulator(eqx.Module):
             else:
                 hp_on_t = (mode_uniform_t < pi_t).astype(input_t.dtype)
                 sampled_log_active_t = log_mu_t + log_sigma_t * power_noise_t
-                pel_active_t = self._nonnegative_capped(
-                    jnp.expm1(sampled_log_active_t),
-                    self.hp_pel_cap_w_m2,
-                )
+                pel_active_t = self._sample_active_power_from_log(sampled_log_active_t)
                 pel_t = self._nonnegative_capped(hp_on_t * pel_active_t, self.hp_pel_cap_w_m2)
 
             cop_t = self._cop(input_t, cop_intercept, cop_slope)

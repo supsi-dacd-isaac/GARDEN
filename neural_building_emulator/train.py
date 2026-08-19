@@ -46,6 +46,7 @@ from .models import (
     MetadataStateSpaceEmulator,
     ProbabilisticClosedLoopHPEmulator,
     ProbabilisticContractingClosedLoopHPEmulator,
+    ProbHpEmissionMode,
     ProbabilisticStableStateSpaceEmulator,
     SwitchingDynamics,
     spectral_radius,
@@ -87,12 +88,29 @@ SETPOINT_METADATA_COLUMN = "shSetpoint"
 PROB_CLOSED_LOOP_LOSS_COMPONENT_NAMES = (
     "energy",
     "variogram",
+    "ires",
     "softopt",
     "hp_bce",
     "hp_active_nll",
     "hp_inactive_leakage",
     "physics",
     "stability",
+)
+UPDATE_FINITE_FLAG_NAMES = (
+    "loss",
+    "components",
+    "grads",
+    "updates",
+    "opt_state",
+    "params",
+    "forward",
+)
+UPDATE_STAT_NAMES = (
+    "grad_norm",
+    "update_norm",
+    "param_norm",
+    "max_abs_update",
+    "max_abs_param",
 )
 PROB_CLOSED_LOOP_AUX_ENERGY = 2
 PROB_CLOSED_LOOP_AUX_EXPECTED_PEL = 7
@@ -137,6 +155,11 @@ class TrainConfig:
     batch_size: int = 128
     epochs: int = 5
     learning_rate: float = 1e-3
+    gradient_clip_norm: float = 1.0
+    skip_nonfinite_updates: bool = True
+    max_consecutive_nonfinite_updates: int = 8
+    validate_candidate_updates: bool = False
+    log_update_diagnostics: bool = False
     max_train_batches: int | None = None
     output_dir: Path = Path("output/neural_building_emulator")
     model_checkpoint_dir: Path | None = None
@@ -165,6 +188,12 @@ class TrainConfig:
     prob_variogram_weight: float = 0.1
     prob_variogram_lags: tuple[int, ...] = (1, 4, 16, 96)
     prob_variogram_power: float = 0.5
+    prob_variogram_output_weights: tuple[float, ...] = ()
+    prob_variogram_constant_setpoint_only: bool = False
+    prob_variogram_setpoint_threshold_c: float = 0.05
+    prob_ires_weight: float = 0.0
+    prob_ires_horizons_hours: tuple[float, ...] = (0.5, 1.0, 2.0, 3.0)
+    prob_ires_setpoint_threshold_c: float = 0.05
     prob_physics_weight: float = 0.0
     prob_horizon_weight_power: float = 0.0
     hp_controller_state_dim: int = 2
@@ -187,7 +216,9 @@ class TrainConfig:
     contracting_gamma: float = 0.99
     contracting_state_bound: float = 5.0
     contracting_temperature_scale: float = 8.0
+    contracting_temperature_delta_max_c: float = 0.0
     prob_hp_scenario_mode: HPElectricScenarioMode = "bernoulli"
+    prob_hp_emission_mode: ProbHpEmissionMode = "bounded"
     hp_active_power_nll_weight: float = 1.0
     hp_inactive_leakage_weight: float = 0.1
 
@@ -211,6 +242,111 @@ def minibatches(
             windows.initial_temperature[batch_idx],
             windows.targets[batch_idx],
         )
+
+
+def build_optimizer(config: TrainConfig) -> optax.GradientTransformation:
+    if config.gradient_clip_norm < 0.0:
+        raise ValueError("gradient_clip_norm must be non-negative; use 0 to disable clipping")
+    if config.max_consecutive_nonfinite_updates < 1:
+        raise ValueError("max_consecutive_nonfinite_updates must be positive")
+    transforms: list[optax.GradientTransformation] = []
+    if config.gradient_clip_norm > 0.0:
+        transforms.append(optax.clip_by_global_norm(config.gradient_clip_norm))
+    transforms.append(optax.adam(config.learning_rate))
+    optimizer = optax.chain(*transforms)
+    if config.skip_nonfinite_updates:
+        optimizer = optax.apply_if_finite(
+            optimizer,
+            max_consecutive_errors=config.max_consecutive_nonfinite_updates,
+        )
+    return optimizer
+
+
+def _array_tree_all_finite(tree: object) -> jnp.ndarray:
+    leaves = jax.tree_util.tree_leaves(eqx.filter(tree, eqx.is_array))
+    if not leaves:
+        return jnp.asarray(True)
+    return jnp.all(jnp.stack([jnp.all(jnp.isfinite(leaf)) for leaf in leaves]))
+
+
+def _array_tree_global_norm(tree: object) -> jnp.ndarray:
+    leaves = jax.tree_util.tree_leaves(eqx.filter(tree, eqx.is_array))
+    if not leaves:
+        return jnp.asarray(0.0)
+    total = jnp.sum(
+        jnp.stack(
+            [
+                jnp.sum(leaf.astype(jnp.float32) ** 2)
+                for leaf in leaves
+            ]
+        )
+    )
+    return jnp.sqrt(total + jnp.asarray(1e-12, dtype=jnp.float32))
+
+
+def _array_tree_max_abs(tree: object) -> jnp.ndarray:
+    leaves = jax.tree_util.tree_leaves(eqx.filter(tree, eqx.is_array))
+    if not leaves:
+        return jnp.asarray(0.0)
+    return jnp.max(
+        jnp.stack(
+            [
+                jnp.max(jnp.abs(leaf.astype(jnp.float32)))
+                for leaf in leaves
+            ]
+        )
+    )
+
+
+def _select_array_tree(predicate: jnp.ndarray, new_tree: object, old_tree: object) -> object:
+    new_arrays, new_static = eqx.partition(new_tree, eqx.is_array)
+    old_arrays, _ = eqx.partition(old_tree, eqx.is_array)
+    selected_arrays = jax.tree_util.tree_map(
+        lambda new, old: jnp.where(predicate, new, old),
+        new_arrays,
+        old_arrays,
+    )
+    return eqx.combine(selected_arrays, new_static)
+
+
+def _update_stats(*, grads: object, updates: object, model: object) -> jnp.ndarray:
+    return jnp.stack(
+        [
+            _array_tree_global_norm(grads),
+            _array_tree_global_norm(updates),
+            _array_tree_global_norm(model),
+            _array_tree_max_abs(updates),
+            _array_tree_max_abs(model),
+        ]
+    )
+
+
+def _update_finite_flags(
+    *,
+    loss: jnp.ndarray,
+    components: object | None,
+    grads: object,
+    updates: object,
+    opt_state: object,
+    model: object,
+    forward_is_finite: jnp.ndarray,
+) -> jnp.ndarray:
+    components_are_finite = (
+        jnp.asarray(True)
+        if components is None
+        else _array_tree_all_finite(components)
+    )
+    return jnp.stack(
+        [
+            jnp.isfinite(loss),
+            components_are_finite,
+            _array_tree_all_finite(grads),
+            _array_tree_all_finite(updates),
+            _array_tree_all_finite(opt_state),
+            _array_tree_all_finite(model),
+            forward_is_finite,
+        ]
+    )
 
 
 def predict_batch(
@@ -353,16 +489,44 @@ def smooth_abs_power(values: jnp.ndarray, power: float) -> jnp.ndarray:
     return (values**2 + 1e-6) ** (0.5 * power)
 
 
+def constant_setpoint_pair_mask(
+    inputs: jnp.ndarray,
+    *,
+    lag: int,
+    setpoint_delta_threshold: float,
+) -> jnp.ndarray:
+    """Mask lagged pairs whose interval does not cross a setpoint jump."""
+    setpoint = inputs[:, :, 0]
+    threshold = jnp.asarray(setpoint_delta_threshold, dtype=setpoint.dtype)
+    jumps = (jnp.abs(setpoint[:, 1:] - setpoint[:, :-1]) > threshold).astype(setpoint.dtype)
+    jump_count = jnp.concatenate(
+        [jnp.zeros_like(jumps[:, :1]), jnp.cumsum(jumps, axis=1)],
+        axis=1,
+    )
+    interval_jump_count = jump_count[:, lag:] - jump_count[:, :-lag]
+    return (interval_jump_count <= 0.0).astype(setpoint.dtype)
+
+
 def variogram_score(
     predictions: jnp.ndarray,
     targets: jnp.ndarray,
     *,
     lags: tuple[int, ...],
     power: float,
+    output_weights: tuple[float, ...] = (),
+    constant_setpoint_inputs: jnp.ndarray | None = None,
+    setpoint_delta_threshold: float = 0.0,
 ) -> jnp.ndarray:
     """Efficient lag-restricted trajectory variogram score."""
     scores = []
     horizon = predictions.shape[2]
+    if output_weights:
+        weights = jnp.asarray(output_weights, dtype=predictions.dtype)
+    else:
+        weights = jnp.ones((predictions.shape[-1],), dtype=predictions.dtype)
+    weights = weights.reshape((1, 1, -1))
+    weight_sum = jnp.sum(weights)
+    zero = jnp.asarray(0.0, dtype=predictions.dtype)
     for lag in lags:
         if lag < 1 or lag >= horizon:
             continue
@@ -372,9 +536,129 @@ def variogram_score(
             power,
         )
         prediction_moment = jnp.mean(prediction_delta, axis=1)
-        scores.append(jnp.mean((target_delta - prediction_moment) ** 2))
+        squared_error = (target_delta - prediction_moment) ** 2
+        weighted_error = squared_error * weights
+        if constant_setpoint_inputs is None:
+            denominator = (
+                jnp.asarray(squared_error.shape[0] * squared_error.shape[1], dtype=predictions.dtype)
+                * weight_sum
+            )
+            scores.append(jnp.sum(weighted_error) / jnp.maximum(denominator, 1e-6))
+        else:
+            mask = constant_setpoint_pair_mask(
+                constant_setpoint_inputs,
+                lag=lag,
+                setpoint_delta_threshold=setpoint_delta_threshold,
+            )
+            denominator = jnp.sum(mask) * weight_sum
+            scores.append(
+                jnp.where(
+                    denominator > 0.0,
+                    jnp.sum(weighted_error * mask[:, :, jnp.newaxis]) / jnp.maximum(denominator, 1e-6),
+                    zero,
+                )
+            )
     if not scores:
-        return jnp.asarray(0.0, dtype=predictions.dtype)
+        return zero
+    return jnp.mean(jnp.stack(scores))
+
+
+def _window_means_at_starts(
+    values: jnp.ndarray,
+    *,
+    starts: jnp.ndarray,
+    window_steps: int,
+) -> jnp.ndarray:
+    cumsum = jnp.concatenate(
+        [jnp.zeros_like(values[..., :1]), jnp.cumsum(values, axis=-1)],
+        axis=-1,
+    )
+    end_values = jnp.take(cumsum, starts + window_steps, axis=-1)
+    start_values = jnp.take(cumsum, starts, axis=-1)
+    return (end_values - start_values) / jnp.asarray(window_steps, dtype=values.dtype)
+
+
+def intervention_response_energy_score(
+    predictions: jnp.ndarray,
+    targets: jnp.ndarray,
+    inputs: jnp.ndarray,
+    *,
+    horizon_steps: tuple[int, ...],
+    horizon_hours: tuple[float, ...],
+    setpoint_delta_threshold: float,
+    target_channel: int = 2,
+) -> jnp.ndarray:
+    """Energy score on windowed pre/post responses at setpoint interventions.
+
+    The functional scored for each event k and horizon H is
+
+        H * (mean(P_after_H) - mean(P_before_H)).
+
+    This is the energy version of the flexibility KPI response and is computed
+    on normalized target units so its scale remains well behaved during
+    training.
+    """
+    scores = []
+    horizon = predictions.shape[2]
+    setpoint = inputs[:, :, 0]
+    target_power = targets[:, :, target_channel]
+    prediction_power = predictions[:, :, :, target_channel]
+    threshold = jnp.asarray(setpoint_delta_threshold, dtype=predictions.dtype)
+    zero = jnp.asarray(0.0, dtype=predictions.dtype)
+
+    for steps, hours in zip(horizon_steps, horizon_hours):
+        if steps < 1 or 2 * steps > horizon:
+            continue
+        starts = jnp.arange(steps, horizon - steps + 1)
+        setpoint_delta = jnp.take(setpoint, starts, axis=-1) - jnp.take(
+            setpoint,
+            starts - 1,
+            axis=-1,
+        )
+        event_mask = (jnp.abs(setpoint_delta) >= threshold).astype(predictions.dtype)
+
+        target_pre = _window_means_at_starts(
+            target_power,
+            starts=starts - steps,
+            window_steps=steps,
+        )
+        target_post = _window_means_at_starts(
+            target_power,
+            starts=starts,
+            window_steps=steps,
+        )
+        prediction_pre = _window_means_at_starts(
+            prediction_power,
+            starts=starts - steps,
+            window_steps=steps,
+        )
+        prediction_post = _window_means_at_starts(
+            prediction_power,
+            starts=starts,
+            window_steps=steps,
+        )
+
+        hours_value = jnp.asarray(hours, dtype=predictions.dtype)
+        target_response = hours_value * (target_post - target_pre)
+        prediction_response = hours_value * (prediction_post - prediction_pre)
+        centered = prediction_response - target_response[:, jnp.newaxis, :]
+        obs_distance = jnp.sqrt(centered**2 + 1e-6)
+        pairwise = prediction_response[:, :, jnp.newaxis, :] - prediction_response[:, jnp.newaxis, :, :]
+        pairwise_distance = jnp.sqrt(pairwise**2 + 1e-6)
+        per_event_score = jnp.mean(obs_distance, axis=1) - 0.5 * jnp.mean(
+            pairwise_distance,
+            axis=(1, 2),
+        )
+        event_count = jnp.sum(event_mask)
+        scores.append(
+            jnp.where(
+                event_count > 0.0,
+                jnp.sum(per_event_score * event_mask) / jnp.maximum(event_count, 1.0),
+                zero,
+            )
+        )
+    if not scores:
+        return zero
     return jnp.mean(jnp.stack(scores))
 
 
@@ -618,6 +902,7 @@ def probabilistic_loss_fn(
     variogram_weight: float,
     variogram_lags: tuple[int, ...],
     variogram_power: float,
+    variogram_output_weights: tuple[float, ...],
     physics_weight: float,
     horizon_weight_power: float,
     loss_normalization: LossNormalization,
@@ -646,6 +931,7 @@ def probabilistic_loss_fn(
             loss_targets,
             lags=variogram_lags,
             power=variogram_power,
+            output_weights=variogram_output_weights,
         )
     if softopt_weight > 0.0:
         loss = loss + softopt_weight * soft_optimistic_loss(
@@ -677,6 +963,7 @@ def probabilistic_train_step(
     variogram_weight: float,
     variogram_lags: tuple[int, ...],
     variogram_power: float,
+    variogram_output_weights: tuple[float, ...],
     physics_weight: float,
     horizon_weight_power: float,
     loss_normalization: LossNormalization,
@@ -696,6 +983,7 @@ def probabilistic_train_step(
         variogram_weight,
         variogram_lags,
         variogram_power,
+        variogram_output_weights,
         physics_weight,
         horizon_weight_power,
         loss_normalization,
@@ -767,7 +1055,15 @@ def closed_loop_train_step(
     target_scale: jnp.ndarray,
     hp_mode_loss_weight: float,
     heat_on_threshold: float,
-) -> tuple[ClosedLoopHPEmulator | ContractingClosedLoopHPEmulator, optax.OptState, jnp.ndarray]:
+    skip_nonfinite_updates: bool,
+    validate_candidate_update: bool,
+) -> tuple[
+    ClosedLoopHPEmulator | ContractingClosedLoopHPEmulator,
+    optax.OptState,
+    jnp.ndarray,
+    jnp.ndarray,
+    jnp.ndarray,
+]:
     loss, grads = closed_loop_loss_fn(
         model,
         metadata,
@@ -779,9 +1075,36 @@ def closed_loop_train_step(
         hp_mode_loss_weight,
         heat_on_threshold,
     )
-    updates, opt_state = optimizer.update(grads, opt_state, eqx.filter(model, eqx.is_array))
-    model = eqx.apply_updates(model, updates)
-    return model, opt_state, loss
+    updates, candidate_opt_state = optimizer.update(grads, opt_state, eqx.filter(model, eqx.is_array))
+    candidate_model = eqx.apply_updates(model, updates)
+    candidate_forward_is_finite = jnp.asarray(True)
+    if validate_candidate_update:
+        candidate_predictions, candidate_aux = jax.vmap(
+            lambda row_metadata, row_inputs, row_initial_temperature: candidate_model.rollout_with_aux(
+                row_metadata,
+                row_inputs,
+                row_initial_temperature,
+            )
+        )(metadata, inputs, initial_temperature)
+        candidate_forward_is_finite = _array_tree_all_finite((candidate_predictions, candidate_aux))
+    update_flags = _update_finite_flags(
+        loss=loss,
+        components=None,
+        grads=grads,
+        updates=updates,
+        opt_state=candidate_opt_state,
+        model=candidate_model,
+        forward_is_finite=candidate_forward_is_finite,
+    )
+    update_stats = _update_stats(grads=grads, updates=updates, model=candidate_model)
+    update_is_finite = jnp.all(update_flags)
+    if skip_nonfinite_updates:
+        model = _select_array_tree(update_is_finite, candidate_model, model)
+        opt_state = _select_array_tree(update_is_finite, candidate_opt_state, opt_state)
+    else:
+        model = candidate_model
+        opt_state = candidate_opt_state
+    return model, opt_state, loss, update_flags, update_stats
 
 
 def predict_probabilistic_closed_loop_batch(
@@ -908,6 +1231,13 @@ def probabilistic_closed_loop_loss_fn(
     variogram_weight: float,
     variogram_lags: tuple[int, ...],
     variogram_power: float,
+    variogram_output_weights: tuple[float, ...],
+    variogram_constant_setpoint_only: bool,
+    variogram_setpoint_delta_threshold: float,
+    ires_weight: float,
+    ires_horizon_steps: tuple[int, ...],
+    ires_horizon_hours: tuple[float, ...],
+    ires_setpoint_delta_threshold: float,
     physics_weight: float,
     horizon_weight_power: float,
     stability_weight: float,
@@ -935,6 +1265,20 @@ def probabilistic_closed_loop_loss_fn(
             targets,
             lags=variogram_lags,
             power=variogram_power,
+            output_weights=variogram_output_weights,
+            constant_setpoint_inputs=inputs if variogram_constant_setpoint_only else None,
+            setpoint_delta_threshold=variogram_setpoint_delta_threshold,
+        )
+    ires_component = zero
+    if ires_weight > 0.0:
+        ires_component = ires_weight * intervention_response_energy_score(
+            predictions,
+            targets,
+            inputs,
+            horizon_steps=ires_horizon_steps,
+            horizon_hours=ires_horizon_hours,
+            setpoint_delta_threshold=ires_setpoint_delta_threshold,
+            target_channel=2,
         )
     softopt_component = zero
     if softopt_weight > 0.0:
@@ -1002,6 +1346,7 @@ def probabilistic_closed_loop_loss_fn(
         [
             energy_component,
             variogram_component,
+            ires_component,
             softopt_component,
             hp_bce_component,
             hp_active_nll_component,
@@ -1035,13 +1380,29 @@ def probabilistic_closed_loop_train_step(
     variogram_weight: float,
     variogram_lags: tuple[int, ...],
     variogram_power: float,
+    variogram_output_weights: tuple[float, ...],
+    variogram_constant_setpoint_only: bool,
+    variogram_setpoint_delta_threshold: float,
+    ires_weight: float,
+    ires_horizon_steps: tuple[int, ...],
+    ires_horizon_hours: tuple[float, ...],
+    ires_setpoint_delta_threshold: float,
     physics_weight: float,
     horizon_weight_power: float,
     stability_weight: float,
     stability_gamma: float,
     stability_samples: int,
     stability_aggregation: Literal["mean", "max"],
-) -> tuple[ProbabilisticClosedLoopModel, optax.OptState, jnp.ndarray, jnp.ndarray]:
+    skip_nonfinite_updates: bool,
+    validate_candidate_update: bool,
+) -> tuple[
+    ProbabilisticClosedLoopModel,
+    optax.OptState,
+    jnp.ndarray,
+    jnp.ndarray,
+    jnp.ndarray,
+    jnp.ndarray,
+]:
     (loss, components), grads = probabilistic_closed_loop_loss_fn(
         model,
         metadata,
@@ -1061,6 +1422,13 @@ def probabilistic_closed_loop_train_step(
         variogram_weight,
         variogram_lags,
         variogram_power,
+        variogram_output_weights,
+        variogram_constant_setpoint_only,
+        variogram_setpoint_delta_threshold,
+        ires_weight,
+        ires_horizon_steps,
+        ires_horizon_hours,
+        ires_setpoint_delta_threshold,
         physics_weight,
         horizon_weight_power,
         stability_weight,
@@ -1068,9 +1436,39 @@ def probabilistic_closed_loop_train_step(
         stability_samples,
         stability_aggregation,
     )
-    updates, opt_state = optimizer.update(grads, opt_state, eqx.filter(model, eqx.is_array))
-    model = eqx.apply_updates(model, updates)
-    return model, opt_state, loss, components
+    updates, candidate_opt_state = optimizer.update(grads, opt_state, eqx.filter(model, eqx.is_array))
+    candidate_model = eqx.apply_updates(model, updates)
+    candidate_forward_is_finite = jnp.asarray(True)
+    if validate_candidate_update:
+        candidate_predictions, candidate_aux = predict_probabilistic_closed_loop_batch_with_aux(
+            candidate_model,
+            metadata,
+            inputs,
+            initial_temperature,
+            key=key,
+            num_particles=num_particles,
+            sample_process_noise=True,
+            hp_scenario_mode="expected",
+        )
+        candidate_forward_is_finite = _array_tree_all_finite((candidate_predictions, candidate_aux))
+    update_flags = _update_finite_flags(
+        loss=loss,
+        components=components,
+        grads=grads,
+        updates=updates,
+        opt_state=candidate_opt_state,
+        model=candidate_model,
+        forward_is_finite=candidate_forward_is_finite,
+    )
+    update_stats = _update_stats(grads=grads, updates=updates, model=candidate_model)
+    update_is_finite = jnp.all(update_flags)
+    if skip_nonfinite_updates:
+        model = _select_array_tree(update_is_finite, candidate_model, model)
+        opt_state = _select_array_tree(update_is_finite, candidate_opt_state, opt_state)
+    else:
+        model = candidate_model
+        opt_state = candidate_opt_state
+    return model, opt_state, loss, components, update_flags, update_stats
 
 
 def _component_metrics(
@@ -1154,6 +1552,24 @@ def metric_int(metrics: dict[str, float], name: str) -> str:
     if not np.isfinite(value):
         return "nan"
     return str(int(value))
+
+
+def finite_mean(values: list[float]) -> tuple[float, int]:
+    array = np.asarray(values, dtype=float)
+    finite = array[np.isfinite(array)]
+    if finite.size == 0:
+        return float("nan"), int(array.size)
+    return float(np.mean(finite)), int(array.size - finite.size)
+
+
+def finite_column_means(values: list[np.ndarray]) -> tuple[np.ndarray | None, int]:
+    if not values:
+        return None, 0
+    array = np.asarray(values, dtype=float)
+    finite_rows = np.all(np.isfinite(array), axis=1)
+    if not finite_rows.any():
+        return np.full((array.shape[1],), np.nan), int(array.shape[0])
+    return np.mean(array[finite_rows], axis=0), int(array.shape[0] - np.sum(finite_rows))
 
 
 def evaluate_closed_loop(
@@ -2479,11 +2895,17 @@ def _shift_final_bias(target, shift: float):
     return eqx.tree_at(lambda item: item.layers, target, tuple(layers))
 
 
-def _raw_for_hp_active_log_sigma(log_sigma: float) -> jnp.ndarray:
-    """Invert log_sigma = 0.05 + 0.70 * sigmoid(raw)."""
-    normalized = (log_sigma - 0.05) / 0.70
+def _raw_for_hp_active_log_sigma(
+    log_sigma: float,
+    *,
+    hp_emission_mode: ProbHpEmissionMode,
+) -> jnp.ndarray:
+    """Invert the HP active log-sigma parametrization for the selected emission mode."""
+    width = 0.45 if hp_emission_mode == "bounded" else 0.70
+    upper = 0.05 + width
+    normalized = (log_sigma - 0.05) / width
     if not 0.0 < normalized < 1.0:
-        raise ValueError("--init-hp-active-log-sigma must be in (0.05, 0.75)")
+        raise ValueError(f"--init-hp-active-log-sigma must be in (0.05, {upper:.2f})")
     raw = np.log(normalized / (1.0 - normalized))
     return jnp.asarray([raw], dtype=jnp.float32)
 
@@ -2568,7 +2990,11 @@ def initialize_probabilistic_closed_loop_from_deterministic(
     max_active = max(pel_mean + 8.0 * pel_scale, 2.0 * pel_scale)
     if model.hp_pel_cap_w_m2 > 0.0:
         max_active = model.hp_pel_cap_w_m2
-    reference_ratio = np.clip(np.log1p(1.0) * pel_scale / max_active, 1e-4, 0.95)
+    reference_ratio = np.clip(
+        np.log1p(max(pel_scale, 1e-6)) / max(np.log1p(max_active), 1e-6),
+        1e-4,
+        0.95,
+    )
     bias_shift = float(np.log(reference_ratio / (1.0 - reference_ratio)))
     model = eqx.tree_at(
         lambda item: item.pel_mu_net,
@@ -2580,7 +3006,10 @@ def initialize_probabilistic_closed_loop_from_deterministic(
         model,
         _constant_output_mlp(
             model.pel_sigma_net,
-            _raw_for_hp_active_log_sigma(hp_active_log_sigma),
+            _raw_for_hp_active_log_sigma(
+                hp_active_log_sigma,
+                hp_emission_mode=model.hp_emission_mode,
+            ),
         ),
     )
     model = eqx.tree_at(
@@ -2762,6 +3191,8 @@ def run_closed_loop_training(
             raise ValueError("contracting_state_bound must be positive")
         if config.contracting_temperature_scale <= 0.0:
             raise ValueError("contracting_temperature_scale must be positive")
+        if config.contracting_temperature_delta_max_c < 0.0:
+            raise ValueError("contracting_temperature_delta_max_c must be non-negative")
     if is_probabilistic:
         if config.prob_particles < 1:
             raise ValueError("prob_particles must be positive")
@@ -2775,6 +3206,8 @@ def run_closed_loop_training(
             raise ValueError("prob_process_noise must be 'none', 'constant', or 'heteroscedastic'")
         if config.prob_hp_scenario_mode not in ("expected", "bernoulli"):
             raise ValueError("prob_hp_scenario_mode must be 'expected' or 'bernoulli'")
+        if config.prob_hp_emission_mode not in ("bounded", "legacy_lognormal_mean"):
+            raise ValueError("prob_hp_emission_mode must be 'bounded' or 'legacy_lognormal_mean'")
         if config.hp_active_power_nll_weight < 0.0:
             raise ValueError("hp_active_power_nll_weight must be non-negative")
         if config.hp_inactive_leakage_weight < 0.0:
@@ -2787,6 +3220,24 @@ def run_closed_loop_training(
             raise ValueError("prob_variogram_weight must be non-negative")
         if config.prob_variogram_power <= 0.0:
             raise ValueError("prob_variogram_power must be positive")
+        if config.prob_variogram_output_weights:
+            if len(config.prob_variogram_output_weights) != len(CLOSED_LOOP_TARGET_COLUMNS):
+                raise ValueError(
+                    "--prob-variogram-output-weights must contain exactly three values "
+                    "for closed-loop models: Tin Qroom Pel_SH"
+                )
+            if any(weight < 0.0 for weight in config.prob_variogram_output_weights):
+                raise ValueError("prob_variogram_output_weights must be non-negative")
+            if sum(config.prob_variogram_output_weights) <= 0.0:
+                raise ValueError("prob_variogram_output_weights must contain at least one positive value")
+        if config.prob_variogram_setpoint_threshold_c < 0.0:
+            raise ValueError("prob_variogram_setpoint_threshold_c must be non-negative")
+        if config.prob_ires_weight < 0.0:
+            raise ValueError("prob_ires_weight must be non-negative")
+        if any(horizon <= 0.0 for horizon in config.prob_ires_horizons_hours):
+            raise ValueError("prob_ires_horizons_hours must contain positive durations")
+        if config.prob_ires_setpoint_threshold_c < 0.0:
+            raise ValueError("prob_ires_setpoint_threshold_c must be non-negative")
         if config.prob_physics_weight < 0.0:
             raise ValueError("prob_physics_weight must be non-negative")
         if config.prob_horizon_weight_power < 0.0:
@@ -2803,8 +3254,13 @@ def run_closed_loop_training(
             raise ValueError("closed_loop_stability_aggregation must be 'mean' or 'max'")
         if config.init_xi_weight_scale < 0.0:
             raise ValueError("init_xi_weight_scale must be non-negative")
-        if not (0.05 < config.init_hp_active_log_sigma < 0.75):
-            raise ValueError("init_hp_active_log_sigma must be in (0.05, 0.75)")
+        max_init_hp_active_log_sigma = 0.50 if config.prob_hp_emission_mode == "bounded" else 0.75
+        if not (0.05 < config.init_hp_active_log_sigma < max_init_hp_active_log_sigma):
+            raise ValueError(
+                "init_hp_active_log_sigma must be in "
+                f"(0.05, {max_init_hp_active_log_sigma:.2f}) for "
+                f"prob_hp_emission_mode={config.prob_hp_emission_mode!r}"
+            )
         if is_contracting_probabilistic and config.init_from_deterministic_artifact is not None:
             raise ValueError(
                 "--init-from-deterministic-artifact is only implemented for "
@@ -2866,6 +3322,28 @@ def run_closed_loop_training(
     target_scale_np = np.asarray(scalers.target.scale, dtype=np.float32).reshape(-1)
     target_mean = jnp.asarray(target_mean_np, dtype=jnp.float32)
     target_scale = jnp.asarray(target_scale_np, dtype=jnp.float32)
+    prob_ires_horizon_steps = tuple(
+        sorted(
+            set(
+                max(1, int(round(float(horizon) / config.hp_dt_hours)))
+                for horizon in config.prob_ires_horizons_hours
+            )
+        )
+    )
+    prob_ires_horizons_hours = tuple(float(step * config.hp_dt_hours) for step in prob_ires_horizon_steps)
+    if is_probabilistic and config.prob_ires_weight > 0.0:
+        valid_ires_steps = [step for step in prob_ires_horizon_steps if 2 * step <= config.sequence_length]
+        if not valid_ires_steps:
+            raise ValueError(
+                "prob_ires_horizons_hours has no valid horizons for the selected sequence_length; "
+                "each horizon needs equally long pre and post windows."
+            )
+    prob_ires_setpoint_threshold_norm = (
+        float(config.prob_ires_setpoint_threshold_c) / max(float(input_scale[0]), 1e-6)
+    )
+    prob_variogram_setpoint_threshold_norm = (
+        float(config.prob_variogram_setpoint_threshold_c) / max(float(input_scale[0]), 1e-6)
+    )
     train_windows = transform_closed_loop_windows(train_windows, scalers)
     if test_windows is not None:
         test_windows = transform_closed_loop_windows(test_windows, scalers)
@@ -2886,9 +3364,11 @@ def run_closed_loop_training(
             input_encoder_depth=config.input_encoder_depth,
             process_noise_mode=config.prob_process_noise,
             process_noise_init=config.prob_process_noise_init,
+            hp_emission_mode=config.prob_hp_emission_mode,
             contraction_gamma=config.contracting_gamma,
             state_bound=config.contracting_state_bound,
             temperature_output_scale=config.contracting_temperature_scale,
+            temperature_delta_max_c=config.contracting_temperature_delta_max_c,
             hp_dt_hours=config.hp_dt_hours,
             hp_cop_floor=config.hp_cop_floor,
             hp_cop_cap=hp_cop_cap,
@@ -2915,6 +3395,7 @@ def run_closed_loop_training(
             input_encoder_depth=config.input_encoder_depth,
             process_noise_mode=config.prob_process_noise,
             process_noise_init=config.prob_process_noise_init,
+            hp_emission_mode=config.prob_hp_emission_mode,
             hp_dt_hours=config.hp_dt_hours,
             hp_cop_floor=config.hp_cop_floor,
             hp_cop_cap=hp_cop_cap,
@@ -2952,6 +3433,7 @@ def run_closed_loop_training(
             contraction_gamma=config.contracting_gamma,
             state_bound=config.contracting_state_bound,
             temperature_output_scale=config.contracting_temperature_scale,
+            temperature_delta_max_c=config.contracting_temperature_delta_max_c,
             hp_dt_hours=config.hp_dt_hours,
             hp_cop_floor=config.hp_cop_floor,
             hp_cop_cap=hp_cop_cap,
@@ -2990,7 +3472,7 @@ def run_closed_loop_training(
             target_scale=tuple(float(value) for value in target_scale_np),
             key=key,
         )
-    optimizer = optax.adam(config.learning_rate)
+    optimizer = build_optimizer(config)
     opt_state = optimizer.init(eqx.filter(model, eqx.is_array))
     rng = np.random.default_rng(config.seed)
     model_checkpoint_dir = config.model_checkpoint_dir or config.output_dir / "model_checkpoints"
@@ -3026,7 +3508,13 @@ def run_closed_loop_training(
             f"gamma={config.contracting_gamma} "
             f"state_bound={config.contracting_state_bound} "
             f"temperature_output_scale={config.contracting_temperature_scale} "
+            f"temperature_delta_max_c={config.contracting_temperature_delta_max_c} "
             "latent_state_guarantee=||dF/ds||_2<=gamma"
+        )
+        print(
+            "closed_loop_hp_contracting_causal_structure="
+            "Tset_to_HP_head; thermal_transition_uses=[u_without_Tset,Qroom,Tin,Tout_minus_Tin]; "
+            "temperature_head_uses=thermal_state_only"
         )
     else:
         print(
@@ -3062,13 +3550,23 @@ def run_closed_loop_training(
             f"plot_particles={config.prob_plot_particles} "
             f"latent_dim={config.prob_latent_dim} "
             f"process_noise={config.prob_process_noise} "
-            f"hp_scenario_mode={config.prob_hp_scenario_mode}"
+            f"hp_scenario_mode={config.prob_hp_scenario_mode} "
+            f"hp_emission_mode={config.prob_hp_emission_mode}"
         )
         print(
             "probabilistic_closed_loop_loss "
             "energy_score_weight=1.0 "
             f"variogram_weight={config.prob_variogram_weight} "
             f"variogram_lags={list(config.prob_variogram_lags)} "
+            f"variogram_power={config.prob_variogram_power} "
+            f"variogram_output_weights="
+            f"{list(config.prob_variogram_output_weights) if config.prob_variogram_output_weights else 'equal'} "
+            f"variogram_constant_setpoint_only={config.prob_variogram_constant_setpoint_only} "
+            f"variogram_setpoint_threshold_c={config.prob_variogram_setpoint_threshold_c} "
+            f"ires_weight={config.prob_ires_weight} "
+            f"ires_horizons_hours={list(prob_ires_horizons_hours)} "
+            f"ires_horizon_steps={list(prob_ires_horizon_steps)} "
+            f"ires_setpoint_threshold_c={config.prob_ires_setpoint_threshold_c} "
             f"softopt_weight={config.prob_softopt_weight} "
             f"softopt_temperature={config.prob_softopt_temperature} "
             f"physics_weight={config.prob_physics_weight} "
@@ -3089,10 +3587,11 @@ def run_closed_loop_training(
             "warning=closed_loop_hp_ignores_input_encoder_feedback; "
             "temperature, outdoor gap, and setpoint gap are always included internally"
         )
+    encoder_label = "hp_control_input_encoder" if is_contracting else "thermal_input_encoder"
     print(
-        "thermal_input_encoder="
+        f"{encoder_label}="
         f"{'enabled' if config.input_encoder_dim is not None else 'disabled'} "
-        f"encoded_dim={config.input_encoder_dim or 7} "
+        f"encoded_dim={config.input_encoder_dim or train_windows.inputs.shape[-1]} "
         f"hidden_dim={config.input_encoder_hidden_dim or config.hidden_dim} "
         f"depth={config.input_encoder_depth}"
     )
@@ -3107,6 +3606,15 @@ def run_closed_loop_training(
             f"schur_gamma={config.schur_gamma} "
             f"pf_lambda_min={config.pf_lambda_min}"
         )
+    print(
+        "optimizer="
+        f"adam learning_rate={config.learning_rate} "
+        f"gradient_clip_norm={config.gradient_clip_norm} "
+        f"skip_nonfinite_updates={config.skip_nonfinite_updates} "
+        f"max_consecutive_nonfinite_updates={config.max_consecutive_nonfinite_updates} "
+        f"validate_candidate_updates={config.validate_candidate_updates} "
+        f"log_update_diagnostics={config.log_update_diagnostics}"
+    )
     print(f"checkpoint_metric={resolved_checkpoint_metric}")
     if config.early_stopping_patience is not None:
         print(
@@ -3132,6 +3640,10 @@ def run_closed_loop_training(
     for epoch in range(1, config.epochs + 1):
         losses = []
         prob_loss_components = []
+        update_stats_values = []
+        skipped_update_batches = 0
+        first_skipped_update_batch: int | None = None
+        skipped_update_failure_counts = np.zeros((len(UPDATE_FINITE_FLAG_NAMES),), dtype=np.int64)
         for batch_idx, (metadata, inputs, initial_temperature, targets) in enumerate(
             minibatches(train_windows, batch_size=config.batch_size, rng=rng, shuffle=True),
             start=1,
@@ -3142,7 +3654,8 @@ def run_closed_loop_training(
                     (ProbabilisticClosedLoopHPEmulator, ProbabilisticContractingClosedLoopHPEmulator),
                 )
                 key, step_key = jax.random.split(key)
-                model, opt_state, loss, components = probabilistic_closed_loop_train_step(
+                model, opt_state, loss, components, update_flags, update_stats = (
+                    probabilistic_closed_loop_train_step(
                     model,
                     opt_state,
                     optimizer,
@@ -3163,16 +3676,26 @@ def run_closed_loop_training(
                     config.prob_variogram_weight,
                     config.prob_variogram_lags,
                     config.prob_variogram_power,
+                    config.prob_variogram_output_weights,
+                    config.prob_variogram_constant_setpoint_only,
+                    prob_variogram_setpoint_threshold_norm,
+                    config.prob_ires_weight,
+                    prob_ires_horizon_steps,
+                    prob_ires_horizons_hours,
+                    prob_ires_setpoint_threshold_norm,
                     config.prob_physics_weight,
                     config.prob_horizon_weight_power,
                     config.closed_loop_stability_weight,
                     config.closed_loop_stability_gamma,
                     config.closed_loop_stability_samples,
                     config.closed_loop_stability_aggregation,
+                    config.skip_nonfinite_updates,
+                    config.validate_candidate_updates,
+                )
                 )
                 prob_loss_components.append(np.asarray(components))
             else:
-                model, opt_state, loss = closed_loop_train_step(
+                model, opt_state, loss, update_flags, update_stats = closed_loop_train_step(
                     model,
                     opt_state,
                     optimizer,
@@ -3184,7 +3707,16 @@ def run_closed_loop_training(
                     target_scale,
                     config.hp_mode_loss_weight,
                     config.heat_on_threshold,
+                    config.skip_nonfinite_updates,
+                    config.validate_candidate_updates,
                 )
+            update_stats_values.append(np.asarray(update_stats, dtype=float))
+            update_flags_np = np.asarray(update_flags, dtype=bool)
+            if config.skip_nonfinite_updates and not bool(np.all(update_flags_np)):
+                skipped_update_batches += 1
+                if first_skipped_update_batch is None:
+                    first_skipped_update_batch = batch_idx
+                skipped_update_failure_counts += (~update_flags_np).astype(np.int64)
             losses.append(float(loss))
             if config.max_train_batches is not None and batch_idx >= config.max_train_batches:
                 break
@@ -3208,15 +3740,41 @@ def run_closed_loop_training(
                 scalers,
                 batch_size=config.batch_size,
             )
+        train_loss_mean, nonfinite_train_batches = finite_mean(losses)
         message = (
-            f"epoch={epoch:03d} train_loss={np.mean(losses):.6f} "
+            f"epoch={epoch:03d} train_loss={train_loss_mean:.6f} "
             f"train_rmse_c={train_eval['rmse_c']:.4f} "
             f"train_qroom_rmse_w_m2={train_eval['qroom_rmse_w_m2']:.4f} "
             f"train_pel_rmse_w_m2={train_eval['pel_rmse_w_m2']:.4f} "
             f"rho_max={sample_spectral_radius(model, train_windows)}"
         )
+        if nonfinite_train_batches > 0:
+            message += f" nonfinite_train_batches={nonfinite_train_batches}"
+        if skipped_update_batches > 0:
+            message += f" skipped_update_batches={skipped_update_batches}"
+            if first_skipped_update_batch is not None:
+                message += f" first_skipped_update_batch={first_skipped_update_batch}"
+            reason_parts = [
+                f"{name}:{int(count)}"
+                for name, count in zip(UPDATE_FINITE_FLAG_NAMES, skipped_update_failure_counts)
+                if count > 0
+            ]
+            if reason_parts:
+                message += f" skipped_update_reasons=[{','.join(reason_parts)}]"
+        if update_stats_values and (config.log_update_diagnostics or skipped_update_batches > 0):
+            stats_array = np.asarray(update_stats_values, dtype=float)
+            finite_rows = np.all(np.isfinite(stats_array), axis=1)
+            if finite_rows.any():
+                max_stats = np.nanmax(stats_array[finite_rows], axis=0)
+                message += " " + " ".join(
+                    f"max_{name}={value:.6g}"
+                    for name, value in zip(UPDATE_STAT_NAMES, max_stats)
+                )
         if is_probabilistic and prob_loss_components:
-            component_means = np.mean(np.stack(prob_loss_components), axis=0)
+            component_means, nonfinite_component_batches = finite_column_means(prob_loss_components)
+            assert component_means is not None
+            if nonfinite_component_batches > 0:
+                message += f" nonfinite_component_batches={nonfinite_component_batches}"
             message += " " + " ".join(
                 f"train_loss_{name}={value:.6f}"
                 for name, value in zip(PROB_CLOSED_LOOP_LOSS_COMPONENT_NAMES, component_means)
@@ -3523,6 +4081,20 @@ def run_training(config: TrainConfig) -> EmulatorModel:
         raise ValueError("prob_variogram_weight must be non-negative")
     if config.prob_variogram_power <= 0.0:
         raise ValueError("prob_variogram_power must be positive")
+    if config.prob_variogram_output_weights:
+        if len(config.prob_variogram_output_weights) != 1:
+            raise ValueError(
+                "--prob-variogram-output-weights must contain exactly one value "
+                "for the Q-to-T probabilistic model"
+            )
+        if any(weight < 0.0 for weight in config.prob_variogram_output_weights):
+            raise ValueError("prob_variogram_output_weights must be non-negative")
+        if sum(config.prob_variogram_output_weights) <= 0.0:
+            raise ValueError("prob_variogram_output_weights must contain at least one positive value")
+    if config.prob_variogram_constant_setpoint_only:
+        raise ValueError("--prob-variogram-constant-setpoint-only is only available for closed-loop HP models")
+    if config.prob_variogram_setpoint_threshold_c < 0.0:
+        raise ValueError("prob_variogram_setpoint_threshold_c must be non-negative")
     if config.prob_physics_weight < 0.0:
         raise ValueError("prob_physics_weight must be non-negative")
     if config.prob_horizon_weight_power < 0.0:
@@ -3667,7 +4239,7 @@ def run_training(config: TrainConfig) -> EmulatorModel:
             schur_mode=config.schur_mode,  # type: ignore[arg-type]
             key=key,
         )
-    optimizer = optax.adam(config.learning_rate)
+    optimizer = build_optimizer(config)
     opt_state = optimizer.init(eqx.filter(model, eqx.is_array))
     rng = np.random.default_rng(config.seed)
     model_checkpoint_dir = config.model_checkpoint_dir or config.output_dir / "model_checkpoints"
@@ -3738,6 +4310,9 @@ def run_training(config: TrainConfig) -> EmulatorModel:
             "energy_score_weight=1.0 "
             f"variogram_weight={config.prob_variogram_weight} "
             f"variogram_lags={list(config.prob_variogram_lags)} "
+            f"variogram_power={config.prob_variogram_power} "
+            f"variogram_output_weights="
+            f"{list(config.prob_variogram_output_weights) if config.prob_variogram_output_weights else 'equal'} "
             f"softopt_weight={config.prob_softopt_weight} "
             f"softopt_temperature={config.prob_softopt_temperature} "
             f"physics_weight={config.prob_physics_weight}"
@@ -3761,6 +4336,15 @@ def run_training(config: TrainConfig) -> EmulatorModel:
     print(f"train_windows={train_windows.targets.shape[0]}")
     if test_windows is not None:
         print(f"test_windows={test_windows.targets.shape[0]}")
+    print(
+        "optimizer="
+        f"adam learning_rate={config.learning_rate} "
+        f"gradient_clip_norm={config.gradient_clip_norm} "
+        f"skip_nonfinite_updates={config.skip_nonfinite_updates} "
+        f"max_consecutive_nonfinite_updates={config.max_consecutive_nonfinite_updates} "
+        f"validate_candidate_updates={config.validate_candidate_updates} "
+        f"log_update_diagnostics={config.log_update_diagnostics}"
+    )
     print(f"checkpoint_metric={resolved_checkpoint_metric}")
     if config.early_stopping_patience is not None:
         print(
@@ -3833,6 +4417,7 @@ def run_training(config: TrainConfig) -> EmulatorModel:
                     config.prob_variogram_weight,
                     config.prob_variogram_lags,
                     config.prob_variogram_power,
+                    config.prob_variogram_output_weights,
                     config.prob_physics_weight,
                     config.prob_horizon_weight_power,
                     config.loss_normalization,
@@ -3851,12 +4436,15 @@ def run_training(config: TrainConfig) -> EmulatorModel:
             model_kind=config.model_kind,
             num_particles=config.prob_eval_particles,
         )
+        train_loss_mean, nonfinite_train_batches = finite_mean(losses)
         message = (
-            f"epoch={epoch:03d} train_loss={np.mean(losses):.6f} "
+            f"epoch={epoch:03d} train_loss={train_loss_mean:.6f} "
             f"train_rmse_c={train_eval['rmse_c']:.4f} "
             f"train_nmae={train_eval['nmae']:.4f} "
             f"rho_max={sample_spectral_radius(model, train_windows):.5f}"
         )
+        if nonfinite_train_batches > 0:
+            message += f" nonfinite_train_batches={nonfinite_train_batches}"
         test_eval: dict[str, float] | None = None
         if test_windows is not None:
             test_eval = evaluate(
@@ -4153,6 +4741,40 @@ def parse_args() -> TrainConfig:
     parser.add_argument("--batch-size", type=int, default=128)
     parser.add_argument("--epochs", type=int, default=5)
     parser.add_argument("--learning-rate", type=float, default=1e-3)
+    parser.add_argument(
+        "--gradient-clip-norm",
+        type=float,
+        default=1.0,
+        help="Global gradient clipping norm. Use 0 to disable clipping.",
+    )
+    parser.add_argument(
+        "--allow-nonfinite-updates",
+        action="store_true",
+        help="Disable the default guard that skips optimizer updates with non-finite gradients.",
+    )
+    parser.add_argument(
+        "--max-consecutive-nonfinite-updates",
+        type=int,
+        default=8,
+        help="Allowed consecutive skipped non-finite updates before optax raises.",
+    )
+    parser.add_argument(
+        "--validate-candidate-updates",
+        action="store_true",
+        help=(
+            "Run an extra candidate forward pass before accepting each closed-loop update. "
+            "This is slower, but diagnoses finite-parameter updates that would make the next "
+            "rollout nonfinite."
+        ),
+    )
+    parser.add_argument(
+        "--log-update-diagnostics",
+        action="store_true",
+        help=(
+            "Print per-epoch maxima of gradient norms, update norms, parameter norms, "
+            "and max absolute update/parameter values."
+        ),
+    )
     parser.add_argument("--max-train-batches", type=int, default=None)
     parser.add_argument("--output-dir", type=Path, default=Path("output/neural_building_emulator"))
     parser.add_argument(
@@ -4298,6 +4920,52 @@ def parse_args() -> TrainConfig:
         help="Power p used in the variogram score.",
     )
     parser.add_argument(
+        "--prob-variogram-output-weights",
+        nargs="+",
+        type=float,
+        default=[],
+        help=(
+            "Optional per-output variogram weights. For closed-loop models use "
+            "three values in Tin Qroom Pel_SH order, e.g. 1 0 0."
+        ),
+    )
+    parser.add_argument(
+        "--prob-variogram-constant-setpoint-only",
+        action="store_true",
+        help=(
+            "For closed-loop probabilistic models, compute variogram terms only "
+            "on lagged pairs whose interval does not cross a setpoint jump."
+        ),
+    )
+    parser.add_argument(
+        "--prob-variogram-setpoint-threshold-c",
+        type=float,
+        default=0.05,
+        help="Setpoint-change threshold in degC used by --prob-variogram-constant-setpoint-only.",
+    )
+    parser.add_argument(
+        "--prob-ires-weight",
+        type=float,
+        default=0.0,
+        help=(
+            "Weight for the intervention response energy score on windowed "
+            "pre/post Pel responses around setpoint jumps."
+        ),
+    )
+    parser.add_argument(
+        "--prob-ires-horizons-hours",
+        nargs="+",
+        type=float,
+        default=[0.5, 1.0, 2.0, 3.0],
+        help="Activation durations in hours used by the intervention response energy score.",
+    )
+    parser.add_argument(
+        "--prob-ires-setpoint-threshold-c",
+        type=float,
+        default=0.05,
+        help="Minimum absolute thermostat setpoint jump, in degC, counted as an IRES intervention.",
+    )
+    parser.add_argument(
         "--prob-physics-weight",
         type=float,
         default=0.0,
@@ -4361,7 +5029,8 @@ def parse_args() -> TrainConfig:
         default=0.25,
         help=(
             "Initial log-space sigma for active HP electric power when warm-starting "
-            "closed_loop_hp_probabilistic from a deterministic artifact. Must be in (0.05, 0.75)."
+            "closed_loop_hp_probabilistic from a deterministic artifact. Must be in "
+            "(0.05, 0.50) for bounded HP emissions or (0.05, 0.75) for legacy_lognormal_mean."
         ),
     )
     parser.add_argument(
@@ -4389,12 +5058,33 @@ def parse_args() -> TrainConfig:
         ),
     )
     parser.add_argument(
+        "--contracting-temperature-delta-max-c",
+        type=float,
+        default=0.0,
+        help=(
+            "If positive, rate-limit the contracting closed-loop temperature readout to "
+            "T[t+1] = T[t] +/- this many degC per model step. The default 0 keeps the "
+            "legacy absolute bounded readout."
+        ),
+    )
+    parser.add_argument(
         "--prob-hp-scenario-mode",
         choices=("expected", "bernoulli"),
         default="bernoulli",
         help=(
             "HP electric scenario mode for --model-kind closed_loop_hp_probabilistic plots. "
             "'bernoulli' samples on/off and active power; 'expected' propagates expected power."
+        ),
+    )
+    parser.add_argument(
+        "--prob-hp-emission-mode",
+        choices=("bounded", "legacy_lognormal_mean"),
+        default="bounded",
+        help=(
+            "Active HP electric-power distribution for probabilistic closed-loop models. "
+            "'bounded' caps log power and sigma for numerical safety. "
+            "'legacy_lognormal_mean' restores the previous lognormal-mean path, which can "
+            "produce larger tails and reproduce older NaN-prone runs."
         ),
     )
     parser.add_argument(
@@ -4504,6 +5194,11 @@ def parse_args() -> TrainConfig:
         batch_size=args.batch_size,
         epochs=args.epochs,
         learning_rate=args.learning_rate,
+        gradient_clip_norm=args.gradient_clip_norm,
+        skip_nonfinite_updates=not args.allow_nonfinite_updates,
+        max_consecutive_nonfinite_updates=args.max_consecutive_nonfinite_updates,
+        validate_candidate_updates=args.validate_candidate_updates,
+        log_update_diagnostics=args.log_update_diagnostics,
         max_train_batches=args.max_train_batches,
         output_dir=args.output_dir,
         model_checkpoint_dir=args.model_checkpoint_dir,
@@ -4530,9 +5225,16 @@ def parse_args() -> TrainConfig:
         prob_variogram_weight=args.prob_variogram_weight,
         prob_variogram_lags=tuple(args.prob_variogram_lags),
         prob_variogram_power=args.prob_variogram_power,
+        prob_variogram_output_weights=tuple(args.prob_variogram_output_weights),
+        prob_variogram_constant_setpoint_only=args.prob_variogram_constant_setpoint_only,
+        prob_variogram_setpoint_threshold_c=args.prob_variogram_setpoint_threshold_c,
+        prob_ires_weight=args.prob_ires_weight,
+        prob_ires_horizons_hours=tuple(args.prob_ires_horizons_hours),
+        prob_ires_setpoint_threshold_c=args.prob_ires_setpoint_threshold_c,
         prob_physics_weight=args.prob_physics_weight,
         prob_horizon_weight_power=args.prob_horizon_weight_power,
         prob_hp_scenario_mode=args.prob_hp_scenario_mode,
+        prob_hp_emission_mode=args.prob_hp_emission_mode,
         hp_controller_state_dim=args.hp_controller_state_dim,
         hp_dt_hours=args.hp_dt_hours,
         hp_mode_loss_weight=args.hp_mode_loss_weight,
@@ -4553,6 +5255,7 @@ def parse_args() -> TrainConfig:
         contracting_gamma=args.contracting_gamma,
         contracting_state_bound=args.contracting_state_bound,
         contracting_temperature_scale=args.contracting_temperature_scale,
+        contracting_temperature_delta_max_c=args.contracting_temperature_delta_max_c,
         hp_active_power_nll_weight=args.hp_active_power_nll_weight,
         hp_inactive_leakage_weight=args.hp_inactive_leakage_weight,
     )
