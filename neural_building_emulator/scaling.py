@@ -6,7 +6,7 @@ from dataclasses import dataclass
 
 import numpy as np
 
-from .data import ClosedLoopWindowedArrays, WindowedArrays
+from .data import BuildingProfile, ClosedLoopProfile, ClosedLoopWindowedArrays, WindowedArrays
 
 
 @dataclass(frozen=True)
@@ -71,6 +71,45 @@ def transform_closed_loop_windows(
         targets=scalers.target.transform(windows.targets),
         initial_temperature=initial_temperature,
     )
+
+
+def transform_profiles(
+    profiles: list[BuildingProfile],
+    scalers: WindowScalers,
+) -> list[BuildingProfile]:
+    """Scale complete profiles once so rotated windows need no extra array copy."""
+    return [
+        BuildingProfile(
+            profile_id=profile.profile_id,
+            datetime=profile.datetime,
+            metadata=scalers.metadata.transform(profile.metadata),
+            inputs=scalers.inputs.transform(profile.inputs),
+            target=scalers.target.transform(profile.target),
+        )
+        for profile in profiles
+    ]
+
+
+def transform_closed_loop_profiles(
+    profiles: list[ClosedLoopProfile],
+    scalers: WindowScalers,
+) -> list[ClosedLoopProfile]:
+    """Scale complete closed-loop profiles before epoch-wise window slicing."""
+    target_mean = np.asarray(scalers.target.mean, dtype=np.float32).reshape(-1)
+    target_scale = np.asarray(scalers.target.scale, dtype=np.float32).reshape(-1)
+    return [
+        ClosedLoopProfile(
+            profile_id=profile.profile_id,
+            datetime=profile.datetime,
+            metadata=scalers.metadata.transform(profile.metadata),
+            inputs=scalers.inputs.transform(profile.inputs),
+            targets=scalers.target.transform(profile.targets),
+            initial_temperature=(
+                (profile.initial_temperature - target_mean[:1]) / target_scale[:1]
+            ).astype(np.float32),
+        )
+        for profile in profiles
+    ]
 
 
 def inverse_target(values: np.ndarray, scalers: WindowScalers) -> np.ndarray:

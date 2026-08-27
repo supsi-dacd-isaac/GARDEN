@@ -1,10 +1,18 @@
 """Model blocks for the neural building emulator."""
 
 from .closed_loop_hp import ClosedLoopHPEmulator
-from .contracting_closed_loop_hp import ContractingClosedLoopHPEmulator
+from .causal_hybrid_hp import CausalHybridHPEmulator, CausalHybridRollout
+from .contracting_closed_loop_hp import (
+    ContractingClosedLoopHPEmulator,
+    ThermalQResponseMode,
+    ThermostatDemandMode,
+)
 from .emulator import InputEncoderFeedback, MetadataStateSpaceEmulator, SwitchingDynamics
 from .probabilistic_closed_loop_hp import (
+    HPElectricRolloutMode,
     HPElectricScenarioMode,
+    HPActivationModel,
+    HPTrainingMode,
     ProbabilisticClosedLoopHPEmulator,
     ProbHpEmissionMode,
 )
@@ -15,8 +23,15 @@ from .state_space import StateSpaceMatrices, rollout_state_space
 
 __all__ = [
     "ClosedLoopHPEmulator",
+    "CausalHybridHPEmulator",
+    "CausalHybridRollout",
     "ContractingClosedLoopHPEmulator",
+    "ThermalQResponseMode",
+    "ThermostatDemandMode",
+    "HPElectricRolloutMode",
     "HPElectricScenarioMode",
+    "HPActivationModel",
+    "HPTrainingMode",
     "MetadataStateSpaceEmulator",
     "InputEncoderFeedback",
     "SwitchingDynamics",

@@ -1,5 +1,9 @@
 # Neural Building Emulator Models
 
+The building-local causal semi-Markov research model and its half-year
+ablation are documented separately in
+[`README_CAUSAL_HYBRID_HP.md`](README_CAUSAL_HYBRID_HP.md).
+
 This document summarizes the emulator model families exposed by:
 
 ```bash
@@ -680,6 +684,7 @@ u[t] = [
   Tout[t],
   solar[t],
   ventilation[t],
+  space_heating_available[t],
   hour_sin[t],
   hour_cos[t],
   day_of_year_sin[t],
@@ -702,10 +707,18 @@ Tin_target[t] = FL0_THZ0 zone air temperature at t+1
 Qroom[t]      = zone_thermal_heating_power[t] / floor_area
 Pel_SH[t]     = heat_pump_electric_power[t] / floor_area
 Pel_SH[t]     = 0 when hp_mode_is_dhw[t] > 0.5
+Qroom[t] = Pel_SH[t] = 0 from May 15 through September 30
 ```
 
-`Pel_SH` is therefore total HP electric demand with DHW periods masked out, not
-necessarily a perfect physical space-heating decomposition.
+`space_heating_available` exactly reproduces the EnergyPlus seasonal SH
+lockout. It hard-gates predicted room heat and SH electric power, while the
+thermal transition can react only through `Qroom`. Electricity during the
+summer lockout is also removed from the SH target, covering DHW events missed
+by `hp_mode_is_dhw`.
+
+Training window grids rotate across one stride over the epochs by default;
+validation starts remain fixed and the per-epoch window count is unchanged.
+`--no-rotate-window-starts` restores the old fixed start grid.
 
 ## Added Heating-System State
 
@@ -836,26 +849,24 @@ With:
 the model uses a data-driven bounded recurrent state:
 
 ```text
-s[t+1] = state_bound * tanh(M_t (s[t] / state_bound) + r_t)
+s[t+1] = state_bound * tanh(M_t(c, f_t) (s[t] / state_bound) + b_t(c, f_t))
 ```
 
-where `M_t` and `r_t` are generated from metadata and the exogenous input at
-time `t`.
+Here `f_t` is the current thermal forcing. One joint transition network emits
+both `M_t` and `b_t` from `[c, f_t]` at every timestep, restoring the
+architecture used before the fixed-matrix experiment.
 
 The generated matrix is normalized by Frobenius norm:
 
 ```text
-||M_t||_F <= contracting_gamma
+||M_t(c, f_t)||_F <= contracting_gamma
 ```
 
-therefore:
-
-```text
-||d s[t+1] / d s[t]||_2 <= contracting_gamma
-```
-
-for every metadata/input sequence. This is stronger than the sampled Jacobian
-penalty used by `closed_loop_hp_probabilistic`.
+This guarantees `||M_t||_2 <= contracting_gamma` pointwise. It does not by
+itself bound the complete HP-buffer-temperature Jacobian. In the default
+`unconstrained` Q-to-T mode, both `M_t` and `b_t` depend on predicted `Qroom`
+and `Tin`; the optional sampled whole-state penalty handles that feedback
+empirically.
 
 The HP outputs are still passed through the same buffer-in-series projection as
 `closed_loop_hp`: `Pel_SH` charges bounded stored energy, leakage is applied,
@@ -876,6 +887,44 @@ by the other closed-loop models. Temperature is bounded in normalized units by:
 --contracting-temperature-scale 8.0
 ```
 
+### Structural Positive Q-to-T Path
+
+Contracting deterministic and probabilistic models can instead use:
+
+```bash
+--contracting-temperature-update leaky_equilibrium
+--contracting-temperature-delta-max-c 2.0
+--contracting-q-to-t-mode positive_leaky
+--contracting-q-to-t-time-constants-hours 1 24
+```
+
+This removes `Qroom` from the neural inputs generating `M_t` and `b_t`. A
+separate positive leaky state carries delivered heat:
+
+```text
+g_total(c[, xi]) in [g_min, g_max]
+w_j(c[, xi]) >= 0, sum_j w_j = 1
+lambda_j = exp(-dt / tau_j)
+h_j[t+1] = lambda_j h_j[t]
+             + (1 - lambda_j) w_j g_total Qroom[t]
+T_eq[t] = clip(T_eq,free[t] + sum_j h_j[t+1], -Tbound, Tbound)
+Tin[t+1] = (1 - alpha) Tin[t] + alpha T_eq[t]
+```
+
+The total gain has physical units `degC/(W/m2)` and is bounded with:
+
+```bash
+--contracting-q-to-t-gain-min-c-per-w-m2 0.01
+--contracting-q-to-t-gain-max-c-per-w-m2 2.0
+```
+
+For fixed metadata, particle and current state, increasing delivered room heat
+cannot lower the next equilibrium temperature through the generated matrix or
+bias. Saturation can make the response flat at the configured temperature
+bound, but cannot reverse its sign. In the probabilistic model the gains and
+mode weights are conditioned on the trajectory-persistent `xi`, and the leaky
+heat states are included in sampled full closed-loop Jacobian diagnostics.
+
 Main controls:
 
 ```bash
@@ -887,7 +936,7 @@ Main controls:
 The training log reports:
 
 ```text
-closed_loop_hp_contracting=enabled ... latent_state_guarantee=||dF/ds||_2<=gamma
+closed_loop_hp_contracting=enabled ... thermal_matrix=time_varying pointwise_matrix_guarantee=||M_t||_2<=gamma
 rho_max=<contracting_gamma>
 ```
 
@@ -903,6 +952,17 @@ prediction = [Tin_pred, Qroom_pred, Pel_SH_pred]
 target     = [Tin_true, Qroom_true, Pel_SH_true]
 loss       = mean((prediction - target)^2)
 ```
+
+The pointwise channel weights can be changed with:
+
+```bash
+--closed-loop-trajectory-output-weights 1 1 1
+```
+
+in `Tin Qroom Pel_SH` order. The weights are normalized to mean one, so changing
+them changes the channel tradeoff without changing the nominal loss scale. For
+example, `1 1 0` removes direct pointwise `Pel_SH` MSE while retaining the HP
+mode BCE and the indirect `Pel -> buffer -> Qroom -> Tin` path.
 
 ### Additional Optional Components
 
@@ -953,11 +1013,13 @@ the same probabilistic objective is used, but the sampled thermal model is the
 bounded contractive architecture:
 
 ```text
-s[t+1] = state_bound * tanh(M_t (s[t] / state_bound) + r_t + noise[t])
-||M_t||_F <= contracting_gamma
+s[t+1] = state_bound * tanh(M_t(c, xi, f_t) (s[t] / state_bound) + b_t(c, xi, f_t) + noise[t])
+||M_t(c, xi, f_t)||_F <= contracting_gamma
 ```
 
-Here `xi` conditions the transition, initial state, initial stored energy, HP
+Here `xi` remains fixed over the particle trajectory, while `M_t` is regenerated
+from the current thermal forcing at every step. A joint transition network emits
+both `M_t` and `b_t`. `xi` also conditions the nonlinear forcing, initial state, initial stored energy, HP
 emission, COP, and buffer loss parameters. HP heat still passes through the
 buffer-in-series projection before becoming `Qroom`.
 
@@ -969,12 +1031,110 @@ log1p(Pel_active[t]) ~ Normal(mu[t], sigma[t])
 Pel[t] = m[t] * Pel_active[t]
 ```
 
-During training, the thermal and buffer path uses expected HP power for stable
+By default, the thermal and buffer path uses expected HP power for stable
 differentiability:
 
 ```text
-E[Pel[t]] = pi[t] * (exp(mu[t] + 0.5 sigma[t]^2) - 1)
+E[Pel[t]] = pi[t] * E[expm1(clip(X[t], 0, log1p(Pmax)))]
+X[t] ~ Normal(mu[t], sigma[t]^2)
 ```
+
+The bounded expectation is evaluated analytically and therefore matches the
+clipped active-power distribution used by scenario sampling. It includes both
+the log-normal variance correction and probability mass clipped at zero and at
+`Pmax`.
+
+Stochastic HP propagation can instead be enabled during training with:
+
+```bash
+--prob-hp-training-mode straight_through
+--prob-hp-concrete-temperature 0.5
+```
+
+Each training particle then samples active-power noise and a hard HP on/off
+trace. The forward mode is binary, while its backward derivative uses a Binary
+Concrete relaxation. Thus the energy, variogram, IRES, and soft Best-of-K terms
+see linked sampled `Pel -> E -> Qroom -> Tin` trajectories. The BCE and active
+power NLL remain explicit auxiliary losses. The default
+`--prob-hp-training-mode expected` preserves the previous training behavior.
+
+### Direct flexibility-KPI CRPS
+
+An optional coefficient-level score targets the same upward and downward
+event-study gains used by `flexibility_event_study_kpis.py`:
+
+```bash
+--prob-flex-kpi-crps-weight 1.0
+--prob-flex-kpi-crps-horizons-hours 0.5 1 2 3
+--prob-flex-kpi-crps-setpoint-threshold-c 0.05
+--prob-flex-kpi-crps-min-events 20
+--prob-flex-kpi-crps-ridge 0.001
+--prob-flex-kpi-crps-controls full
+```
+
+For each training window and horizon, the model forms the pre/post HP-power
+responses and fits one fixed ridge-regression design:
+
+```text
+delta_P_H = alpha + beta_plus delta_Tset_plus
+                  + beta_minus delta_Tset_minus + controls
+G_plus = H beta_plus
+G_minus = H beta_minus
+```
+
+The design uses observed setpoints and disturbances. With `full` controls it
+also uses observed pre-event power and temperature, previous setpoint, and
+previous setpoint jump. It is fixed across particles, so every particle
+coefficient is only a linear projection of its predicted `Pel` trace. The loss
+is empirical univariate CRPS averaged over `G_plus`, `G_minus`, horizons, and
+eligible profile windows:
+
+```text
+CRPS = mean_k |G_k - G_true| - 0.5 mean_kl |G_k - G_l|
+```
+
+The coefficients are fitted in normalized training units; conversion to
+Wh/(m2 K) is a constant scaler ratio and therefore does not change the
+calibration target. Ridge regularization and a minimum-event mask stabilize
+short-window regressions. Startup diagnostics report the design dimension,
+effective event requirement, and eligible training windows per horizon.
+Existing behavior is unchanged when the weight is zero, which is the default.
+
+The contracting probabilistic model also has an optional persistent HP
+controller:
+
+```bash
+--prob-hp-activation-model persistent_markov
+--prob-hp-persistent-latent-dim 2
+--prob-hp-controller-leak 0.25
+--prob-hp-controller-noise-scale 0.0
+```
+
+For each particle it samples a dedicated `r_HP ~ Normal(0, I)` once for the
+whole trajectory and carries a bounded controller state `h[t]`. Separate
+transition heads produce:
+
+```text
+p_start[t] = sigmoid(g_start(c, xi, r_HP, h[t], u[t], T[t], E[t]))
+p_stop[t]  = sigmoid(g_stop (c, xi, r_HP, h[t], u[t], T[t], E[t]))
+Pr(m[t]=1) = (1-m[t-1]) p_start[t] + m[t-1] (1-p_stop[t])
+h[t+1]     = (1-leak) h[t] + leak * tanh(f(..., m[t]) + noise[t])
+```
+
+This makes complete on/off spells coherent within a scenario instead of
+sampling unrelated Bernoulli states at every timestep. `r_HP` also conditions
+active power, requested room heat, COP, and buffer-loss parameters. During
+training, `--hp-mode-loss-weight` weights a teacher-forced transition NLL:
+`p_start` is scored on reference-off steps and `p_stop` on reference-on steps.
+The probabilities are averaged across particles before this likelihood is
+evaluated, so the persistent latent is not forced to make every particle
+identical.
+
+`independent` remains the default and preserves the previous HP mode
+architecture. The persistent controller is currently implemented only for
+`closed_loop_hp_contracting_probabilistic`. Its bounded controller and
+previous-mode probability are included in the sampled whole-state Jacobian
+penalty.
 
 Scenario plots use:
 
@@ -996,6 +1156,17 @@ HP on/off BCE
 active HP electric log-power NLL
 ```
 
+The same option:
+
+```bash
+--closed-loop-trajectory-output-weights 1 1 0
+```
+
+removes `Pel_SH` from the trajectory energy score and soft Best-of-K distance.
+It does not disable HP mode BCE, active-power NLL, inactive leakage, IRES, or
+flexibility-coefficient CRPS. The default `1 1 1` preserves the historical
+loss exactly.
+
 ### Probabilistic Closed-Loop Additional Optional Components
 
 Additional weighted terms are:
@@ -1008,9 +1179,18 @@ physics regularization
 sampled closed-loop stability penalty
 ```
 
-In training code, all probabilistic closed-loop losses are computed with
-`hp_scenario_mode="expected"` (differentiable expected electric power path),
-while scenario plots can still use Bernoulli sampling.
+The training HP path is selected independently from plot generation:
+
+```text
+--prob-hp-training-mode expected|straight_through
+--prob-hp-scenario-mode expected|bernoulli
+--prob-hp-activation-model independent|persistent_markov
+```
+
+The straight-through gradient is biased, even though its forward trajectories
+contain hard Bernoulli decisions. The energy score remains proper as a function
+of the sampled predictive trajectories; adding auxiliary losses means the full
+combined objective is not itself a strictly proper score.
 
 The energy score is the proper-scoring-rule component. Once auxiliary terms are
 added, the total objective is no longer strictly proper.
@@ -1025,6 +1205,9 @@ probabilistic closed-loop variants:
 --closed-loop-stability-gamma
 --closed-loop-stability-samples
 --closed-loop-stability-aggregation mean|max
+--closed-loop-stability-every-steps
+--closed-loop-stability-method exact_svd|power_iteration
+--closed-loop-stability-power-iterations
 ```
 
 It samples batch/particle/time states and penalizes:
@@ -1036,11 +1219,22 @@ relu(||dF/ds||_2 - gamma)^2
 where:
 
 ```text
-s = [x, w, E, T]
+s = active recurrent state
 ```
 
-This is only a local sampled regularizer. It is not a formal global stability
-proof.
+The active state contains `[x, E, T]` plus the controller/previous-mode state
+for `persistent_markov`, or the power/mode histories for `power_history`.
+Dormant identity states are excluded. Heteroscedastic-noise checks use sampled
+nonzero noise. The default differentiable power iteration is evaluated only
+once every configured number of optimizer steps; `exact_svd` remains available
+for diagnostics. HP activation uses the differentiable expected transition
+because hard Bernoulli switching has no useful classical Jacobian at its
+boundary. This is still a local sampled regularizer, not a formal global
+stability proof, and finite power iteration can underestimate the largest
+singular value.
+
+Fixed-matrix contracting artifacts have an incompatible parameter tree with the
+restored time-varying production model and must be retrained.
 
 ## Closed-Loop Warm Start
 
@@ -1142,11 +1336,12 @@ so they can prefer narrow deterministic-like checkpoints.
 - The probabilistic closed-loop model can fit mean trajectories after warm-start,
   but temperature intervals can remain too narrow.
 - Stable thermal `A` does not imply full closed-loop stability.
-- `closed_loop_hp_contracting` guarantees recurrent-state contraction, but gives
-  up the explicit HP energy-conservation equation.
+- `closed_loop_hp_contracting` structurally bounds every generated thermal
+  matrix and all reported states/outputs, but does not prove contraction of the
+  complete nonlinear HP feedback map.
 - The Jacobian penalty is local and sampled, not a proof.
-- Training uses expected HP power in the thermal path; Bernoulli HP sampling is
-  used for scenarios/plots.
+- Expected HP training remains the default. Straight-through stochastic HP
+  training is optional and may have higher minibatch gradient variance.
 - The active HP power NLL can dominate the loss if initialized too narrowly or if
   `Pel_SH` has sharp spikes.
 - `Pel_SH` depends on the quality of `hp_mode_is_dhw`.
@@ -1259,6 +1454,27 @@ so they can prefer narrow deterministic-like checkpoints.
   --contracting-temperature-scale 8.0 \
   --save-model
 ```
+
+### Structurally monotone thermostat demand
+
+Both contracting closed-loop models support:
+
+```text
+--hp-thermostat-demand-mode monotone
+```
+
+In this mode the timestep thermostat setpoint is masked from the unrestricted HP
+input encoder. The model instead uses bounded, context-conditioned positive
+slopes and thresholds so latent requested room heat is nondecreasing in
+`Tset - Tin` when metadata, weather, particle latent and current indoor
+temperature are held fixed. HP activation and active power remain unrestricted
+functions of the thermal gap, controller history and buffer energy; this allows
+compressor cycling and delayed buffer charging. Delivered room heat is the
+requested heat capped by available buffer energy, so it is not independently
+forced to be pointwise monotone. The default `unconstrained` mode preserves old
+artifacts and behavior. Optional bounds are exposed through
+`--hp-thermostat-slope-{min,max}` and
+`--hp-thermostat-threshold-{min,max}-c`.
 
 ## Probabilistic Closed-Loop HP Warm Start
 

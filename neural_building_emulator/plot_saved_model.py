@@ -11,6 +11,7 @@ import pandas as pd
 
 from .columns import (
     PROFILE_ID_COLUMN,
+    SPACE_HEATING_AVAILABILITY_COLUMN,
     closed_loop_required_columns,
     required_columns,
 )
@@ -103,7 +104,12 @@ def regenerate_closed_loop_plots(
         columns=closed_loop_required_columns(),
         profile_ids=test_ids,
     )
-    profiles = to_closed_loop_profiles(df)
+    profiles = to_closed_loop_profiles(
+        df,
+        include_space_heating_availability=(
+            SPACE_HEATING_AVAILABILITY_COLUMN in metadata.get("input_columns", [])
+        ),
+    )
     profiles = [profile for profile in profiles if profile.profile_id in set(test_ids)]
     profiles.sort(key=lambda profile: test_ids.index(profile.profile_id))
     if not profiles:

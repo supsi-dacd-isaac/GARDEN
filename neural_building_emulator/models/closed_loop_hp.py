@@ -9,6 +9,7 @@ import jax.numpy as jnp
 from .emulator import MLP, ParameterSlices, parameter_slices
 from .schur import SchurMode, simba_schur_matrix
 from .state_space import StateSpaceMatrices
+from .truncated_bptt import DEFAULT_BPTT_TRUNCATE_STEPS, detach_carry, validate_bptt_truncate_steps
 
 ClosedLoopAux = tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]
 
@@ -54,9 +55,11 @@ class ClosedLoopHPEmulator(eqx.Module):
     outdoor_input_index: int = eqx.field(static=True)
     solar_input_index: int = eqx.field(static=True)
     ventilation_input_index: int = eqx.field(static=True)
+    availability_input_index: int = eqx.field(static=True)
     temperature_target_index: int = eqx.field(static=True)
     qroom_target_index: int = eqx.field(static=True)
     pel_target_index: int = eqx.field(static=True)
+    bptt_truncate_steps: int = eqx.field(static=True)
 
     def __init__(
         self,
@@ -85,6 +88,8 @@ class ClosedLoopHPEmulator(eqx.Module):
         input_scale: tuple[float, ...] = (),
         target_mean: tuple[float, ...] = (),
         target_scale: tuple[float, ...] = (),
+        availability_input_index: int = -1,
+        bptt_truncate_steps: int = DEFAULT_BPTT_TRUNCATE_STEPS,
         key: jax.Array,
     ) -> None:
         if controller_state_dim < 1:
@@ -101,6 +106,7 @@ class ClosedLoopHPEmulator(eqx.Module):
             raise ValueError("hp_qroom_cap_w_m2 must be non-negative")
         if hp_energy_cap_wh_m2 < 0.0:
             raise ValueError("hp_energy_cap_wh_m2 must be non-negative")
+        bptt_truncate_steps = validate_bptt_truncate_steps(bptt_truncate_steps)
         if input_encoder_dim is not None and input_encoder_dim < 1:
             raise ValueError("input_encoder_dim must be positive or None")
         if input_encoder_depth < 1:
@@ -109,6 +115,8 @@ class ClosedLoopHPEmulator(eqx.Module):
             raise ValueError("input_mean and input_scale must match input_dim")
         if len(target_mean) != 3 or len(target_scale) != 3:
             raise ValueError("closed_loop_hp target scalers must have exactly 3 outputs")
+        if availability_input_index >= input_dim:
+            raise ValueError("availability_input_index must be smaller than input_dim")
 
         (
             theta_key,
@@ -186,9 +194,11 @@ class ClosedLoopHPEmulator(eqx.Module):
         self.outdoor_input_index = 1
         self.solar_input_index = 2
         self.ventilation_input_index = 3
+        self.availability_input_index = availability_input_index
         self.temperature_target_index = 0
         self.qroom_target_index = 1
         self.pel_target_index = 2
+        self.bptt_truncate_steps = bptt_truncate_steps
 
     def decode_matrices(self, theta: jnp.ndarray) -> StateSpaceMatrices:
         slices = self.slices
@@ -222,6 +232,15 @@ class ClosedLoopHPEmulator(eqx.Module):
         return (
             value - jnp.asarray(self.target_mean[index], dtype=value.dtype)
         ) / jnp.asarray(self.target_scale[index], dtype=value.dtype)
+
+    def _space_heating_availability(self, input_t: jnp.ndarray) -> jnp.ndarray:
+        if self.availability_input_index < 0:
+            return jnp.asarray(1.0, dtype=input_t.dtype)
+        return jnp.clip(
+            self._physical_input(input_t, self.availability_input_index),
+            jnp.asarray(0.0, dtype=input_t.dtype),
+            jnp.asarray(1.0, dtype=input_t.dtype),
+        )
 
     def _nonnegative_capped(self, value: jnp.ndarray, cap: float) -> jnp.ndarray:
         value = jnp.maximum(value, jnp.asarray(0.0, dtype=value.dtype))
@@ -345,12 +364,14 @@ class ClosedLoopHPEmulator(eqx.Module):
 
         def step(
             carry: tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray],
-            input_t: jnp.ndarray,
+            step_inputs: tuple[jnp.ndarray, jnp.ndarray],
         ) -> tuple[tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray], tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]]:
             x_t, w_t, energy_t, temperature_t = carry
+            time_index, input_t = step_inputs
             features = self._controller_features(input_t, temperature_t, energy_t, w_t)
+            availability_t = self._space_heating_availability(input_t)
 
-            pi_t = jax.nn.sigmoid(self.mode_net(features)[0])
+            pi_t = availability_t * jax.nn.sigmoid(self.mode_net(features)[0])
             pel_base = (
                 jax.nn.softplus(self.pel_net(features)[0])
                 * jnp.asarray(self.target_scale[self.pel_target_index], dtype=input_t.dtype)
@@ -362,7 +383,10 @@ class ClosedLoopHPEmulator(eqx.Module):
                 jax.nn.softplus(self.qroom_net(features)[0])
                 * jnp.asarray(self.target_scale[self.qroom_target_index], dtype=input_t.dtype)
             )
-            qroom_raw_t = self._nonnegative_capped(qroom_raw_t, self.hp_qroom_cap_w_m2)
+            qroom_raw_t = availability_t * self._nonnegative_capped(
+                qroom_raw_t,
+                self.hp_qroom_cap_w_m2,
+            )
             qroom_t, available_power_t, energy_next = self._buffer_draw(
                 energy_t,
                 cop_t * pel_t,
@@ -382,9 +406,17 @@ class ClosedLoopHPEmulator(eqx.Module):
                 [temperature_next, qroom_scaled_t, pel_scaled_t],
             )
             aux_t = (pi_t, cop_t, energy_t, available_power_t, qroom_raw_t)
-            return (x_next, w_next, energy_next, temperature_next), (prediction_t, *aux_t)
+            return detach_carry(
+                (x_next, w_next, energy_next, temperature_next),
+                time_index,
+                self.bptt_truncate_steps,
+            ), (prediction_t, *aux_t)
 
-        _, outputs = jax.lax.scan(step, (x0, w0, e0, temperature0), inputs)
+        _, outputs = jax.lax.scan(
+            step,
+            (x0, w0, e0, temperature0),
+            (jnp.arange(inputs.shape[0]), inputs),
+        )
         predictions, pi, cop, energy, available_power, qroom_raw = outputs
         aux = (pi, cop, energy, available_power, qroom_raw)
         return predictions, aux

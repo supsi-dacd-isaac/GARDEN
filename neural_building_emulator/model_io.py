@@ -13,7 +13,11 @@ import equinox as eqx
 import jax
 import numpy as np
 
-from .columns import DISTURBANCE_COLUMNS
+from .columns import (
+    CLOSED_LOOP_CALENDAR_COLUMNS,
+    DISTURBANCE_COLUMNS,
+    SPACE_HEATING_AVAILABILITY_COLUMN,
+)
 from .models import (
     ClosedLoopHPEmulator,
     ContractingClosedLoopHPEmulator,
@@ -287,6 +291,21 @@ def _build_model_skeleton(
     key = jax.random.PRNGKey(0)
     feedback_scaler_kwargs = _input_encoder_feedback_scaler_kwargs(metadata, scalers)
     switching_scaler_kwargs = _switching_dynamics_scaler_kwargs(metadata, scalers)
+    input_columns = list(metadata.get("input_columns", []))
+    availability_input_index = (
+        input_columns.index(SPACE_HEATING_AVAILABILITY_COLUMN)
+        if SPACE_HEATING_AVAILABILITY_COLUMN in input_columns
+        else -1
+    )
+    hp_controller_masked_input_indices = (
+        ()
+        if bool(config.get("hp_controller_calendar_features", True))
+        else tuple(
+            index
+            for index, column in enumerate(input_columns)
+            if column in CLOSED_LOOP_CALENDAR_COLUMNS
+        )
+    )
 
     if model_kind == "deterministic":
         return MetadataStateSpaceEmulator(
@@ -364,6 +383,8 @@ def _build_model_skeleton(
             input_scale=input_scale,
             target_mean=target_mean,
             target_scale=target_scale,
+            availability_input_index=availability_input_index,
+            bptt_truncate_steps=int(config.get("bptt_truncate_steps", 0)),
             key=key,
         )
 
@@ -385,6 +406,7 @@ def _build_model_skeleton(
             state_bound=float(config.get("contracting_state_bound", 5.0)),
             temperature_output_scale=float(config.get("contracting_temperature_scale", 8.0)),
             temperature_delta_max_c=float(config.get("contracting_temperature_delta_max_c", 0.0)),
+            temperature_update_mode=config.get("contracting_temperature_update", "auto"),
             hp_dt_hours=float(config.get("hp_dt_hours", 0.25)),
             hp_cop_floor=float(config.get("hp_cop_floor", 1.0)),
             hp_cop_cap=float(config.get("hp_cop_cap", 0.0)),
@@ -395,6 +417,31 @@ def _build_model_skeleton(
             input_scale=input_scale,
             target_mean=target_mean,
             target_scale=target_scale,
+            availability_input_index=availability_input_index,
+            bptt_truncate_steps=int(config.get("bptt_truncate_steps", 0)),
+            hp_controller_masked_input_indices=hp_controller_masked_input_indices,
+            thermostat_demand_mode=config.get("hp_thermostat_demand_mode", "unconstrained"),
+            thermostat_slope_min=float(config.get("hp_thermostat_slope_min", 0.1)),
+            thermostat_slope_max=float(config.get("hp_thermostat_slope_max", 6.0)),
+            thermostat_threshold_min_c=float(
+                config.get("hp_thermostat_threshold_min_c", -1.0)
+            ),
+            thermostat_threshold_max_c=float(
+                config.get("hp_thermostat_threshold_max_c", 1.0)
+            ),
+            q_to_t_mode=config.get("contracting_q_to_t_mode", "unconstrained"),
+            q_to_t_time_constants_hours=tuple(
+                float(value)
+                for value in config.get(
+                    "contracting_q_to_t_time_constants_hours", (1.0, 24.0)
+                )
+            ),
+            q_to_t_gain_min_c_per_w_m2=float(
+                config.get("contracting_q_to_t_gain_min_c_per_w_m2", 0.01)
+            ),
+            q_to_t_gain_max_c_per_w_m2=float(
+                config.get("contracting_q_to_t_gain_max_c_per_w_m2", 2.0)
+            ),
             key=key,
         )
 
@@ -417,10 +464,18 @@ def _build_model_skeleton(
             process_noise_mode=config.get("prob_process_noise", "constant"),
             process_noise_init=float(config.get("prob_process_noise_init", -6.0)),
             hp_emission_mode=config.get("prob_hp_emission_mode", "legacy_lognormal_mean"),
+            hp_activation_model=config.get("prob_hp_activation_model", "independent"),
+            hp_persistent_latent_dim=int(config.get("prob_hp_persistent_latent_dim", 2)),
+            hp_controller_leak=float(config.get("prob_hp_controller_leak", 0.25)),
+            hp_controller_noise_scale=float(
+                config.get("prob_hp_controller_noise_scale", 0.0)
+            ),
+            hp_history_hours=float(config.get("prob_hp_history_hours", 3.0)),
             contraction_gamma=float(config.get("contracting_gamma", 0.99)),
             state_bound=float(config.get("contracting_state_bound", 5.0)),
             temperature_output_scale=float(config.get("contracting_temperature_scale", 8.0)),
             temperature_delta_max_c=float(config.get("contracting_temperature_delta_max_c", 0.0)),
+            temperature_update_mode=config.get("contracting_temperature_update", "auto"),
             hp_dt_hours=float(config.get("hp_dt_hours", 0.25)),
             hp_cop_floor=float(config.get("hp_cop_floor", 1.0)),
             hp_cop_cap=float(config.get("hp_cop_cap", 0.0)),
@@ -431,6 +486,31 @@ def _build_model_skeleton(
             input_scale=input_scale,
             target_mean=target_mean,
             target_scale=target_scale,
+            availability_input_index=availability_input_index,
+            bptt_truncate_steps=int(config.get("bptt_truncate_steps", 0)),
+            hp_controller_masked_input_indices=hp_controller_masked_input_indices,
+            thermostat_demand_mode=config.get("hp_thermostat_demand_mode", "unconstrained"),
+            thermostat_slope_min=float(config.get("hp_thermostat_slope_min", 0.1)),
+            thermostat_slope_max=float(config.get("hp_thermostat_slope_max", 6.0)),
+            thermostat_threshold_min_c=float(
+                config.get("hp_thermostat_threshold_min_c", -1.0)
+            ),
+            thermostat_threshold_max_c=float(
+                config.get("hp_thermostat_threshold_max_c", 1.0)
+            ),
+            q_to_t_mode=config.get("contracting_q_to_t_mode", "unconstrained"),
+            q_to_t_time_constants_hours=tuple(
+                float(value)
+                for value in config.get(
+                    "contracting_q_to_t_time_constants_hours", (1.0, 24.0)
+                )
+            ),
+            q_to_t_gain_min_c_per_w_m2=float(
+                config.get("contracting_q_to_t_gain_min_c_per_w_m2", 0.01)
+            ),
+            q_to_t_gain_max_c_per_w_m2=float(
+                config.get("contracting_q_to_t_gain_max_c_per_w_m2", 2.0)
+            ),
             key=key,
         )
 
@@ -466,6 +546,8 @@ def _build_model_skeleton(
             input_scale=input_scale,
             target_mean=target_mean,
             target_scale=target_scale,
+            availability_input_index=availability_input_index,
+            bptt_truncate_steps=int(config.get("bptt_truncate_steps", 0)),
             key=key,
         )
 

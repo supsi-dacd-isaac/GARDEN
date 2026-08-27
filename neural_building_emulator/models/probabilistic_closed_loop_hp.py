@@ -7,30 +7,61 @@ from typing import Literal
 import equinox as eqx
 import jax
 import jax.numpy as jnp
+from jax.scipy.special import ndtr
 
 from .emulator import MLP, ParameterSlices, parameter_slices
 from .schur import SchurMode, simba_schur_matrix
 from .state_space import StateSpaceMatrices
+from .truncated_bptt import DEFAULT_BPTT_TRUNCATE_STEPS, detach_carry, validate_bptt_truncate_steps
 
 ProcessNoiseMode = Literal["none", "constant", "heteroscedastic"]
 HPElectricScenarioMode = Literal["expected", "bernoulli"]
+HPElectricRolloutMode = Literal["expected", "bernoulli", "straight_through"]
+HPTrainingMode = Literal["expected", "straight_through"]
 ProbHpEmissionMode = Literal["bounded", "legacy_lognormal_mean"]
-ProbClosedLoopAux = tuple[
-    jnp.ndarray,
-    jnp.ndarray,
-    jnp.ndarray,
-    jnp.ndarray,
-    jnp.ndarray,
-    jnp.ndarray,
-    jnp.ndarray,
-    jnp.ndarray,
-    jnp.ndarray,
-    jnp.ndarray,
-    jnp.ndarray,
-    jnp.ndarray,
-    jnp.ndarray,
-    jnp.ndarray,
-]
+HPActivationModel = Literal["independent", "persistent_markov", "power_history"]
+ProbClosedLoopAux = tuple[jnp.ndarray, ...]
+
+
+def bounded_lognormal_expm1_mean(
+    log_mu: jnp.ndarray,
+    log_sigma: jnp.ndarray,
+    max_log_active: jnp.ndarray,
+) -> jnp.ndarray:
+    """Return E[expm1(clip(X, 0, L))] for X ~ Normal(mu, sigma^2)."""
+    dtype = log_mu.dtype
+    zero = jnp.asarray(0.0, dtype=dtype)
+    sigma = jnp.maximum(log_sigma, jnp.asarray(1e-6, dtype=dtype))
+    sigma_sq = sigma**2
+    lower_standard = -log_mu / sigma
+    upper_standard = (max_log_active - log_mu) / sigma
+    tilted_lower = (-log_mu - sigma_sq) / sigma
+    tilted_upper = (max_log_active - log_mu - sigma_sq) / sigma
+
+    truncated_exp_mean = jnp.exp(log_mu + 0.5 * sigma_sq) * (
+        ndtr(tilted_upper) - ndtr(tilted_lower)
+    )
+    middle_probability = ndtr(upper_standard) - ndtr(lower_standard)
+    upper_probability = ndtr(-upper_standard)
+    upper_value = jnp.expm1(max_log_active)
+    mean = truncated_exp_mean - middle_probability + upper_value * upper_probability
+    return jnp.clip(mean, zero, upper_value)
+
+
+def straight_through_binary_concrete(
+    mode_logit: jnp.ndarray,
+    uniform: jnp.ndarray,
+    temperature: jnp.ndarray,
+) -> jnp.ndarray:
+    """Sample a hard Bernoulli value with a Binary Concrete surrogate gradient."""
+    dtype = mode_logit.dtype
+    eps = jnp.asarray(1e-6, dtype=dtype)
+    clipped_uniform = jnp.clip(uniform, eps, 1.0 - eps)
+    logistic_noise = jnp.log(clipped_uniform) - jnp.log1p(-clipped_uniform)
+    safe_temperature = jnp.maximum(temperature, eps)
+    soft_sample = jax.nn.sigmoid((mode_logit + logistic_noise) / safe_temperature)
+    hard_sample = (soft_sample >= 0.5).astype(dtype)
+    return soft_sample + jax.lax.stop_gradient(hard_sample - soft_sample)
 
 
 class ProbabilisticClosedLoopHPEmulator(eqx.Module):
@@ -81,9 +112,11 @@ class ProbabilisticClosedLoopHPEmulator(eqx.Module):
     outdoor_input_index: int = eqx.field(static=True)
     solar_input_index: int = eqx.field(static=True)
     ventilation_input_index: int = eqx.field(static=True)
+    availability_input_index: int = eqx.field(static=True)
     temperature_target_index: int = eqx.field(static=True)
     qroom_target_index: int = eqx.field(static=True)
     pel_target_index: int = eqx.field(static=True)
+    bptt_truncate_steps: int = eqx.field(static=True)
 
     def __init__(
         self,
@@ -118,6 +151,8 @@ class ProbabilisticClosedLoopHPEmulator(eqx.Module):
         input_scale: tuple[float, ...] = (),
         target_mean: tuple[float, ...] = (),
         target_scale: tuple[float, ...] = (),
+        availability_input_index: int = -1,
+        bptt_truncate_steps: int = DEFAULT_BPTT_TRUNCATE_STEPS,
         key: jax.Array,
     ) -> None:
         if controller_state_dim < 1:
@@ -136,6 +171,7 @@ class ProbabilisticClosedLoopHPEmulator(eqx.Module):
             raise ValueError("hp_qroom_cap_w_m2 must be non-negative")
         if hp_energy_cap_wh_m2 < 0.0:
             raise ValueError("hp_energy_cap_wh_m2 must be non-negative")
+        bptt_truncate_steps = validate_bptt_truncate_steps(bptt_truncate_steps)
         if input_encoder_dim is not None and input_encoder_dim < 1:
             raise ValueError("input_encoder_dim must be positive or None")
         if input_encoder_depth < 1:
@@ -150,6 +186,8 @@ class ProbabilisticClosedLoopHPEmulator(eqx.Module):
             raise ValueError("input_mean and input_scale must match input_dim")
         if len(target_mean) != 3 or len(target_scale) != 3:
             raise ValueError("closed-loop probabilistic target scalers must have exactly 3 outputs")
+        if availability_input_index >= input_dim:
+            raise ValueError("availability_input_index must be smaller than input_dim")
 
         (
             theta_key,
@@ -253,9 +291,11 @@ class ProbabilisticClosedLoopHPEmulator(eqx.Module):
         self.outdoor_input_index = 1
         self.solar_input_index = 2
         self.ventilation_input_index = 3
+        self.availability_input_index = availability_input_index
         self.temperature_target_index = 0
         self.qroom_target_index = 1
         self.pel_target_index = 2
+        self.bptt_truncate_steps = bptt_truncate_steps
 
     def decode_matrices(self, theta: jnp.ndarray) -> StateSpaceMatrices:
         slices = self.slices
@@ -303,6 +343,15 @@ class ProbabilisticClosedLoopHPEmulator(eqx.Module):
         return (
             value - jnp.asarray(self.target_mean[index], dtype=value.dtype)
         ) / jnp.asarray(self.target_scale[index], dtype=value.dtype)
+
+    def _space_heating_availability(self, input_t: jnp.ndarray) -> jnp.ndarray:
+        if self.availability_input_index < 0:
+            return jnp.asarray(1.0, dtype=input_t.dtype)
+        return jnp.clip(
+            self._physical_input(input_t, self.availability_input_index),
+            jnp.asarray(0.0, dtype=input_t.dtype),
+            jnp.asarray(1.0, dtype=input_t.dtype),
+        )
 
     def _nonnegative_capped(self, value: jnp.ndarray, cap: float) -> jnp.ndarray:
         value = jnp.maximum(value, jnp.asarray(0.0, dtype=value.dtype))
@@ -425,8 +474,11 @@ class ProbabilisticClosedLoopHPEmulator(eqx.Module):
     def hp_emission(
         self,
         features: jnp.ndarray,
+        mode_logit: jnp.ndarray | None = None,
     ) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
-        pi_t = jax.nn.sigmoid(self.mode_net(features)[0])
+        if mode_logit is None:
+            mode_logit = self.mode_net(features)[0]
+        pi_t = jax.nn.sigmoid(mode_logit)
         raw_mu = self.pel_mu_net(features)[0]
         raw_sigma = self.pel_sigma_net(features)[0]
         if self.hp_emission_mode == "legacy_lognormal_mean":
@@ -450,7 +502,7 @@ class ProbabilisticClosedLoopHPEmulator(eqx.Module):
             jnp.asarray(0.05, dtype=features.dtype)
             + jnp.asarray(0.45, dtype=features.dtype) * jax.nn.sigmoid(raw_sigma)
         )
-        expected_active = self._active_power_from_log(log_mu)
+        expected_active = self.expected_active_power(log_mu, log_sigma)
         expected_total = pi_t * expected_active
         return pi_t, log_mu, log_sigma, expected_active, expected_total
 
@@ -475,6 +527,23 @@ class ProbabilisticClosedLoopHPEmulator(eqx.Module):
             self._max_log_active_power(log_active.dtype),
         )
         return jnp.expm1(capped_log_active)
+
+    def expected_active_power(
+        self,
+        log_mu: jnp.ndarray,
+        log_sigma: jnp.ndarray,
+    ) -> jnp.ndarray:
+        if self.hp_emission_mode == "legacy_lognormal_mean":
+            expected_active = jnp.maximum(
+                jnp.expm1(log_mu + 0.5 * log_sigma**2),
+                jnp.asarray(0.0, dtype=log_mu.dtype),
+            )
+            return self._nonnegative_capped(expected_active, self.hp_pel_cap_w_m2)
+        return bounded_lognormal_expm1_mean(
+            log_mu,
+            log_sigma,
+            self._max_log_active_power(log_mu.dtype),
+        )
 
     def _sample_active_power_from_log(self, log_active: jnp.ndarray) -> jnp.ndarray:
         if self.hp_emission_mode == "legacy_lognormal_mean":
@@ -571,11 +640,13 @@ class ProbabilisticClosedLoopHPEmulator(eqx.Module):
         hp_mode_uniform: jnp.ndarray,
         hp_power_noise: jnp.ndarray,
         *,
-        hp_scenario_mode: HPElectricScenarioMode = "expected",
+        hp_scenario_mode: HPElectricRolloutMode = "expected",
+        hp_concrete_temperature: jnp.ndarray | float = 0.5,
     ) -> tuple[jnp.ndarray, ProbClosedLoopAux]:
-        if hp_scenario_mode not in ("expected", "bernoulli"):
-            raise ValueError("hp_scenario_mode must be 'expected' or 'bernoulli'")
-
+        if hp_scenario_mode not in ("expected", "bernoulli", "straight_through"):
+            raise ValueError(
+                "hp_scenario_mode must be 'expected', 'bernoulli', or 'straight_through'"
+            )
         matrices = self.matrices(metadata, xi)
         x0 = self.initial_state(metadata, initial_temperature, xi)
         w0, e0 = self.initial_controller_state(metadata, initial_temperature, xi)
@@ -585,7 +656,7 @@ class ProbabilisticClosedLoopHPEmulator(eqx.Module):
 
         def step(
             carry: tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray],
-            step_inputs: tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray],
+            step_inputs: tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray],
         ) -> tuple[
             tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray],
             tuple[
@@ -606,18 +677,32 @@ class ProbabilisticClosedLoopHPEmulator(eqx.Module):
             ],
         ]:
             x_t, w_t, energy_t, temperature_t = carry
-            input_t, eps_t, mode_uniform_t, power_noise_t = step_inputs
+            time_index, input_t, eps_t, mode_uniform_t, power_noise_t = step_inputs
             features = self._controller_features(input_t, temperature_t, energy_t, w_t)
+            availability_t = self._space_heating_availability(input_t)
 
-            pi_t, log_mu_t, log_sigma_t, expected_active_t, expected_pel_t = self.hp_emission(features)
+            mode_logit_t = self.mode_net(features)[0]
+            pi_t, log_mu_t, log_sigma_t, expected_active_t, expected_pel_t = self.hp_emission(
+                features,
+                mode_logit_t,
+            )
+            pi_t = availability_t * pi_t
+            expected_pel_t = availability_t * expected_pel_t
             if hp_scenario_mode == "expected":
                 hp_on_t = pi_t
                 pel_active_t = expected_active_t
                 pel_t = expected_pel_t
             else:
-                hp_on_t = (mode_uniform_t < pi_t).astype(input_t.dtype)
                 sampled_log_active_t = log_mu_t + log_sigma_t * power_noise_t
                 pel_active_t = self._sample_active_power_from_log(sampled_log_active_t)
+                if hp_scenario_mode == "straight_through":
+                    hp_on_t = availability_t * straight_through_binary_concrete(
+                        mode_logit_t,
+                        mode_uniform_t,
+                        jnp.asarray(hp_concrete_temperature, dtype=input_t.dtype),
+                    )
+                else:
+                    hp_on_t = (mode_uniform_t < pi_t).astype(input_t.dtype)
                 pel_t = self._nonnegative_capped(hp_on_t * pel_active_t, self.hp_pel_cap_w_m2)
 
             cop_t = self._cop(input_t, cop_intercept, cop_slope)
@@ -625,7 +710,10 @@ class ProbabilisticClosedLoopHPEmulator(eqx.Module):
                 jax.nn.softplus(self.qroom_net(features)[0])
                 * jnp.asarray(self.target_scale[self.qroom_target_index], dtype=input_t.dtype)
             )
-            qroom_raw_t = self._nonnegative_capped(qroom_raw_t, self.hp_qroom_cap_w_m2)
+            qroom_raw_t = availability_t * self._nonnegative_capped(
+                qroom_raw_t,
+                self.hp_qroom_cap_w_m2,
+            )
             qroom_t, available_power_t, energy_next = self._buffer_draw(
                 energy_t,
                 cop_t * pel_t,
@@ -658,12 +746,16 @@ class ProbabilisticClosedLoopHPEmulator(eqx.Module):
                 w_t,
                 temperature_t,
             )
-            return (x_next, w_next, energy_next, temperature_next), (prediction_t, *aux_t)
+            return detach_carry(
+                (x_next, w_next, energy_next, temperature_next),
+                time_index,
+                self.bptt_truncate_steps,
+            ), (prediction_t, *aux_t)
 
         _, outputs = jax.lax.scan(
             step,
             (x0, w0, e0, temperature0),
-            (inputs, process_noise, hp_mode_uniform, hp_power_noise),
+            (jnp.arange(inputs.shape[0]), inputs, process_noise, hp_mode_uniform, hp_power_noise),
         )
         (
             predictions,
@@ -707,12 +799,15 @@ class ProbabilisticClosedLoopHPEmulator(eqx.Module):
         key: jax.Array,
         num_particles: int,
         sample_process_noise: bool = True,
-        hp_scenario_mode: HPElectricScenarioMode = "expected",
+        hp_scenario_mode: HPElectricRolloutMode = "expected",
+        hp_concrete_temperature: jnp.ndarray | float = 0.5,
     ) -> tuple[jnp.ndarray, ProbClosedLoopAux]:
         if num_particles < 1:
             raise ValueError("num_particles must be positive")
-        if hp_scenario_mode not in ("expected", "bernoulli"):
-            raise ValueError("hp_scenario_mode must be 'expected' or 'bernoulli'")
+        if hp_scenario_mode not in ("expected", "bernoulli", "straight_through"):
+            raise ValueError(
+                "hp_scenario_mode must be 'expected', 'bernoulli', or 'straight_through'"
+            )
         xi_key, process_key, mode_key, power_key = jax.random.split(key, 4)
         xi = jax.random.normal(xi_key, (num_particles, self.latent_dim))
         if sample_process_noise and self.process_noise_mode != "none":
@@ -731,6 +826,7 @@ class ProbabilisticClosedLoopHPEmulator(eqx.Module):
                 particle_mode_uniform,
                 particle_power_noise,
                 hp_scenario_mode=hp_scenario_mode,
+                hp_concrete_temperature=hp_concrete_temperature,
             )
         )(xi, process_noise, hp_mode_uniform, hp_power_noise)
         return predictions, (*aux, xi)
@@ -744,7 +840,8 @@ class ProbabilisticClosedLoopHPEmulator(eqx.Module):
         key: jax.Array,
         num_particles: int,
         sample_process_noise: bool = True,
-        hp_scenario_mode: HPElectricScenarioMode = "expected",
+        hp_scenario_mode: HPElectricRolloutMode = "expected",
+        hp_concrete_temperature: jnp.ndarray | float = 0.5,
     ) -> jnp.ndarray:
         predictions, _ = self.sample_with_aux(
             metadata,
@@ -754,6 +851,7 @@ class ProbabilisticClosedLoopHPEmulator(eqx.Module):
             num_particles=num_particles,
             sample_process_noise=sample_process_noise,
             hp_scenario_mode=hp_scenario_mode,
+            hp_concrete_temperature=hp_concrete_temperature,
         )
         return predictions
 

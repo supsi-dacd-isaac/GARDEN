@@ -30,6 +30,7 @@ from .columns import (
     METADATA_COLUMNS,
     PROFILE_ID_COLUMN,
     SETPOINT_TIMESERIES_COLUMN,
+    SPACE_HEATING_AVAILABILITY_COLUMN,
     SPACE_HEATING_HP_SIZE_BINDING,
     TARGET_COLUMN,
     ZONE_THERMAL_HEATING_POWER_COLUMN,
@@ -484,6 +485,19 @@ def _calendar_features(datetime_values: np.ndarray) -> np.ndarray:
     ).astype(np.float32)
 
 
+def _space_heating_availability(datetime_values: np.ndarray) -> np.ndarray:
+    """Reproduce the EnergyPlus May 15 through September 30 SH lockout."""
+    datetimes = pd.to_datetime(pd.Series(_simulation_calendar_datetimes(datetime_values)))
+    month = datetimes.dt.month.to_numpy()
+    day = datetimes.dt.day.to_numpy()
+    summer_lockout = (
+        ((month == 5) & (day >= 15))
+        | ((month > 5) & (month < 9))
+        | (month == 9)
+    )
+    return (~summer_lockout).astype(np.float32)
+
+
 def _positive_heating_signal(values: np.ndarray, *, profile_id: int, column: str) -> np.ndarray:
     values = values.astype(np.float32, copy=True)
     negative = values < np.float32(-1e-3)
@@ -496,7 +510,11 @@ def _positive_heating_signal(values: np.ndarray, *, profile_id: int, column: str
     return np.maximum(values, np.float32(0.0))
 
 
-def to_closed_loop_profiles(df: pd.DataFrame) -> list[ClosedLoopProfile]:
+def to_closed_loop_profiles(
+    df: pd.DataFrame,
+    *,
+    include_space_heating_availability: bool = True,
+) -> list[ClosedLoopProfile]:
     """Convert a dataframe split into profile arrays for closed-loop HP training.
 
     The alignment is explicit: exogenous inputs and power targets are taken at t,
@@ -520,12 +538,22 @@ def to_closed_loop_profiles(df: pd.DataFrame) -> list[ClosedLoopProfile]:
         temperature = group.loc[:, TARGET_COLUMN].to_numpy(dtype=np.float32)
         setpoint = group.loc[:, SETPOINT_TIMESERIES_COLUMN].to_numpy(dtype=np.float32)
         disturbances = group.loc[:, DISTURBANCE_COLUMNS].to_numpy(dtype=np.float32)
+        availability = _space_heating_availability(profile_datetime)
         calendar = _calendar_features(profile_datetime)
 
         q_room = group.loc[:, ZONE_THERMAL_HEATING_POWER_COLUMN].to_numpy(dtype=np.float32)
         p_el = group.loc[:, HEAT_PUMP_ELECTRIC_POWER_COLUMN].to_numpy(dtype=np.float32)
         dhw_mode = group.loc[:, HP_MODE_IS_DHW_COLUMN].to_numpy(dtype=np.float32) > np.float32(0.5)
-        p_el = np.where(dhw_mode, np.float32(0.0), p_el)
+        if include_space_heating_availability:
+            space_heating_available = availability > np.float32(0.5)
+            q_room = np.where(space_heating_available, q_room, np.float32(0.0))
+            p_el = np.where(
+                dhw_mode | ~space_heating_available,
+                np.float32(0.0),
+                p_el,
+            )
+        else:
+            p_el = np.where(dhw_mode, np.float32(0.0), p_el)
 
         q_room = _positive_heating_signal(
             q_room,
@@ -540,7 +568,11 @@ def to_closed_loop_profiles(df: pd.DataFrame) -> list[ClosedLoopProfile]:
         q_room = q_room / np.float32(floor_area)
         p_el = p_el / np.float32(floor_area)
 
-        inputs = np.column_stack([setpoint, disturbances, calendar]).astype(np.float32)
+        input_parts: list[np.ndarray] = [setpoint, disturbances]
+        if include_space_heating_availability:
+            input_parts.append(availability)
+        input_parts.append(calendar)
+        inputs = np.column_stack(input_parts).astype(np.float32)
         targets = np.column_stack([temperature[1:], q_room[:-1], p_el[:-1]]).astype(np.float32)
         profiles.append(
             ClosedLoopProfile(
@@ -607,7 +639,19 @@ def to_profiles(
     return profiles
 
 
-def make_windows(profiles: Iterable[BuildingProfile], config: WindowConfig) -> WindowedArrays:
+def _window_starts(last_start: int, stride: int, start_offset: int) -> list[int]:
+    if not 0 <= start_offset < stride:
+        raise ValueError("start_offset must be in [0, stride)")
+    base_starts = range(0, last_start + 1, stride)
+    return [min(start + start_offset, last_start) for start in base_starts]
+
+
+def make_windows(
+    profiles: Iterable[BuildingProfile],
+    config: WindowConfig,
+    *,
+    start_offset: int = 0,
+) -> WindowedArrays:
     """Slice full profiles into fixed-length rollout windows."""
     if config.sequence_length < 2:
         raise ValueError("sequence_length must be at least 2")
@@ -629,7 +673,7 @@ def make_windows(profiles: Iterable[BuildingProfile], config: WindowConfig) -> W
         last_start = n_steps - config.sequence_length - target_offset
         if last_start < 0:
             continue
-        for start in range(0, last_start + 1, config.stride):
+        for start in _window_starts(last_start, config.stride, start_offset):
             end = start + config.sequence_length
             target_start = start + target_offset
             target_end = end + target_offset
@@ -656,6 +700,8 @@ def make_windows(profiles: Iterable[BuildingProfile], config: WindowConfig) -> W
 def make_closed_loop_windows(
     profiles: Iterable[ClosedLoopProfile],
     config: WindowConfig,
+    *,
+    start_offset: int = 0,
 ) -> ClosedLoopWindowedArrays:
     """Slice closed-loop profiles into fixed-length rollout windows."""
     if config.sequence_length < 2:
@@ -675,7 +721,7 @@ def make_closed_loop_windows(
         last_start = n_steps - config.sequence_length
         if last_start < 0:
             continue
-        for start in range(0, last_start + 1, config.stride):
+        for start in _window_starts(last_start, config.stride, start_offset):
             end = start + config.sequence_length
             profile_ids.append(profile.profile_id)
             start_indices.append(start)
