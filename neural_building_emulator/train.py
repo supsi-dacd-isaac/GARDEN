@@ -23,6 +23,7 @@ from .columns import (
     CLOSED_LOOP_TARGET_COLUMNS,
     DISTURBANCE_COLUMNS,
     HEATING_INPUT_COLUMNS,
+    HPPowerAreaNormalization,
     InputFeatureMode,
     SPACE_HEATING_AVAILABILITY_COLUMN,
 )
@@ -74,11 +75,29 @@ from .scaling import (
 )
 
 TargetMode = Literal["absolute", "delta", "residual"]
-CheckpointMetric = Literal["auto", "train_rmse_c", "test_rmse_c"]
+CheckpointMetric = Literal[
+    "auto",
+    "train_rmse_c",
+    "test_rmse_c",
+    "train_total_nrmse",
+    "test_total_nrmse",
+]
 LossNormalization = Literal["none", "window_std"]
 InputEncoderFeedbackMode = Literal["none", "predicted_temperature", "thermal_gaps"]
 ProbProcessNoiseMode = Literal["none", "constant", "heteroscedastic"]
-ContractingTemperatureUpdateMode = Literal["auto", "absolute", "delta", "leaky_equilibrium"]
+ContractingTemperatureUpdateMode = Literal[
+    "auto",
+    "absolute",
+    "delta",
+    "leaky_equilibrium",
+    "bounded_equilibrium",
+    "alpha_bounded_equilibrium",
+]
+ContractingTransitionConditioning = Literal[
+    "state_feedback",
+    "exogenous",
+    "exogenous_additive_feedback",
+]
 ClosedLoopStabilityMethod = Literal["exact_svd", "power_iteration"]
 FlexibilityKpiControls = Literal["none", "weather", "full"]
 ModelKind = Literal[
@@ -150,9 +169,12 @@ class TrainConfig:
     dataset_path: Path = DEFAULT_DATASET_PATH
     max_profiles: int | None = 10
     test_fraction: float = 0.2
+    fixed_test_profile_ids: tuple[int, ...] = ()
+    excluded_profile_ids: tuple[int, ...] = ()
     seed: int = 13
     heating_mode: str = "A"
     heat_input_normalization: str = "per_floor_area"
+    hp_power_area_normalization: HPPowerAreaNormalization = "building_heated_area"
     input_feature_mode: InputFeatureMode = "base"
     heating_regime_window_steps: int = 96 * 7
     heat_on_threshold: float = 1e-6
@@ -261,8 +283,17 @@ class TrainConfig:
     contracting_temperature_scale: float = 8.0
     contracting_temperature_delta_max_c: float = 0.0
     contracting_temperature_update: ContractingTemperatureUpdateMode = "auto"
+    contracting_transition_conditioning: ContractingTransitionConditioning = "state_feedback"
+    contracting_additive_feedback_gain_bound: float = 1.0
     contracting_q_to_t_mode: ThermalQResponseMode = "unconstrained"
-    contracting_q_to_t_time_constants_hours: tuple[float, ...] = (1.0, 24.0)
+    contracting_q_to_t_time_constants_hours: tuple[float, ...] = (
+        0.25,
+        1.0,
+        4.0,
+        16.0,
+        24.0,
+        48.0,
+    )
     contracting_q_to_t_gain_min_c_per_w_m2: float = 0.01
     contracting_q_to_t_gain_max_c_per_w_m2: float = 2.0
     prob_hp_scenario_mode: HPElectricScenarioMode = "bernoulli"
@@ -2362,6 +2393,7 @@ def evaluate_closed_loop(
     metrics = _closed_loop_metrics_from_accumulators(physical_accumulators)
     normalized_metrics = normalized_accumulator.metrics()
     metrics["loss"] = normalized_metrics["rmse"] ** 2
+    metrics["total_nrmse"] = normalized_metrics["rmse"]
     metrics.update(temperature_diagnostics.as_dict())
     return metrics
 
@@ -2492,6 +2524,7 @@ def evaluate_probabilistic_closed_loop(
     metrics.update({f"median_{name}": value for name, value in median_metrics.items()})
     metrics["mean_median_rmse_c"] = mean_median_temperature_accumulator.metrics()["rmse"]
     metrics["loss"] = normalized_accumulator.metrics()["rmse"] ** 2
+    metrics["total_nrmse"] = normalized_accumulator.metrics()["rmse"]
     metrics["median_loss"] = normalized_median_accumulator.metrics()["rmse"] ** 2
     particle_diagnostics["particle_max_abs_error_c"] = (
         float(particle_diagnostics["particle_max_abs_error_c"])
@@ -2550,6 +2583,7 @@ def evaluate(
     physical = physical_accumulator.metrics()
     return {
         "loss": normalized["rmse"] ** 2,
+        "total_nrmse": normalized["rmse"],
         "rmse_c": physical["rmse"],
         "mae_c": physical["mae"],
         "nmae": physical["nmae"],
@@ -2561,11 +2595,14 @@ def resolve_checkpoint_metric(
     metric: CheckpointMetric,
     *,
     has_test_windows: bool,
+    prefer_total_nrmse: bool = False,
 ) -> CheckpointMetric:
     if metric == "auto":
+        if prefer_total_nrmse:
+            return "test_total_nrmse" if has_test_windows else "train_total_nrmse"
         return "test_rmse_c" if has_test_windows else "train_rmse_c"
-    if metric == "test_rmse_c" and not has_test_windows:
-        raise ValueError("checkpoint_metric='test_rmse_c' requires a non-empty test split")
+    if metric.startswith("test_") and not has_test_windows:
+        raise ValueError(f"checkpoint_metric={metric!r} requires a non-empty test split")
     return metric
 
 
@@ -2578,6 +2615,10 @@ def checkpoint_metric_value(
         return train_eval["rmse_c"]
     if metric == "test_rmse_c" and test_eval is not None:
         return test_eval["rmse_c"]
+    if metric == "train_total_nrmse":
+        return train_eval["total_nrmse"]
+    if metric == "test_total_nrmse" and test_eval is not None:
+        return test_eval["total_nrmse"]
     raise ValueError(f"Cannot compute checkpoint metric {metric!r}")
 
 
@@ -3926,6 +3967,11 @@ def run_closed_loop_training(
         )
     if config.heat_input_normalization != "per_floor_area":
         raise ValueError(f"--model-kind {config.model_kind} requires --heat-input-normalization per_floor_area")
+    if config.hp_power_area_normalization not in ("zone_floor_area", "building_heated_area"):
+        raise ValueError(
+            "hp_power_area_normalization must be 'zone_floor_area' or "
+            "'building_heated_area'"
+        )
     if config.hp_controller_state_dim < 1:
         raise ValueError("hp_controller_state_dim must be positive")
     if config.hp_thermostat_demand_mode not in ("unconstrained", "monotone"):
@@ -4006,17 +4052,41 @@ def run_closed_loop_training(
             raise ValueError("contracting_temperature_scale must be positive")
         if config.contracting_temperature_delta_max_c < 0.0:
             raise ValueError("contracting_temperature_delta_max_c must be non-negative")
-        if config.contracting_temperature_update not in ("auto", "absolute", "delta", "leaky_equilibrium"):
+        if config.contracting_temperature_update not in (
+            "auto",
+            "absolute",
+            "delta",
+            "leaky_equilibrium",
+            "bounded_equilibrium",
+            "alpha_bounded_equilibrium",
+        ):
             raise ValueError(
-                "contracting_temperature_update must be 'auto', 'absolute', 'delta', or 'leaky_equilibrium'"
+                "contracting_temperature_update must be 'auto', 'absolute', 'delta', "
+                "'leaky_equilibrium', 'bounded_equilibrium', or "
+                "'alpha_bounded_equilibrium'"
             )
+        if config.contracting_transition_conditioning not in (
+            "state_feedback",
+            "exogenous",
+            "exogenous_additive_feedback",
+        ):
+            raise ValueError(
+                "contracting_transition_conditioning must be 'state_feedback' "
+                "'exogenous', or 'exogenous_additive_feedback'"
+            )
+        if config.contracting_additive_feedback_gain_bound <= 0.0:
+            raise ValueError("contracting_additive_feedback_gain_bound must be positive")
         if (
-            config.contracting_temperature_update == "leaky_equilibrium"
+            config.contracting_temperature_update in (
+                "leaky_equilibrium",
+                "bounded_equilibrium",
+                "alpha_bounded_equilibrium",
+            )
             and config.contracting_temperature_delta_max_c <= 0.0
         ):
             raise ValueError(
-                "--contracting-temperature-update leaky_equilibrium requires "
-                "--contracting-temperature-delta-max-c > 0 so alpha_max is tied to a physical jump cap"
+                "equilibrium-based --contracting-temperature-update modes "
+                "require --contracting-temperature-delta-max-c > 0"
             )
         if config.contracting_q_to_t_mode not in ("unconstrained", "positive_leaky"):
             raise ValueError(
@@ -4047,11 +4117,15 @@ def run_closed_loop_training(
             raise ValueError("contracting Q-to-T gain bounds must satisfy min < max")
         if (
             config.contracting_q_to_t_mode == "positive_leaky"
-            and config.contracting_temperature_update != "leaky_equilibrium"
+            and config.contracting_temperature_update not in (
+                "leaky_equilibrium",
+                "bounded_equilibrium",
+                "alpha_bounded_equilibrium",
+            )
         ):
             raise ValueError(
                 "--contracting-q-to-t-mode positive_leaky requires "
-                "--contracting-temperature-update leaky_equilibrium"
+                "an equilibrium-based --contracting-temperature-update"
             )
     if is_probabilistic:
         if config.prob_particles < 1:
@@ -4177,8 +4251,17 @@ def run_closed_loop_training(
             )
     elif config.init_from_deterministic_artifact is not None:
         raise ValueError("--init-from-deterministic-artifact requires --model-kind closed_loop_hp_probabilistic")
-    if config.checkpoint_metric not in ("auto", "train_rmse_c", "test_rmse_c"):
-        raise ValueError("checkpoint_metric must be 'auto', 'train_rmse_c', or 'test_rmse_c'")
+    if config.checkpoint_metric not in (
+        "auto",
+        "train_rmse_c",
+        "test_rmse_c",
+        "train_total_nrmse",
+        "test_total_nrmse",
+    ):
+        raise ValueError(
+            "checkpoint_metric must be 'auto', 'train_rmse_c', 'test_rmse_c', "
+            "'train_total_nrmse', or 'test_total_nrmse'"
+        )
     if config.early_stopping_patience is not None and config.early_stopping_patience < 1:
         raise ValueError("early_stopping_patience must be positive or None")
     if config.early_stopping_min_delta < 0.0:
@@ -4195,7 +4278,10 @@ def run_closed_loop_training(
         max_profiles=config.max_profiles,
         test_fraction=config.test_fraction,
         seed=config.seed,
+        fixed_test_profile_ids=config.fixed_test_profile_ids,
+        excluded_profile_ids=config.excluded_profile_ids,
         heat_input_normalization="per_floor_area",
+        hp_power_area_normalization=config.hp_power_area_normalization,
         input_feature_mode="base",
     )
     splits = load_closed_loop_result_splits(split_config)
@@ -4216,8 +4302,20 @@ def run_closed_loop_training(
         stride=config.stride,
         target_alignment="same_time",
     )
-    train_profiles = to_closed_loop_profiles(splits.train)
-    test_profiles = to_closed_loop_profiles(splits.test) if splits.test_ids else []
+    train_profiles = to_closed_loop_profiles(
+        splits.train,
+        hp_power_area_normalization=splits.hp_power_area_normalization,
+        metadata_columns=splits.metadata_columns,
+    )
+    test_profiles = (
+        to_closed_loop_profiles(
+            splits.test,
+            hp_power_area_normalization=splits.hp_power_area_normalization,
+            metadata_columns=splits.metadata_columns,
+        )
+        if splits.test_ids
+        else []
+    )
     raw_train_windows = make_closed_loop_windows(train_profiles, window_config)
     raw_test_windows = (
         make_closed_loop_windows(test_profiles, window_config) if splits.test_ids else None
@@ -4239,6 +4337,7 @@ def run_closed_loop_training(
     resolved_checkpoint_metric = resolve_checkpoint_metric(
         config.checkpoint_metric,
         has_test_windows=raw_test_windows is not None,
+        prefer_total_nrmse=True,
     )
 
     scalers = fit_window_scalers(raw_train_windows)  # type: ignore[arg-type]
@@ -4375,6 +4474,10 @@ def run_closed_loop_training(
             temperature_output_scale=config.contracting_temperature_scale,
             temperature_delta_max_c=config.contracting_temperature_delta_max_c,
             temperature_update_mode=config.contracting_temperature_update,
+            transition_conditioning=config.contracting_transition_conditioning,
+            additive_feedback_gain_bound=(
+                config.contracting_additive_feedback_gain_bound
+            ),
             hp_dt_hours=config.hp_dt_hours,
             hp_cop_floor=config.hp_cop_floor,
             hp_cop_cap=hp_cop_cap,
@@ -4455,6 +4558,10 @@ def run_closed_loop_training(
             temperature_output_scale=config.contracting_temperature_scale,
             temperature_delta_max_c=config.contracting_temperature_delta_max_c,
             temperature_update_mode=config.contracting_temperature_update,
+            transition_conditioning=config.contracting_transition_conditioning,
+            additive_feedback_gain_bound=(
+                config.contracting_additive_feedback_gain_bound
+            ),
             hp_dt_hours=config.hp_dt_hours,
             hp_cop_floor=config.hp_cop_floor,
             hp_cop_cap=hp_cop_cap,
@@ -4583,6 +4690,9 @@ def run_closed_loop_training(
             f"temperature_output_scale={config.contracting_temperature_scale} "
             f"temperature_delta_max_c={config.contracting_temperature_delta_max_c} "
             f"temperature_update={config.contracting_temperature_update} "
+            f"transition_conditioning={config.contracting_transition_conditioning} "
+            f"additive_feedback_gain_bound="
+            f"{config.contracting_additive_feedback_gain_bound} "
             "thermal_matrix=time_varying "
             "pointwise_matrix_guarantee=||M_t||_2<=gamma"
         )
@@ -4590,11 +4700,38 @@ def run_closed_loop_training(
             "closed_loop_hp_contracting_causal_structure="
             "Tset_and_availability_to_HP_head; "
             + (
-                "thermal_transition_uses=[u_without_Tset_or_availability,Tin,Tout_minus_Tin]; "
+                (
+                    "thermal_transition_uses=[u_without_Tset_or_availability]; "
+                    if config.contracting_transition_conditioning == "exogenous"
+                    else (
+                        "thermal_matrix_uses=[u_without_Tset_or_availability]; "
+                        "thermal_additive_feedback_uses="
+                        "[u_without_Tset_or_availability,Tin,Tout_minus_Tin]; "
+                        if config.contracting_transition_conditioning
+                        == "exogenous_additive_feedback"
+                        else "thermal_transition_uses="
+                        "[u_without_Tset_or_availability,Tin,Tout_minus_Tin]; "
+                    )
+                )
+                +
                 "Qroom_to_temperature=separate_positive_leaky_path"
                 if config.contracting_q_to_t_mode == "positive_leaky"
-                else "thermal_transition_uses=[u_without_Tset_or_availability,Qroom,Tin,Tout_minus_Tin]; "
-                "Qroom_to_temperature=unconstrained"
+                else (
+                    (
+                        "thermal_transition_uses=[u_without_Tset_or_availability]; "
+                        if config.contracting_transition_conditioning == "exogenous"
+                        else (
+                            "thermal_matrix_uses=[u_without_Tset_or_availability]; "
+                            "thermal_additive_feedback_uses="
+                            "[u_without_Tset_or_availability,Qroom,Tin,Tout_minus_Tin]; "
+                            if config.contracting_transition_conditioning
+                            == "exogenous_additive_feedback"
+                            else "thermal_transition_uses="
+                            "[u_without_Tset_or_availability,Qroom,Tin,Tout_minus_Tin]; "
+                        )
+                    )
+                    + "Qroom_to_temperature=unconstrained"
+                )
             )
         )
         print(
@@ -4615,11 +4752,36 @@ def run_closed_loop_training(
                 ),
                 1.0,
             )
+            alpha_conditioning = (
+                "metadata_and_xi"
+                if is_contracting_probabilistic
+                else "metadata"
+            )
             print(
                 "closed_loop_hp_contracting_temperature_update=leaky_equilibrium "
                 f"alpha_max={temperature_alpha_max:.6g} "
                 f"max_step_c={config.contracting_temperature_delta_max_c:.6g} "
-                "alpha_is_rollout_constant=metadata_conditioned"
+                "alpha_is_rollout_constant=true "
+                f"alpha_conditioning={alpha_conditioning}"
+            )
+        elif config.contracting_temperature_update == "bounded_equilibrium":
+            print(
+                "closed_loop_hp_contracting_temperature_update=bounded_equilibrium "
+                f"max_step_c={config.contracting_temperature_delta_max_c:.6g} "
+                "alpha=removed update=delta_max*tanh((T_eq-T)/delta_max)"
+            )
+        elif config.contracting_temperature_update == "alpha_bounded_equilibrium":
+            alpha_conditioning = (
+                "metadata_and_xi"
+                if is_contracting_probabilistic
+                else "metadata"
+            )
+            print(
+                "closed_loop_hp_contracting_temperature_update=alpha_bounded_equilibrium "
+                f"max_step_c={config.contracting_temperature_delta_max_c:.6g} "
+                "alpha_range=(0,1) alpha_is_rollout_constant=true "
+                f"alpha_conditioning={alpha_conditioning} "
+                "update=delta_max*tanh(alpha*(T_eq-T)/delta_max)"
             )
     else:
         print(
@@ -4629,6 +4791,10 @@ def run_closed_loop_training(
             f"mode_loss_weight={config.hp_mode_loss_weight} "
             f"cop_floor={config.hp_cop_floor}"
         )
+    print(
+        "closed_loop_hp_power_normalization "
+        f"qroom_area=zone_floor_area pel_area={config.hp_power_area_normalization}"
+    )
     if is_contracting:
         print(
             "closed_loop_hp_contracting_caps "
@@ -4964,6 +5130,7 @@ def run_closed_loop_training(
         rho_max = sample_spectral_radius(model, epoch_train_windows)
         message = (
             f"epoch={epoch:03d} train_loss={train_loss_mean:.6f} "
+            f"train_total_nrmse={train_eval['total_nrmse']:.4f} "
             f"train_rmse_c={train_eval['rmse_c']:.4f} "
             f"train_qroom_rmse_w_m2={train_eval['qroom_rmse_w_m2']:.4f} "
             f"train_pel_rmse_w_m2={train_eval['pel_rmse_w_m2']:.4f} "
@@ -4973,6 +5140,7 @@ def run_closed_loop_training(
         )
         if full_train_eval is not None:
             message += (
+                f" full_train_total_nrmse={full_train_eval['total_nrmse']:.4f}"
                 f" full_train_rmse_c={full_train_eval['rmse_c']:.4f}"
                 f" full_train_qroom_rmse_w_m2={full_train_eval['qroom_rmse_w_m2']:.4f}"
                 f" full_train_pel_rmse_w_m2={full_train_eval['pel_rmse_w_m2']:.4f}"
@@ -5064,6 +5232,7 @@ def run_closed_loop_training(
                     batch_size=config.batch_size,
                 )
             message += (
+                f" test_total_nrmse={test_eval['total_nrmse']:.4f}"
                 f" test_rmse_c={test_eval['rmse_c']:.4f}"
                 f" test_qroom_rmse_w_m2={test_eval['qroom_rmse_w_m2']:.4f}"
                 f" test_pel_rmse_w_m2={test_eval['pel_rmse_w_m2']:.4f}"
@@ -5144,11 +5313,15 @@ def run_closed_loop_training(
             "train_eval_total_windows": epoch_train_windows.targets.shape[0],
             "train_window_offset": train_window_offset,
             "full_train_eval_every_epochs": config.full_train_eval_every_epochs,
+            "train_total_nrmse": train_eval["total_nrmse"],
             "train_rmse_c": train_eval["rmse_c"],
             "train_qroom_rmse_w_m2": train_eval["qroom_rmse_w_m2"],
             "train_pel_rmse_w_m2": train_eval["pel_rmse_w_m2"],
             "full_train_rmse_c": (
                 full_train_eval["rmse_c"] if full_train_eval is not None else ""
+            ),
+            "full_train_total_nrmse": (
+                full_train_eval["total_nrmse"] if full_train_eval is not None else ""
             ),
             "full_train_qroom_rmse_w_m2": (
                 full_train_eval["qroom_rmse_w_m2"] if full_train_eval is not None else ""
@@ -5160,6 +5333,7 @@ def run_closed_loop_training(
         if test_eval is not None:
             diagnostics_row.update(
                 {
+                    "test_total_nrmse": test_eval["total_nrmse"],
                     "test_rmse_c": test_eval["rmse_c"],
                     "test_qroom_rmse_w_m2": test_eval["qroom_rmse_w_m2"],
                     "test_pel_rmse_w_m2": test_eval["pel_rmse_w_m2"],
@@ -5168,6 +5342,7 @@ def run_closed_loop_training(
         else:
             diagnostics_row.update(
                 {
+                    "test_total_nrmse": "",
                     "test_rmse_c": "",
                     "test_qroom_rmse_w_m2": "",
                     "test_pel_rmse_w_m2": "",
@@ -5266,6 +5441,7 @@ def run_closed_loop_training(
     if best_train_eval is not None:
         print(
             "selected_train_metrics "
+            f"total_nrmse={best_train_eval['total_nrmse']:.4f} "
             f"rmse_c={best_train_eval['rmse_c']:.4f} "
             f"qroom_rmse_w_m2={best_train_eval['qroom_rmse_w_m2']:.4f} "
             f"pel_rmse_w_m2={best_train_eval['pel_rmse_w_m2']:.4f}"
@@ -5273,6 +5449,7 @@ def run_closed_loop_training(
     if best_test_eval is not None:
         print(
             "selected_test_metrics "
+            f"total_nrmse={best_test_eval['total_nrmse']:.4f} "
             f"rmse_c={best_test_eval['rmse_c']:.4f} "
             f"qroom_rmse_w_m2={best_test_eval['qroom_rmse_w_m2']:.4f} "
             f"pel_rmse_w_m2={best_test_eval['pel_rmse_w_m2']:.4f}"
@@ -5465,8 +5642,17 @@ def run_training(config: TrainConfig) -> EmulatorModel:
         raise ValueError("prob_horizon_weight_power must be non-negative")
     if any(lag < 1 for lag in config.prob_variogram_lags):
         raise ValueError("prob_variogram_lags must be positive")
-    if config.checkpoint_metric not in ("auto", "train_rmse_c", "test_rmse_c"):
-        raise ValueError("checkpoint_metric must be 'auto', 'train_rmse_c', or 'test_rmse_c'")
+    if config.checkpoint_metric not in (
+        "auto",
+        "train_rmse_c",
+        "test_rmse_c",
+        "train_total_nrmse",
+        "test_total_nrmse",
+    ):
+        raise ValueError(
+            "checkpoint_metric must be 'auto', 'train_rmse_c', 'test_rmse_c', "
+            "'train_total_nrmse', or 'test_total_nrmse'"
+        )
     if config.early_stopping_patience is not None and config.early_stopping_patience < 1:
         raise ValueError("early_stopping_patience must be positive or None")
     if config.early_stopping_min_delta < 0.0:
@@ -5491,7 +5677,10 @@ def run_training(config: TrainConfig) -> EmulatorModel:
         max_profiles=config.max_profiles,
         test_fraction=config.test_fraction,
         seed=config.seed,
+        fixed_test_profile_ids=config.fixed_test_profile_ids,
+        excluded_profile_ids=config.excluded_profile_ids,
         heat_input_normalization=config.heat_input_normalization,  # type: ignore[arg-type]
+        hp_power_area_normalization=config.hp_power_area_normalization,
         input_feature_mode=config.input_feature_mode,
         heating_regime_window_steps=config.heating_regime_window_steps,
     )
@@ -5515,6 +5704,7 @@ def run_training(config: TrainConfig) -> EmulatorModel:
         splits.input_feature_mode,
         splits.heating_regime_window_steps,
         config.heat_on_threshold,
+        splits.hp_power_area_normalization,
     )
     test_profiles = (
         to_profiles(
@@ -5524,6 +5714,7 @@ def run_training(config: TrainConfig) -> EmulatorModel:
             splits.input_feature_mode,
             splits.heating_regime_window_steps,
             config.heat_on_threshold,
+            splits.hp_power_area_normalization,
         )
         if splits.test_ids
         else []
@@ -5634,6 +5825,11 @@ def run_training(config: TrainConfig) -> EmulatorModel:
 
     print(f"heating_mode={splits.heating_mode}")
     print(f"heat_input_normalization={splits.heat_input_normalization}")
+    if splits.heating_mode == "heating_electric":
+        print(
+            "hp_power_area_normalization="
+            f"{splits.hp_power_area_normalization}"
+        )
     print(
         "input_feature_mode="
         f"{splits.input_feature_mode} "
@@ -6293,9 +6489,18 @@ def parse_args() -> TrainConfig:
     )
     parser.add_argument(
         "--checkpoint-metric",
-        choices=("auto", "train_rmse_c", "test_rmse_c"),
+        choices=(
+            "auto",
+            "train_rmse_c",
+            "test_rmse_c",
+            "train_total_nrmse",
+            "test_total_nrmse",
+        ),
         default="auto",
-        help="Metric used to select the best in-memory checkpoint. Auto prefers test_rmse_c when available.",
+        help=(
+            "Metric used to select the best in-memory checkpoint. Auto uses equal-channel "
+            "normalized RMSE for closed-loop HP models and temperature RMSE for Q-to-T."
+        ),
     )
     parser.add_argument(
         "--early-stopping-patience",
@@ -6629,14 +6834,52 @@ def parse_args() -> TrainConfig:
     )
     parser.add_argument(
         "--contracting-temperature-update",
-        choices=("auto", "absolute", "delta", "leaky_equilibrium"),
+        choices=(
+            "auto",
+            "absolute",
+            "delta",
+            "leaky_equilibrium",
+            "bounded_equilibrium",
+            "alpha_bounded_equilibrium",
+        ),
         default="auto",
         help=(
             "Temperature readout used by contracting closed-loop models. 'auto' preserves "
             "the legacy behavior: absolute when --contracting-temperature-delta-max-c is 0, "
             "additive delta when it is positive. 'leaky_equilibrium' uses "
             "T[t+1]=(1-alpha)T[t]+alpha*T_eq[t] with rollout-constant learned alpha and "
-            "alpha_max derived from --contracting-temperature-delta-max-c."
+            "alpha_max derived from --contracting-temperature-delta-max-c. "
+            "'bounded_equilibrium' removes alpha and uses "
+            "T[t+1]=T[t]+delta_max*tanh((T_eq[t]-T[t])/delta_max). "
+            "'alpha_bounded_equilibrium' additionally learns rollout-constant alpha in "
+            "(0,1) and places it inside tanh."
+        ),
+    )
+    parser.add_argument(
+        "--contracting-transition-conditioning",
+        choices=(
+            "state_feedback",
+            "exogenous",
+            "exogenous_additive_feedback",
+        ),
+        default="state_feedback",
+        help=(
+            "Inputs used by the neural generator of M_t and b_t. 'state_feedback' "
+            "preserves the existing Tin/Tout-Tin (and unconstrained Qroom) feedback. "
+            "'exogenous' restricts the generator to metadata, persistent xi, and "
+            "exogenous time-varying inputs while preserving the same parameter shape. "
+            "'exogenous_additive_feedback' generates bounded M_t, B_t, and b_t from "
+            "exogenous inputs and injects encoded Tin/Tout-Tin feedback only through "
+            "the additive B_t z_t path."
+        ),
+    )
+    parser.add_argument(
+        "--contracting-additive-feedback-gain-bound",
+        type=float,
+        default=1.0,
+        help=(
+            "Frobenius-norm bound for B_t in the "
+            "exogenous_additive_feedback transition mode."
         ),
     )
     parser.add_argument(
@@ -6648,14 +6891,14 @@ def parse_args() -> TrainConfig:
             "'unconstrained' keeps Qroom in the neural transition forcing. "
             "'positive_leaky' removes Qroom from the generated matrix/bias inputs and "
             "injects it through separate positive leaky thermal modes; it requires "
-            "--contracting-temperature-update leaky_equilibrium."
+            "an equilibrium-based --contracting-temperature-update."
         ),
     )
     parser.add_argument(
         "--contracting-q-to-t-time-constants-hours",
         type=float,
         nargs="+",
-        default=(1.0, 24.0),
+        default=(0.25, 1.0, 4.0, 16.0, 24.0, 48.0),
         help=(
             "Fixed positive time constants in hours for the structural positive "
             "Qroom-to-temperature modes."
@@ -6816,6 +7059,16 @@ def parse_args() -> TrainConfig:
         help="Closed-loop HP energy balance timestep in hours.",
     )
     parser.add_argument(
+        "--hp-power-area-normalization",
+        choices=("building_heated_area", "zone_floor_area"),
+        default="building_heated_area",
+        help=(
+            "Area used to convert whole-building HP electric power to W/m2. "
+            "The corrected default uses floor_area*totalFloors; zone_floor_area "
+            "reproduces legacy artifacts and should not be used for new training."
+        ),
+    )
+    parser.add_argument(
         "--hp-mode-loss-weight",
         type=float,
         default=0.1,
@@ -6896,6 +7149,7 @@ def parse_args() -> TrainConfig:
         heating_mode=args.heating_mode,
         model_kind=args.model_kind,
         heat_input_normalization=args.heat_input_normalization,
+        hp_power_area_normalization=args.hp_power_area_normalization,
         input_feature_mode=args.input_feature_mode,
         heating_regime_window_steps=args.heating_regime_window_steps,
         heat_on_threshold=args.heat_on_threshold,
@@ -7014,6 +7268,12 @@ def parse_args() -> TrainConfig:
         contracting_temperature_scale=args.contracting_temperature_scale,
         contracting_temperature_delta_max_c=args.contracting_temperature_delta_max_c,
         contracting_temperature_update=args.contracting_temperature_update,
+        contracting_transition_conditioning=(
+            args.contracting_transition_conditioning
+        ),
+        contracting_additive_feedback_gain_bound=(
+            args.contracting_additive_feedback_gain_bound
+        ),
         contracting_q_to_t_mode=args.contracting_q_to_t_mode,
         contracting_q_to_t_time_constants_hours=tuple(
             args.contracting_q_to_t_time_constants_hours

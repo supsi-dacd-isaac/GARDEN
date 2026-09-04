@@ -25,6 +25,7 @@ dependencies = [
     "notebook>=7.4.5",
     "numba>=0.62.0",
     "optax>=0.2.8",
+    "optuna>=4.9.0",
     "plotly>=6.3.0",
     "pvlib>=0.13.1",
     "pyomo>=6.9.4",

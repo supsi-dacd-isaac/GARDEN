@@ -22,6 +22,7 @@ from .contracting_closed_loop_hp import (
     TemperatureUpdateMode,
     ThermalQResponseMode,
     ThermostatDemandMode,
+    TransitionConditioningMode,
 )
 from .truncated_bptt import DEFAULT_BPTT_TRUNCATE_STEPS, detach_carry, validate_bptt_truncate_steps
 
@@ -38,6 +39,7 @@ class ProbabilisticContractingClosedLoopHPEmulator(eqx.Module):
 
     input_encoder: MLP | None
     transition_net: MLP
+    transition_forcing_encoder: MLP | None
     x0_net: MLP
     e0_net: MLP
     hp_param_net: MLP
@@ -96,6 +98,9 @@ class ProbabilisticContractingClosedLoopHPEmulator(eqx.Module):
     pel_target_index: int = eqx.field(static=True)
     bptt_truncate_steps: int = eqx.field(static=True)
     transition_matrix_mode: Literal["fixed", "time_varying"] = eqx.field(static=True)
+    transition_conditioning: TransitionConditioningMode = eqx.field(static=True)
+    additive_feedback_gain_bound: float = eqx.field(static=True)
+    transition_forcing_encoded_dim: int = eqx.field(static=True)
     hp_controller_masked_input_indices: tuple[int, ...] = eqx.field(static=True)
     thermostat_demand_mode: ThermostatDemandMode = eqx.field(static=True)
     thermostat_slope_min: float = eqx.field(static=True)
@@ -149,6 +154,8 @@ class ProbabilisticContractingClosedLoopHPEmulator(eqx.Module):
         availability_input_index: int = -1,
         bptt_truncate_steps: int = DEFAULT_BPTT_TRUNCATE_STEPS,
         transition_matrix_mode: Literal["fixed", "time_varying"] = "time_varying",
+        transition_conditioning: TransitionConditioningMode = "state_feedback",
+        additive_feedback_gain_bound: float = 1.0,
         hp_controller_masked_input_indices: tuple[int, ...] = (),
         thermostat_demand_mode: ThermostatDemandMode = "unconstrained",
         thermostat_slope_min: float = 0.1,
@@ -156,7 +163,14 @@ class ProbabilisticContractingClosedLoopHPEmulator(eqx.Module):
         thermostat_threshold_min_c: float = -1.0,
         thermostat_threshold_max_c: float = 1.0,
         q_to_t_mode: ThermalQResponseMode = "unconstrained",
-        q_to_t_time_constants_hours: tuple[float, ...] = (1.0, 24.0),
+        q_to_t_time_constants_hours: tuple[float, ...] = (
+            0.25,
+            1.0,
+            4.0,
+            16.0,
+            24.0,
+            48.0,
+        ),
         q_to_t_gain_min_c_per_w_m2: float = 0.01,
         q_to_t_gain_max_c_per_w_m2: float = 2.0,
         key: jax.Array,
@@ -207,12 +221,32 @@ class ProbabilisticContractingClosedLoopHPEmulator(eqx.Module):
             raise ValueError("temperature_output_scale must be positive")
         if temperature_delta_max_c < 0.0:
             raise ValueError("temperature_delta_max_c must be non-negative")
-        if temperature_update_mode not in ("auto", "absolute", "delta", "leaky_equilibrium"):
+        if temperature_update_mode not in (
+            "auto",
+            "absolute",
+            "delta",
+            "leaky_equilibrium",
+            "bounded_equilibrium",
+            "alpha_bounded_equilibrium",
+        ):
             raise ValueError(
-                "temperature_update_mode must be 'auto', 'absolute', 'delta', or 'leaky_equilibrium'"
+                "temperature_update_mode must be 'auto', 'absolute', 'delta', "
+                "'leaky_equilibrium', 'bounded_equilibrium', or "
+                "'alpha_bounded_equilibrium'"
             )
         if transition_matrix_mode not in ("fixed", "time_varying"):
             raise ValueError("transition_matrix_mode must be 'fixed' or 'time_varying'")
+        if transition_conditioning not in (
+            "state_feedback",
+            "exogenous",
+            "exogenous_additive_feedback",
+        ):
+            raise ValueError(
+                "transition_conditioning must be 'state_feedback', 'exogenous', "
+                "or 'exogenous_additive_feedback'"
+            )
+        if additive_feedback_gain_bound <= 0.0:
+            raise ValueError("additive_feedback_gain_bound must be positive")
         if hp_dt_hours <= 0.0:
             raise ValueError("hp_dt_hours must be positive")
         if hp_cop_floor <= 0.0:
@@ -249,10 +283,26 @@ class ProbabilisticContractingClosedLoopHPEmulator(eqx.Module):
         resolved_temperature_update = temperature_update_mode
         if resolved_temperature_update == "auto":
             resolved_temperature_update = "delta" if temperature_delta_max_c > 0.0 else "absolute"
-        if q_to_t_mode == "positive_leaky" and resolved_temperature_update != "leaky_equilibrium":
+        if (
+            resolved_temperature_update in (
+                "bounded_equilibrium",
+                "alpha_bounded_equilibrium",
+            )
+            and temperature_delta_max_c <= 0.0
+        ):
+            raise ValueError(
+                "bounded equilibrium temperature updates require "
+                "temperature_delta_max_c > 0"
+            )
+        if q_to_t_mode == "positive_leaky" and resolved_temperature_update not in (
+            "leaky_equilibrium",
+            "bounded_equilibrium",
+            "alpha_bounded_equilibrium",
+        ):
             raise ValueError(
                 "q_to_t_mode='positive_leaky' requires temperature_update_mode="
-                "'leaky_equilibrium'"
+                "'leaky_equilibrium', 'bounded_equilibrium', or "
+                "'alpha_bounded_equilibrium'"
             )
         bptt_truncate_steps = validate_bptt_truncate_steps(bptt_truncate_steps)
         if len(input_mean) != input_dim or len(input_scale) != input_dim:
@@ -284,8 +334,12 @@ class ProbabilisticContractingClosedLoopHPEmulator(eqx.Module):
         alpha_key = jax.random.fold_in(temperature_key, 1)
         q_response_key = jax.random.fold_in(temperature_key, 2)
         q_response_init_key = jax.random.fold_in(temperature_key, 3)
+        transition_forcing_key = jax.random.fold_in(transition_key, 1)
         encoded_input_dim = input_dim if input_encoder_dim is None else input_encoder_dim
         thermal_forcing_dim = input_dim + (1 if q_to_t_mode == "positive_leaky" else 2)
+        transition_forcing_encoded_dim = (
+            thermal_forcing_dim if input_encoder_dim is None else input_encoder_dim
+        )
         uses_persistent_controller = hp_activation_model == "persistent_markov"
         uses_power_history = hp_activation_model == "power_history"
         hp_history_feature_dim = (
@@ -297,6 +351,8 @@ class ProbabilisticContractingClosedLoopHPEmulator(eqx.Module):
         generator_input_dim = metadata_dim + latent_dim
         transition_input_dim = generator_input_dim + thermal_forcing_dim
         transition_output_dim = state_dim * state_dim + state_dim
+        if transition_conditioning == "exogenous_additive_feedback":
+            transition_output_dim += state_dim * transition_forcing_encoded_dim
         output_input_dim = (
             generator_input_dim
             + encoded_input_dim
@@ -322,6 +378,15 @@ class ProbabilisticContractingClosedLoopHPEmulator(eqx.Module):
             depth=depth,
             key=transition_key,
         )
+        self.transition_forcing_encoder = None
+        if transition_conditioning == "exogenous_additive_feedback":
+            self.transition_forcing_encoder = MLP(
+                thermal_forcing_dim,
+                transition_forcing_encoded_dim,
+                hidden_dim=input_encoder_hidden_dim or hidden_dim,
+                depth=input_encoder_depth,
+                key=transition_forcing_key,
+            )
         self.x0_net = MLP(metadata_dim + 1 + latent_dim, state_dim, hidden_dim=hidden_dim, depth=depth, key=x0_key)
         self.e0_net = MLP(metadata_dim + 1 + latent_dim, 1, hidden_dim=hidden_dim, depth=depth, key=e0_key)
         self.hp_param_net = MLP(
@@ -347,7 +412,10 @@ class ProbabilisticContractingClosedLoopHPEmulator(eqx.Module):
             key=temperature_key,
         )
         self.temperature_alpha_net = None
-        if temperature_update_mode == "leaky_equilibrium":
+        if temperature_update_mode in (
+            "leaky_equilibrium",
+            "alpha_bounded_equilibrium",
+        ):
             self.temperature_alpha_net = MLP(
                 generator_input_dim,
                 1,
@@ -467,6 +535,9 @@ class ProbabilisticContractingClosedLoopHPEmulator(eqx.Module):
         self.pel_target_index = 2
         self.bptt_truncate_steps = bptt_truncate_steps
         self.transition_matrix_mode = transition_matrix_mode
+        self.transition_conditioning = transition_conditioning
+        self.additive_feedback_gain_bound = float(additive_feedback_gain_bound)
+        self.transition_forcing_encoded_dim = transition_forcing_encoded_dim
         self.hp_controller_masked_input_indices = hp_controller_masked_input_indices
         self.thermostat_demand_mode = thermostat_demand_mode
         self.thermostat_slope_min = float(thermostat_slope_min)
@@ -518,7 +589,11 @@ class ProbabilisticContractingClosedLoopHPEmulator(eqx.Module):
         mode = self._resolved_temperature_update_mode()
         if mode == "absolute":
             return bound * jnp.tanh(raw_temperature)
-        if mode == "leaky_equilibrium":
+        if mode in (
+            "leaky_equilibrium",
+            "bounded_equilibrium",
+            "alpha_bounded_equilibrium",
+        ):
             target_scale = jnp.maximum(
                 jnp.abs(
                     jnp.asarray(
@@ -534,7 +609,22 @@ class ProbabilisticContractingClosedLoopHPEmulator(eqx.Module):
                 -bound,
                 bound,
             )
-            return (1.0 - alpha_t) * previous_temperature_scaled + alpha_t * equilibrium_scaled
+            if mode == "leaky_equilibrium":
+                return (
+                    (1.0 - alpha_t) * previous_temperature_scaled
+                    + alpha_t * equilibrium_scaled
+                )
+            delta_bound = (
+                jnp.asarray(self.temperature_delta_max_c, dtype=raw_temperature.dtype)
+                / target_scale
+            )
+            equilibrium_error = equilibrium_scaled - previous_temperature_scaled
+            if mode == "alpha_bounded_equilibrium":
+                equilibrium_error = alpha_t * equilibrium_error
+            temperature_scaled = previous_temperature_scaled + delta_bound * jnp.tanh(
+                equilibrium_error / delta_bound
+            )
+            return jnp.clip(temperature_scaled, -bound, bound)
         target_scale = jnp.maximum(
             jnp.abs(jnp.asarray(self.target_scale[self.temperature_target_index], dtype=raw_temperature.dtype)),
             jnp.asarray(1e-6, dtype=raw_temperature.dtype),
@@ -566,6 +656,8 @@ class ProbabilisticContractingClosedLoopHPEmulator(eqx.Module):
         if self.temperature_alpha_net is None:
             return jnp.asarray(1.0, dtype=metadata.dtype)
         raw_alpha = self.temperature_alpha_net(jnp.concatenate([metadata, xi], axis=0))[0]
+        if self._resolved_temperature_update_mode() == "alpha_bounded_equilibrium":
+            return jax.nn.sigmoid(raw_alpha)
         return self.temperature_alpha_max(raw_alpha.dtype) * jax.nn.sigmoid(raw_alpha)
 
     def _temperature_physical(self, temperature_scaled: jnp.ndarray) -> jnp.ndarray:
@@ -1014,12 +1106,22 @@ class ProbabilisticContractingClosedLoopHPEmulator(eqx.Module):
         xi: jnp.ndarray,
         thermal_forcing_t: jnp.ndarray,
     ) -> tuple[jnp.ndarray, jnp.ndarray]:
+        generator_forcing_t = self._transition_forcing(thermal_forcing_t)
         raw = self.transition_net(
-            jnp.concatenate([metadata, xi, thermal_forcing_t], axis=0)
+            jnp.concatenate([metadata, xi, generator_forcing_t], axis=0)
         )
         matrix_size = self.state_dim * self.state_dim
         raw_matrix = raw[:matrix_size].reshape((self.state_dim, self.state_dim))
-        raw_bias = raw[matrix_size:]
+        if self.transition_conditioning == "exogenous_additive_feedback":
+            input_matrix_size = self.state_dim * self.transition_forcing_encoded_dim
+            input_matrix_end = matrix_size + input_matrix_size
+            raw_input_matrix = raw[matrix_size:input_matrix_end].reshape(
+                (self.state_dim, self.transition_forcing_encoded_dim)
+            )
+            raw_bias = raw[input_matrix_end:]
+        else:
+            raw_input_matrix = None
+            raw_bias = raw[matrix_size:]
         frobenius = jnp.sqrt(
             jnp.sum(raw_matrix**2) + jnp.asarray(1e-12, dtype=raw_matrix.dtype)
         )
@@ -1029,7 +1131,36 @@ class ProbabilisticContractingClosedLoopHPEmulator(eqx.Module):
             * raw_matrix
             / divisor
         )
-        return matrix, jnp.tanh(raw_bias)
+        bias = jnp.tanh(raw_bias)
+        if raw_input_matrix is not None:
+            assert self.transition_forcing_encoder is not None
+            input_frobenius = jnp.sqrt(
+                jnp.sum(raw_input_matrix**2)
+                + jnp.asarray(1e-12, dtype=raw_input_matrix.dtype)
+            )
+            input_divisor = jnp.maximum(
+                input_frobenius,
+                jnp.asarray(1.0, dtype=raw_input_matrix.dtype),
+            )
+            input_matrix = (
+                jnp.asarray(
+                    self.additive_feedback_gain_bound,
+                    dtype=raw_input_matrix.dtype,
+                )
+                * raw_input_matrix
+                / input_divisor
+            )
+            encoded_forcing = jnp.tanh(
+                self.transition_forcing_encoder(thermal_forcing_t)
+            )
+            bias = bias + input_matrix @ encoded_forcing
+        return matrix, bias
+
+    def _transition_forcing(self, thermal_forcing_t: jnp.ndarray) -> jnp.ndarray:
+        if self.transition_conditioning == "state_feedback":
+            return thermal_forcing_t
+        endogenous_count = 2 if self.q_to_t_mode == "positive_leaky" else 3
+        return thermal_forcing_t.at[-endogenous_count:].set(0.0)
 
     def transition_bias(
         self,

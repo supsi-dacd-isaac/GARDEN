@@ -6,6 +6,7 @@ from .contracting_closed_loop_hp import (
     ContractingClosedLoopHPEmulator,
     ThermalQResponseMode,
     ThermostatDemandMode,
+    TransitionConditioningMode,
 )
 from .emulator import InputEncoderFeedback, MetadataStateSpaceEmulator, SwitchingDynamics
 from .probabilistic_closed_loop_hp import (
@@ -28,6 +29,7 @@ __all__ = [
     "ContractingClosedLoopHPEmulator",
     "ThermalQResponseMode",
     "ThermostatDemandMode",
+    "TransitionConditioningMode",
     "HPElectricRolloutMode",
     "HPElectricScenarioMode",
     "HPActivationModel",

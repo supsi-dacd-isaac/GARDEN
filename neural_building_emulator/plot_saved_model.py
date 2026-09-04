@@ -98,10 +98,11 @@ def regenerate_closed_loop_plots(
     metadata = artifact.metadata
     model_kind = str(metadata["model_kind"])
     test_ids = _saved_test_ids(metadata)
+    metadata_columns = tuple(metadata.get("metadata_columns", ()))
 
     df = _read_parquet(
         dataset_path,
-        columns=closed_loop_required_columns(),
+        columns=closed_loop_required_columns(metadata_columns or None),
         profile_ids=test_ids,
     )
     profiles = to_closed_loop_profiles(
@@ -109,6 +110,10 @@ def regenerate_closed_loop_plots(
         include_space_heating_availability=(
             SPACE_HEATING_AVAILABILITY_COLUMN in metadata.get("input_columns", [])
         ),
+        hp_power_area_normalization=str(
+            _config_value(metadata, "hp_power_area_normalization", "zone_floor_area")
+        ),  # type: ignore[arg-type]
+        metadata_columns=metadata_columns or None,
     )
     profiles = [profile for profile in profiles if profile.profile_id in set(test_ids)]
     profiles.sort(key=lambda profile: test_ids.index(profile.profile_id))
@@ -230,6 +235,9 @@ def regenerate_q_to_t_plots(
         input_feature_mode=input_feature_mode,  # type: ignore[arg-type]
         heating_regime_window_steps=heating_regime_window_steps,
         heat_on_threshold=float(_config_value(metadata, "heat_on_threshold", 1e-6)),
+        hp_power_area_normalization=str(
+            _config_value(metadata, "hp_power_area_normalization", "zone_floor_area")
+        ),  # type: ignore[arg-type]
     )
     profiles = [profile for profile in profiles if profile.profile_id in set(test_ids)]
     profiles.sort(key=lambda profile: test_ids.index(profile.profile_id))

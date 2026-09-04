@@ -30,7 +30,7 @@ import argparse
 import json
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterable, Literal
+from typing import Any, Iterable, Literal, Sequence
 
 import jax
 import numpy as np
@@ -481,15 +481,21 @@ def _load_closed_loop_profiles(
     profile_ids: list[int],
     *,
     include_space_heating_availability: bool,
+    hp_power_area_normalization: str = "zone_floor_area",
+    metadata_columns: Sequence[str] | None = None,
 ) -> list[ClosedLoopProfile]:
     df = _read_parquet(
         dataset_path,
-        columns=closed_loop_required_columns(),
+        columns=closed_loop_required_columns(
+            None if metadata_columns is None else tuple(metadata_columns)
+        ),
         profile_ids=profile_ids,
     )
     profiles = to_closed_loop_profiles(
         df,
         include_space_heating_availability=include_space_heating_availability,
+        hp_power_area_normalization=hp_power_area_normalization,  # type: ignore[arg-type]
+        metadata_columns=metadata_columns,
     )
     profile_order = {profile_id: index for index, profile_id in enumerate(profile_ids)}
     profiles = [profile for profile in profiles if profile.profile_id in profile_order]
@@ -1029,6 +1035,10 @@ def run_analysis(args: argparse.Namespace) -> None:
         include_space_heating_availability=(
             SPACE_HEATING_AVAILABILITY_COLUMN in artifact.metadata.get("input_columns", [])
         ),
+        hp_power_area_normalization=str(
+            _config_value(metadata, "hp_power_area_normalization", "zone_floor_area")
+        ),
+        metadata_columns=tuple(metadata.get("metadata_columns", ())) or None,
     )
 
     rng_key = jax.random.PRNGKey(int(args.seed))

@@ -167,6 +167,11 @@ def save_training_artifact(
         "model_kind": model_kind,
         "heating_mode": splits.heating_mode,
         "heat_input_normalization": splits.heat_input_normalization,
+        "hp_power_area_normalization": getattr(
+            splits,
+            "hp_power_area_normalization",
+            "zone_floor_area",
+        ),
         "input_feature_mode": splits.input_feature_mode,
         "heating_regime_window_steps": int(splits.heating_regime_window_steps),
         "target_mode": getattr(train_config, "target_mode"),
@@ -407,6 +412,12 @@ def _build_model_skeleton(
             temperature_output_scale=float(config.get("contracting_temperature_scale", 8.0)),
             temperature_delta_max_c=float(config.get("contracting_temperature_delta_max_c", 0.0)),
             temperature_update_mode=config.get("contracting_temperature_update", "auto"),
+            transition_conditioning=config.get(
+                "contracting_transition_conditioning", "state_feedback"
+            ),
+            additive_feedback_gain_bound=float(
+                config.get("contracting_additive_feedback_gain_bound", 1.0)
+            ),
             hp_dt_hours=float(config.get("hp_dt_hours", 0.25)),
             hp_cop_floor=float(config.get("hp_cop_floor", 1.0)),
             hp_cop_cap=float(config.get("hp_cop_cap", 0.0)),
@@ -476,6 +487,12 @@ def _build_model_skeleton(
             temperature_output_scale=float(config.get("contracting_temperature_scale", 8.0)),
             temperature_delta_max_c=float(config.get("contracting_temperature_delta_max_c", 0.0)),
             temperature_update_mode=config.get("contracting_temperature_update", "auto"),
+            transition_conditioning=config.get(
+                "contracting_transition_conditioning", "state_feedback"
+            ),
+            additive_feedback_gain_bound=float(
+                config.get("contracting_additive_feedback_gain_bound", 1.0)
+            ),
             hp_dt_hours=float(config.get("hp_dt_hours", 0.25)),
             hp_cop_floor=float(config.get("hp_cop_floor", 1.0)),
             hp_cop_cap=float(config.get("hp_cop_cap", 0.0)),

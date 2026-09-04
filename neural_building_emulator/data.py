@@ -17,13 +17,25 @@ import pandas as pd
 import pyarrow.parquet as pq
 
 from .columns import (
+    CLOSED_LOOP_METADATA_COLUMNS,
     CLOSED_LOOP_INPUT_COLUMNS,
     CLOSED_LOOP_TARGET_COLUMNS,
+    HP_MODEL_NAME_CATEGORIES,
+    HP_MODEL_NAME_COLUMN,
+    HP_MODEL_NAME_ONE_HOT_COLUMNS,
+    HP_REF_CAPACITY_COLUMN,
+    HP_REF_CAPACITY_PER_HEATED_AREA_COLUMN,
+    HP_REF_COP_COLUMN,
+    SH_DESIGN_CAPACITY_COLUMN,
+    SH_DESIGN_CAPACITY_PER_HEATED_AREA_COLUMN,
+    SH_VOLUME_COLUMN,
+    SH_VOLUME_PER_HEATED_AREA_COLUMN,
     DATETIME_COLUMN,
     DISTURBANCE_COLUMNS,
     HeatInputNormalization,
     HEAT_PUMP_ELECTRIC_POWER_COLUMN,
     HEATING_INPUT_COLUMNS,
+    HPPowerAreaNormalization,
     HP_MODE_IS_DHW_COLUMN,
     HP_SIZE_BINDING_COLUMN,
     InputFeatureMode,
@@ -56,8 +68,11 @@ class SplitConfig:
     test_fraction: float = 0.2
     seed: int = 13
     profile_selection: str = "random"  # "random" or "first"
+    fixed_test_profile_ids: tuple[int, ...] = ()
+    excluded_profile_ids: tuple[int, ...] = ()
     profile_id_column: str = PROFILE_ID_COLUMN
     heat_input_normalization: HeatInputNormalization = "per_floor_area"
+    hp_power_area_normalization: HPPowerAreaNormalization = "building_heated_area"
     input_feature_mode: InputFeatureMode = "base"
     heating_regime_window_steps: int = 96 * 7
 
@@ -78,6 +93,7 @@ class BuildingDatasetSplits:
     selected_ids: tuple[int, ...]
     heating_mode: str
     heat_input_normalization: HeatInputNormalization
+    hp_power_area_normalization: HPPowerAreaNormalization
     input_feature_mode: InputFeatureMode
     heating_regime_window_steps: int
     input_columns: tuple[str, ...]
@@ -98,6 +114,7 @@ class ClosedLoopDatasetSplits:
     input_columns: tuple[str, ...]
     target_columns: tuple[str, ...]
     metadata_columns: tuple[str, ...]
+    hp_power_area_normalization: HPPowerAreaNormalization = "building_heated_area"
     heating_mode: str = "closed_loop_hp"
     heat_input_normalization: HeatInputNormalization = "per_floor_area"
     input_feature_mode: InputFeatureMode = "base"
@@ -228,21 +245,75 @@ def split_profile_ids(
     return train_ids, test_ids
 
 
+def select_and_split_profile_ids(
+    profile_ids: Sequence[int],
+    *,
+    max_profiles: int | None,
+    test_fraction: float,
+    seed: int,
+    strategy: str,
+    fixed_test_profile_ids: Sequence[int] = (),
+    excluded_profile_ids: Sequence[int] = (),
+) -> tuple[tuple[int, ...], tuple[int, ...], tuple[int, ...]]:
+    """Select profiles with an optional fixed holdout shared across experiments."""
+    excluded = set(int(profile_id) for profile_id in excluded_profile_ids)
+    available_ids = tuple(
+        int(profile_id) for profile_id in profile_ids if int(profile_id) not in excluded
+    )
+    if not available_ids:
+        raise ValueError("No profiles remain after applying excluded_profile_ids")
+    if not fixed_test_profile_ids:
+        selected_ids = select_profile_ids(
+            available_ids,
+            max_profiles=max_profiles,
+            seed=seed,
+            strategy=strategy,
+        )
+        train_ids, test_ids = split_profile_ids(
+            selected_ids,
+            test_fraction=test_fraction,
+            seed=seed + 1,
+        )
+        return selected_ids, train_ids, test_ids
+
+    available = tuple(sorted(int(profile_id) for profile_id in available_ids))
+    available_set = set(available)
+    test_ids = tuple(sorted(set(int(profile_id) for profile_id in fixed_test_profile_ids)))
+    missing = tuple(sorted(set(test_ids).difference(available_set)))
+    if missing:
+        raise ValueError(f"Fixed test profile ids are not available: {missing}")
+    if max_profiles is not None and max_profiles <= len(test_ids):
+        raise ValueError(
+            "max_profiles must exceed the number of fixed test profiles so at least "
+            "one training profile remains"
+        )
+    train_candidates = tuple(profile_id for profile_id in available if profile_id not in test_ids)
+    max_train_profiles = (
+        None if max_profiles is None else max_profiles - len(test_ids)
+    )
+    train_ids = select_profile_ids(
+        train_candidates,
+        max_profiles=max_train_profiles,
+        seed=seed,
+        strategy=strategy,
+    )
+    selected_ids = tuple(sorted((*train_ids, *test_ids)))
+    return selected_ids, train_ids, test_ids
+
+
 def load_result_splits(config: SplitConfig, heating_mode: str = "zone_thermal") -> BuildingDatasetSplits:
     """Load a configurable subset and split it by complete `egid` profiles."""
     mode = normalize_heating_mode(heating_mode)
     dataset_path = Path(config.dataset_path)
     all_ids = read_profile_ids(dataset_path, config.profile_id_column)
-    selected_ids = select_profile_ids(
+    selected_ids, train_ids, test_ids = select_and_split_profile_ids(
         all_ids,
         max_profiles=config.max_profiles,
+        test_fraction=config.test_fraction,
         seed=config.seed,
         strategy=config.profile_selection,
-    )
-    train_ids, test_ids = split_profile_ids(
-        selected_ids,
-        test_fraction=config.test_fraction,
-        seed=config.seed + 1,
+        fixed_test_profile_ids=config.fixed_test_profile_ids,
+        excluded_profile_ids=config.excluded_profile_ids,
     )
 
     columns = required_columns(mode)
@@ -268,6 +339,7 @@ def load_result_splits(config: SplitConfig, heating_mode: str = "zone_thermal") 
         selected_ids=selected_ids,
         heating_mode=mode,
         heat_input_normalization=config.heat_input_normalization,
+        hp_power_area_normalization=config.hp_power_area_normalization,
         input_feature_mode=config.input_feature_mode,
         heating_regime_window_steps=config.heating_regime_window_steps,
         input_columns=tuple(
@@ -301,7 +373,7 @@ def _check_required_columns(
 def load_closed_loop_result_splits(config: SplitConfig) -> ClosedLoopDatasetSplits:
     """Load the profile split required by the closed-loop HP emulator."""
     dataset_path = Path(config.dataset_path)
-    columns = closed_loop_required_columns()
+    columns = closed_loop_required_columns(CLOSED_LOOP_METADATA_COLUMNS)
     _check_required_columns(
         dataset_path,
         columns,
@@ -343,16 +415,14 @@ def load_closed_loop_result_splits(config: SplitConfig) -> ClosedLoopDatasetSpli
             "Expected finite positive hp_ref_capacity_W and hp_size_binding='SH' "
             "for at least one profile."
         )
-    selected_ids = select_profile_ids(
+    selected_ids, train_ids, test_ids = select_and_split_profile_ids(
         hp_ids,
         max_profiles=config.max_profiles,
+        test_fraction=config.test_fraction,
         seed=config.seed,
         strategy=config.profile_selection,
-    )
-    train_ids, test_ids = split_profile_ids(
-        selected_ids,
-        test_fraction=config.test_fraction,
-        seed=config.seed + 1,
+        fixed_test_profile_ids=config.fixed_test_profile_ids,
+        excluded_profile_ids=config.excluded_profile_ids,
     )
 
     filters = [(config.profile_id_column, "in", list(selected_ids))]
@@ -381,7 +451,8 @@ def load_closed_loop_result_splits(config: SplitConfig) -> ClosedLoopDatasetSpli
         dropped_non_sh_hp_ids=dropped_non_sh_hp_ids,
         input_columns=tuple(CLOSED_LOOP_INPUT_COLUMNS),
         target_columns=tuple(CLOSED_LOOP_TARGET_COLUMNS),
-        metadata_columns=tuple(METADATA_COLUMNS),
+        metadata_columns=tuple(CLOSED_LOOP_METADATA_COLUMNS),
+        hp_power_area_normalization=config.hp_power_area_normalization,
     )
 
 
@@ -514,12 +585,17 @@ def to_closed_loop_profiles(
     df: pd.DataFrame,
     *,
     include_space_heating_availability: bool = True,
+    hp_power_area_normalization: HPPowerAreaNormalization = "building_heated_area",
+    metadata_columns: Sequence[str] | None = None,
 ) -> list[ClosedLoopProfile]:
     """Convert a dataframe split into profile arrays for closed-loop HP training.
 
     The alignment is explicit: exogenous inputs and power targets are taken at t,
     while the temperature target is Tin[t+1]. The initial temperature is Tin[t].
     """
+    metadata_columns = tuple(
+        METADATA_COLUMNS if metadata_columns is None else metadata_columns
+    )
     profiles: list[ClosedLoopProfile] = []
     for profile_id, group in df.groupby(PROFILE_ID_COLUMN, sort=True):
         group = group.sort_values(DATETIME_COLUMN).reset_index(drop=True)
@@ -527,12 +603,66 @@ def to_closed_loop_profiles(
             continue
 
         profile_datetime = _simulation_calendar_datetimes(group.loc[:, DATETIME_COLUMN].to_numpy())
-        metadata = group.loc[:, METADATA_COLUMNS].iloc[0].to_numpy(dtype=np.float32)
         floor_area = float(group.loc[:, "floor_area"].iloc[0])
         if not np.isfinite(floor_area) or floor_area <= 0.0:
             raise ValueError(
                 f"Profile {profile_id} has invalid floor_area={floor_area!r}; "
                 "cannot build W/m2 closed-loop targets."
+            )
+
+        total_floors = float(group.loc[:, "totalFloors"].iloc[0])
+        if not np.isfinite(total_floors) or total_floors <= 0.0:
+            raise ValueError(
+                f"Profile {profile_id} has invalid totalFloors={total_floors!r}; "
+                "cannot normalize whole-building HP power."
+            )
+        heated_area = floor_area * total_floors
+        if hp_power_area_normalization == "zone_floor_area":
+            hp_power_area = floor_area
+        elif hp_power_area_normalization == "building_heated_area":
+            hp_power_area = heated_area
+        else:
+            raise ValueError(
+                "hp_power_area_normalization must be 'zone_floor_area' or "
+                "'building_heated_area'"
+            )
+
+        row = group.iloc[0]
+        derived_metadata: dict[str, float] = {}
+        if any(column not in METADATA_COLUMNS for column in metadata_columns):
+            hp_model_name = str(row.get(HP_MODEL_NAME_COLUMN, "")).strip().lower()
+            if hp_model_name not in HP_MODEL_NAME_CATEGORIES:
+                raise ValueError(
+                    f"Profile {profile_id} has unsupported hp_model_name={hp_model_name!r}; "
+                    f"expected one of {HP_MODEL_NAME_CATEGORIES}"
+                )
+            derived_metadata = {
+                HP_REF_CAPACITY_PER_HEATED_AREA_COLUMN: (
+                    float(row[HP_REF_CAPACITY_COLUMN]) / heated_area
+                ),
+                SH_DESIGN_CAPACITY_PER_HEATED_AREA_COLUMN: (
+                    float(row[SH_DESIGN_CAPACITY_COLUMN]) / heated_area
+                ),
+                SH_VOLUME_PER_HEATED_AREA_COLUMN: (
+                    float(row[SH_VOLUME_COLUMN]) / heated_area
+                ),
+                HP_REF_COP_COLUMN: float(row[HP_REF_COP_COLUMN]),
+                **{
+                    column: float(hp_model_name == category)
+                    for category, column in zip(
+                        HP_MODEL_NAME_CATEGORIES,
+                        HP_MODEL_NAME_ONE_HOT_COLUMNS,
+                    )
+                },
+            }
+        metadata_values = [
+            derived_metadata[column] if column in derived_metadata else row[column]
+            for column in metadata_columns
+        ]
+        metadata = np.asarray(metadata_values, dtype=np.float32)
+        if not bool(np.all(np.isfinite(metadata))):
+            raise ValueError(
+                f"Profile {profile_id} has non-finite closed-loop metadata values"
             )
 
         temperature = group.loc[:, TARGET_COLUMN].to_numpy(dtype=np.float32)
@@ -566,7 +696,7 @@ def to_closed_loop_profiles(
             column=HEAT_PUMP_ELECTRIC_POWER_COLUMN,
         )
         q_room = q_room / np.float32(floor_area)
-        p_el = p_el / np.float32(floor_area)
+        p_el = p_el / np.float32(hp_power_area)
 
         input_parts: list[np.ndarray] = [setpoint, disturbances]
         if include_space_heating_availability:
@@ -594,6 +724,7 @@ def to_profiles(
     input_feature_mode: InputFeatureMode = "base",
     heating_regime_window_steps: int = 96 * 7,
     heat_on_threshold: float = 1e-6,
+    hp_power_area_normalization: HPPowerAreaNormalization = "building_heated_area",
 ) -> list[BuildingProfile]:
     """Convert a dataframe split into per-building arrays."""
     mode = normalize_heating_mode(heating_mode)
@@ -614,7 +745,22 @@ def to_profiles(
                     f"Profile {profile_id} has invalid floor_area={floor_area!r}; "
                     "cannot normalize heat input to W/m2."
                 )
-            inputs[:, 0] = inputs[:, 0] / floor_area
+            heat_input_area = floor_area
+            if mode == "heating_electric":
+                total_floors = float(group.loc[:, "totalFloors"].iloc[0])
+                if not np.isfinite(total_floors) or total_floors <= 0.0:
+                    raise ValueError(
+                        f"Profile {profile_id} has invalid totalFloors={total_floors!r}; "
+                        "cannot normalize whole-building HP power."
+                    )
+                if hp_power_area_normalization == "building_heated_area":
+                    heat_input_area *= total_floors
+                elif hp_power_area_normalization != "zone_floor_area":
+                    raise ValueError(
+                        "hp_power_area_normalization must be 'zone_floor_area' or "
+                        "'building_heated_area'"
+                    )
+            inputs[:, 0] = inputs[:, 0] / heat_input_area
         if feature_mode == "heating_regime":
             inputs = np.column_stack(
                 [
@@ -765,6 +911,11 @@ def main() -> None:
         default="per_floor_area",
         help="Use the selected heat input as raw W or divide it by floor_area to W/m2.",
     )
+    parser.add_argument(
+        "--hp-power-area-normalization",
+        choices=("building_heated_area", "zone_floor_area"),
+        default="building_heated_area",
+    )
     parser.add_argument("--input-feature-mode", choices=("base", "heating_regime"), default="base")
     parser.add_argument("--heating-regime-window-steps", type=int, default=96 * 7)
     parser.add_argument("--heat-on-threshold", type=float, default=1e-6)
@@ -780,6 +931,7 @@ def main() -> None:
         seed=args.seed,
         profile_selection=args.profile_selection,
         heat_input_normalization=args.heat_input_normalization,
+        hp_power_area_normalization=args.hp_power_area_normalization,
         input_feature_mode=args.input_feature_mode,
         heating_regime_window_steps=args.heating_regime_window_steps,
     )
@@ -797,6 +949,7 @@ def main() -> None:
             splits.input_feature_mode,
             splits.heating_regime_window_steps,
             args.heat_on_threshold,
+            splits.hp_power_area_normalization,
         ),
         window_config,
     )
@@ -810,12 +963,15 @@ def main() -> None:
                 splits.input_feature_mode,
                 splits.heating_regime_window_steps,
                 args.heat_on_threshold,
+                splits.hp_power_area_normalization,
             ),
             window_config,
         )
 
     print(f"heating_mode={splits.heating_mode}")
     print(f"heat_input_normalization={splits.heat_input_normalization}")
+    if splits.heating_mode == "heating_electric":
+        print(f"hp_power_area_normalization={splits.hp_power_area_normalization}")
     print(
         "input_feature_mode="
         f"{splits.input_feature_mode} "

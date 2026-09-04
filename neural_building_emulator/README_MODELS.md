@@ -2,7 +2,7 @@
 
 The building-local causal semi-Markov research model and its half-year
 ablation are documented separately in
-[`README_CAUSAL_HYBRID_HP.md`](README_CAUSAL_HYBRID_HP.md).
+`[README_CAUSAL_HYBRID_HP.md](README_CAUSAL_HYBRID_HP.md)`.
 
 This document summarizes the emulator model families exposed by:
 
@@ -13,9 +13,9 @@ This document summarizes the emulator model families exposed by:
 There are two main modeling strategies:
 
 1. **Q-to-T thermal emulator**: delivered room heat is known and provided as an
-   exogenous input.
+  exogenous input.
 2. **Closed-loop HP emulator**: delivered room heat and HP electric power are
-   predicted from setpoint/weather/current temperature through a learned
+  predicted from setpoint/weather/current temperature through a learned
    controller, buffer, and HP model.
 
 The Q-to-T emulator is the simpler base case and is described first. The
@@ -51,6 +51,8 @@ closed_loop_hp_probabilistic   active but uncertainty calibration is still exper
 closed_loop_hp_contracting_probabilistic
                                probabilistic contractive model with leaky buffer
 ```
+
+
 
 ## Shared Dataset Context
 
@@ -99,6 +101,9 @@ window_area
 surface_to_volume_ratio
 thermal_mass_class
 ```
+
+`totalFloors` is therefore an explicit network input. Closed-loop HP models
+extend this common list with the equipment metadata described below.
 
 Metadata, inputs, and targets are standardized from training windows. Evaluation
 and plots are inverse-transformed back to physical units.
@@ -175,6 +180,11 @@ so the first input becomes:
 zone_thermal_heating_power_per_m2
 ```
 
+For the non-recommended `--heating-mode heating_electric` case, the source is
+whole-building HP power. New runs therefore divide it by
+`floor_area * totalFloors`; `--hp-power-area-normalization zone_floor_area`
+retains the historical behavior for artifact reproduction.
+
 With:
 
 ```bash
@@ -227,6 +237,8 @@ The initial true temperature is supplied at the start of each rollout window:
 ```text
 Tin[start]
 ```
+
+
 
 ## Deterministic Q-to-T State-Space Model
 
@@ -445,6 +457,8 @@ systems are stable.
 
 ## Q-to-T Training Loss
 
+
+
 ### Deterministic Q-to-T Core Loss
 
 The core deterministic objective is temperature MSE:
@@ -452,6 +466,8 @@ The core deterministic objective is temperature MSE:
 ```text
 loss = mean((Tin_pred - Tin_true)^2)
 ```
+
+
 
 ### Deterministic Q-to-T Additional Optional Components
 
@@ -522,6 +538,8 @@ The core probabilistic objective is:
 energy score
 ```
 
+
+
 ### Probabilistic Q-to-T Additional Optional Components
 
 Additional weighted terms are available:
@@ -576,21 +594,23 @@ and full-profile plots include a 95 percent scenario interval.
 
 - The heating input is known at inference time.
 - The recommended heating input is `zone_thermal_heating_power`, preferably in
-  W/m2.
+W/m2.
 - The model predicts temperature only.
 - It does not predict `Qroom` or HP electric power.
 - It does not enforce energy conservation between HP electric power and
-  delivered room heat.
+delivered room heat.
 - Building metadata determines the state-space parameters and initial-state map.
 - The latent state is a learned thermal memory coordinate, not an identified
-  physical state.
+physical state.
 - Stable `A` is necessary but not sufficient for accurate long rollouts.
 - `thermal_gaps` feedback uses static `shSetpoint`, not the timestep thermostat
-  setpoint schedule.
+setpoint schedule.
 - Non-HP buildings can be included when using `zone_thermal_heating_power`
-  because the room heat trajectory is already exogenous.
+because the room heat trajectory is already exogenous.
 - If `--heating-mode heating_electric` is used, the first input is not room heat.
-  That is one reason the closed-loop HP model exists.
+That is one reason the closed-loop HP model exists.
+
+
 
 # Closed-Loop HP Emulator
 
@@ -619,6 +639,8 @@ closed_loop_hp_contracting
   data-driven recurrent closed-loop state with guaranteed one-step contraction
 ```
 
+
+
 ## What Changes Relative To Q-to-T
 
 Closed-loop models predict three channels instead of one:
@@ -632,7 +654,7 @@ where:
 ```text
 Tin      = first-zone indoor temperature [degC]
 Qroom    = delivered room heat to FL0_THZ0 [W/m2]
-Pel_SH   = HP electric power attributed to space heating [W/m2]
+Pel_SH   = whole-building HP electric power attributed to space heating [W/m2]
 ```
 
 They require timestep setpoint and HP/DHW columns:
@@ -692,6 +714,19 @@ u[t] = [
 ]
 ```
 
+Closed-loop HP models additionally receive these static equipment features:
+
+```text
+hp_ref_capacity_W / (floor_area * totalFloors)
+SH_design_cap_W / (floor_area * totalFloors)
+shVolume_m3 / (floor_area * totalFloors)
+hp_ref_cop
+one-hot(hp_model_name): aerotop_g07_14m, aerotop_t35r
+```
+
+The resulting metadata vector has 21 entries. These equipment values are
+standardized with the other metadata using training-set statistics.
+
 Alignment is fixed:
 
 ```text
@@ -705,10 +740,29 @@ Targets are constructed as:
 ```text
 Tin_target[t] = FL0_THZ0 zone air temperature at t+1
 Qroom[t]      = zone_thermal_heating_power[t] / floor_area
-Pel_SH[t]     = heat_pump_electric_power[t] / floor_area
+Pel_SH[t]     = heat_pump_electric_power[t] / (floor_area * totalFloors)
 Pel_SH[t]     = 0 when hp_mode_is_dhw[t] > 0.5
 Qroom[t] = Pel_SH[t] = 0 from May 15 through September 30
 ```
+
+The two power targets have different physical scopes. `Qroom` is the heat
+delivered to the modeled first-zone apartment, so its denominator is that
+zone's `floor_area`. `heat_pump_electric_power` is the total HP electricity for
+the building, so its denominator is the estimated total heated area
+`floor_area * totalFloors`. This removes a spurious dependence of electric-power
+intensity and flexibility KPIs on the number of floors.
+
+New training uses `--hp-power-area-normalization building_heated_area` by
+default. `--hp-power-area-normalization zone_floor_area` is retained only to
+reproduce artifacts trained before this correction. Saved artifacts record the
+mode, and artifact-based plotting and KPI scripts automatically use the saved
+value. Artifacts without the field are interpreted as legacy
+`zone_floor_area` artifacts.
+
+The buffer equations therefore relate a first-zone heat intensity to a
+whole-building-average electric intensity. This is a useful approximation for
+the present dataset, but it is not an exact whole-building energy balance. An
+exact balance would additionally require total heat delivered to all zones.
 
 `space_heating_available` exactly reproduces the EnergyPlus seasonal SH
 lockout. It hard-gates predicted room heat and SH electric power, while the
@@ -856,6 +910,64 @@ Here `f_t` is the current thermal forcing. One joint transition network emits
 both `M_t` and `b_t` from `[c, f_t]` at every timestep, restoring the
 architecture used before the fixed-matrix experiment.
 
+The transition generator can optionally be restricted to exogenous forcing:
+
+```bash
+--contracting-transition-conditioning exogenous
+```
+
+The default `state_feedback` retains the historical conditioning. With
+`exogenous`, the `Qroom`, predicted `Tin`, and `Tout-Tin` slots are zeroed only
+before the joint network that emits `M_t` and `b_t`. The parameter-tree shape
+is unchanged, and the HP controller plus the explicit positive Q-to-T path are
+unaffected. Consequently,
+
+```text
+(M_t, b_t) = g(c, xi, u_exogenous[t])
+```
+
+for the probabilistic model (without `xi` for the deterministic model). This
+removes the `dM_t/dTin` and `db_t/dTin` feedback paths. It does not by itself
+prove contraction of the complete stochastic closed loop: in heteroscedastic
+mode the process-noise scale still receives the latent state, and the HP,
+buffer, Q response, and temperature states remain coupled.
+
+The factorized alternative keeps the matrix generator exogenous while restoring
+temperature feedback through a separate additive state-space input path:
+
+```bash
+--contracting-transition-conditioning exogenous_additive_feedback \
+--contracting-additive-feedback-gain-bound 1.0
+```
+
+Its transition is
+
+```text
+(M_t, B_t, b_t) = g(c, xi, u_exogenous[t])
+z_t = tanh(e([u_exogenous[t], Tin[t], Tout[t] - Tin[t]]))
+s[t+1] = state_bound * tanh(
+    M_t (s[t] / state_bound) + B_t z_t + b_t + process_noise[t]
+)
+```
+
+There is no `xi` or process-noise term in the deterministic model. `Tset` and
+space-heating availability do not enter this thermal forcing; they act through
+the HP/controller path. With `positive_leaky`, `Qroom` is also excluded from
+`z_t` because it enters temperature through the separate positive leaky modes.
+With `unconstrained`, `Qroom` remains part of `z_t`.
+
+Both generated matrices are pointwise bounded:
+
+```text
+||M_t||_F <= contracting_gamma
+||B_t||_F <= contracting_additive_feedback_gain_bound
+```
+
+Compared with `state_feedback`, this removes the recurrently amplified
+`(dM_t/dTin) s[t]` term while retaining the information lost by `exogenous`.
+It remains an empirical closed-loop architecture rather than a contraction
+proof because the encoded forcing still depends on predicted `Tin`.
+
 The generated matrix is normalized by Frobenius norm:
 
 ```text
@@ -887,6 +999,8 @@ by the other closed-loop models. Temperature is bounded in normalized units by:
 --contracting-temperature-scale 8.0
 ```
 
+
+
 ### Structural Positive Q-to-T Path
 
 Contracting deterministic and probabilistic models can instead use:
@@ -895,7 +1009,7 @@ Contracting deterministic and probabilistic models can instead use:
 --contracting-temperature-update leaky_equilibrium
 --contracting-temperature-delta-max-c 2.0
 --contracting-q-to-t-mode positive_leaky
---contracting-q-to-t-time-constants-hours 1 24
+--contracting-q-to-t-time-constants-hours 0.25 1 4 16 24 48
 ```
 
 This removes `Qroom` from the neural inputs generating `M_t` and `b_t`. A
@@ -925,6 +1039,58 @@ bound, but cannot reverse its sign. In the probabilistic model the gains and
 mode weights are conditioned on the trajectory-persistent `xi`, and the leaky
 heat states are included in sampled full closed-loop Jacobian diagnostics.
 
+The learned outer `alpha` can be removed with the optional bounded-equilibrium
+readout:
+
+```bash
+--contracting-temperature-update bounded_equilibrium
+--contracting-temperature-delta-max-c 2.0
+```
+
+It keeps the same equilibrium and positive leaky Qroom response, but updates
+temperature as:
+
+```text
+delta_max_scaled = delta_max_C / temperature_target_scale
+Tin[t+1] = clip(
+    Tin[t] + delta_max_scaled * tanh((T_eq[t] - Tin[t]) / delta_max_scaled),
+    -Tbound,
+    Tbound,
+)
+```
+
+There is no learned `alpha` in this mode. For small equilibrium errors the
+update approaches `T_eq`; for large errors its physical magnitude is strictly
+bounded by `--contracting-temperature-delta-max-c`. This simplifies the
+readout and avoids the additional slow pole introduced by a small learned
+`alpha`. It remains an explosion guard, not a proof that the full nonlinear
+HP-buffer-thermal system is globally contractive.
+
+A second optional mode keeps a learned local response rate:
+
+```bash
+--contracting-temperature-update alpha_bounded_equilibrium
+--contracting-temperature-delta-max-c 2.0
+```
+
+```text
+alpha = sigmoid(alpha_net(c[, xi]))
+Tin[t+1] = clip(
+    Tin[t] + delta_max_scaled
+        * tanh(alpha * (T_eq[t] - Tin[t]) / delta_max_scaled),
+    -Tbound,
+    Tbound,
+)
+```
+
+For deterministic models, `alpha(c)` is fixed for a building and the entire
+rollout. For probabilistic models, `alpha(c, xi)` is fixed within a particle but
+can differ across particles. Near equilibrium the update is approximately
+`alpha * (T_eq - Tin)`, so alpha controls the local response speed. The outer
+`tanh` independently retains the hard physical step cap, allowing alpha to use
+the full `(0,1)` range instead of the much smaller `alpha_max` required by the
+linear `leaky_equilibrium` update.
+
 Main controls:
 
 ```bash
@@ -940,7 +1106,11 @@ closed_loop_hp_contracting=enabled ... thermal_matrix=time_varying pointwise_mat
 rho_max=<contracting_gamma>
 ```
 
+
+
 ## Closed-Loop Deterministic Loss
+
+
 
 ### Core Loss
 
@@ -977,6 +1147,8 @@ with weight:
 ```bash
 --hp-mode-loss-weight 0.1
 ```
+
+
 
 ## Probabilistic Closed-Loop Additions
 
@@ -1293,6 +1465,8 @@ scalers_<model_kind>.npz
 metadata_<model_kind>.json
 ```
 
+
+
 ## Closed-Loop Evaluation And Plots
 
 Closed-loop logs report physical-unit RMSE for:
@@ -1332,23 +1506,27 @@ so they can prefer narrow deterministic-like checkpoints.
 ## Closed-Loop Known Issues
 
 - Deterministic closed-loop training is currently the strongest closed-loop
-  sanity baseline.
+sanity baseline.
 - The probabilistic closed-loop model can fit mean trajectories after warm-start,
-  but temperature intervals can remain too narrow.
+but temperature intervals can remain too narrow.
 - Stable thermal `A` does not imply full closed-loop stability.
 - `closed_loop_hp_contracting` structurally bounds every generated thermal
-  matrix and all reported states/outputs, but does not prove contraction of the
-  complete nonlinear HP feedback map.
+matrix and all reported states/outputs, but does not prove contraction of the
+complete nonlinear HP feedback map.
 - The Jacobian penalty is local and sampled, not a proof.
 - Expected HP training remains the default. Straight-through stochastic HP
-  training is optional and may have higher minibatch gradient variance.
+training is optional and may have higher minibatch gradient variance.
 - The active HP power NLL can dominate the loss if initialized too narrowly or if
-  `Pel_SH` has sharp spikes.
+`Pel_SH` has sharp spikes.
 - `Pel_SH` depends on the quality of `hp_mode_is_dhw`.
 - The latent energy store is physically motivated but not directly observed.
 - Epoch logs do not yet report interval coverage or mean 95 percent width.
 
+
+
 # Practical Commands
+
+
 
 ## Deterministic Q-to-T
 
@@ -1376,6 +1554,8 @@ so they can prefer narrow deterministic-like checkpoints.
   --num-full-profile-plots 5 \
   --save-model
 ```
+
+
 
 ## Probabilistic Q-to-T
 
@@ -1408,6 +1588,8 @@ so they can prefer narrow deterministic-like checkpoints.
   --save-model
 ```
 
+
+
 ## Deterministic Closed-Loop HP
 
 ```bash
@@ -1430,6 +1612,8 @@ so they can prefer narrow deterministic-like checkpoints.
   --model-kind closed_loop_hp \
   --save-model
 ```
+
+
 
 ## Contracting Closed-Loop HP
 
@@ -1455,6 +1639,8 @@ so they can prefer narrow deterministic-like checkpoints.
   --save-model
 ```
 
+
+
 ### Structurally monotone thermostat demand
 
 Both contracting closed-loop models support:
@@ -1466,12 +1652,7 @@ Both contracting closed-loop models support:
 In this mode the timestep thermostat setpoint is masked from the unrestricted HP
 input encoder. The model instead uses bounded, context-conditioned positive
 slopes and thresholds so latent requested room heat is nondecreasing in
-`Tset - Tin` when metadata, weather, particle latent and current indoor
-temperature are held fixed. HP activation and active power remain unrestricted
-functions of the thermal gap, controller history and buffer energy; this allows
-compressor cycling and delayed buffer charging. Delivered room heat is the
-requested heat capped by available buffer energy, so it is not independently
-forced to be pointwise monotone. The default `unconstrained` mode preserves old
+`Tset - Tin` when metadata, weather, particle latent and current indoor temperature are held fixed. HP activation and active power remain unrestricted functions of the thermal gap, controller history and buffer energy; this allows compressor cycling and delayed buffer chartrging. Delivered room heat is the requested heat capped by available buffer energy, so it is not independently forced to be pointwise monotone. The default `unconstrained` mode preserves old
 artifacts and behavior. Optional bounds are exposed through
 `--hp-thermostat-slope-{min,max}` and
 `--hp-thermostat-threshold-{min,max}-c`.
