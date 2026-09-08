@@ -24,7 +24,9 @@ from .columns import (
     DISTURBANCE_COLUMNS,
     HEATING_INPUT_COLUMNS,
     HPPowerAreaNormalization,
+    INTERNAL_GAIN_PER_FLOOR_AREA_COLUMN,
     InputFeatureMode,
+    OCCUPANTS_PER_FLOOR_AREA_COLUMN,
     SPACE_HEATING_AVAILABILITY_COLUMN,
 )
 from .data import (
@@ -100,6 +102,7 @@ ContractingTransitionConditioning = Literal[
 ]
 ClosedLoopStabilityMethod = Literal["exact_svd", "power_iteration"]
 FlexibilityKpiControls = Literal["none", "weather", "full"]
+FlexibilityKpiEstimator = Literal["direct_ratio", "regression"]
 ModelKind = Literal[
     "deterministic",
     "probabilistic",
@@ -248,6 +251,7 @@ class TrainConfig:
     prob_flex_kpi_crps_horizons_hours: tuple[float, ...] = (0.5, 1.0, 2.0, 3.0)
     prob_flex_kpi_crps_setpoint_threshold_c: float = 0.05
     prob_flex_kpi_crps_min_events: int = 20
+    prob_flex_kpi_crps_estimator: FlexibilityKpiEstimator = "regression"
     prob_flex_kpi_crps_ridge: float = 1e-3
     prob_flex_kpi_crps_controls: FlexibilityKpiControls = "full"
     prob_physics_weight: float = 0.0
@@ -1055,6 +1059,133 @@ def flexibility_coefficient_crps(
     return jnp.mean(jnp.stack(scores))
 
 
+def flexibility_direct_ratio_crps(
+    predictions: jnp.ndarray,
+    targets: jnp.ndarray,
+    inputs: jnp.ndarray,
+    *,
+    horizon_steps: tuple[int, ...],
+    horizon_hours: tuple[float, ...],
+    setpoint_delta_threshold: float,
+    min_events: int,
+    target_channel: int = 2,
+) -> jnp.ndarray:
+    """CRPS on directional ratio-of-sums flexibility gains.
+
+    For each batch trajectory and particle, this computes
+
+        F_H^+ = H sum(delta P_H | delta Tset > 0) / sum(delta Tset | delta Tset > 0)
+        F_H^- = H sum(delta P_H | delta Tset < 0) / sum(delta Tset | delta Tset < 0)
+
+    before applying CRPS. Keeping each particle intact through the event sums
+    preserves its cross-event dependence in the scored KPI distribution.
+    """
+    scores = []
+    rollout_horizon = predictions.shape[2]
+    setpoint = inputs[:, :, 0]
+    target_power = targets[:, :, target_channel]
+    prediction_power = predictions[:, :, :, target_channel]
+    threshold = jnp.asarray(setpoint_delta_threshold, dtype=predictions.dtype)
+    zero = jnp.asarray(0.0, dtype=predictions.dtype)
+    epsilon = jnp.asarray(1e-6, dtype=predictions.dtype)
+
+    for steps, hours in zip(horizon_steps, horizon_hours):
+        if steps < 1 or 2 * steps > rollout_horizon:
+            continue
+        starts = jnp.arange(steps, rollout_horizon - steps + 1)
+        setpoint_delta = jnp.take(setpoint, starts, axis=1) - jnp.take(
+            setpoint,
+            starts - 1,
+            axis=1,
+        )
+        event_mask = jnp.abs(setpoint_delta) >= threshold
+        up_mask = (event_mask & (setpoint_delta > 0.0)).astype(predictions.dtype)
+        down_mask = (event_mask & (setpoint_delta < 0.0)).astype(predictions.dtype)
+        event_count = jnp.sum(up_mask + down_mask, axis=1)
+        valid = (
+            (event_count >= jnp.asarray(min_events, dtype=predictions.dtype))
+            & (jnp.sum(up_mask, axis=1) > 0.0)
+            & (jnp.sum(down_mask, axis=1) > 0.0)
+        ).astype(predictions.dtype)
+
+        target_pre = _window_means_at_starts(
+            target_power,
+            starts=starts - steps,
+            window_steps=steps,
+        )
+        target_post = _window_means_at_starts(
+            target_power,
+            starts=starts,
+            window_steps=steps,
+        )
+        prediction_pre = _window_means_at_starts(
+            prediction_power,
+            starts=starts - steps,
+            window_steps=steps,
+        )
+        prediction_post = _window_means_at_starts(
+            prediction_power,
+            starts=starts,
+            window_steps=steps,
+        )
+        target_response = target_post - target_pre
+        prediction_response = prediction_post - prediction_pre
+
+        up_denominator = jnp.maximum(jnp.sum(up_mask * setpoint_delta, axis=1), epsilon)
+        down_denominator = jnp.minimum(
+            jnp.sum(down_mask * setpoint_delta, axis=1),
+            -epsilon,
+        )
+        hours_value = jnp.asarray(hours, dtype=predictions.dtype)
+        target_kpi = hours_value * jnp.stack(
+            [
+                jnp.sum(up_mask * target_response, axis=1) / up_denominator,
+                jnp.sum(down_mask * target_response, axis=1) / down_denominator,
+            ],
+            axis=-1,
+        )
+        prediction_kpi = hours_value * jnp.stack(
+            [
+                jnp.sum(
+                    up_mask[:, jnp.newaxis, :] * prediction_response,
+                    axis=-1,
+                )
+                / up_denominator[:, jnp.newaxis],
+                jnp.sum(
+                    down_mask[:, jnp.newaxis, :] * prediction_response,
+                    axis=-1,
+                )
+                / down_denominator[:, jnp.newaxis],
+            ],
+            axis=-1,
+        )
+
+        observation_delta = prediction_kpi - target_kpi[:, jnp.newaxis, :]
+        observation_distance = jnp.sqrt(observation_delta**2 + epsilon)
+        pairwise_delta = (
+            prediction_kpi[:, :, jnp.newaxis, :]
+            - prediction_kpi[:, jnp.newaxis, :, :]
+        )
+        pairwise_distance = jnp.sqrt(pairwise_delta**2 + epsilon)
+        per_direction_crps = jnp.mean(observation_distance, axis=1) - 0.5 * jnp.mean(
+            pairwise_distance,
+            axis=(1, 2),
+        )
+        per_profile_score = jnp.mean(per_direction_crps, axis=-1)
+        valid_count = jnp.sum(valid)
+        scores.append(
+            jnp.where(
+                valid_count > 0.0,
+                jnp.sum(per_profile_score * valid) / jnp.maximum(valid_count, 1.0),
+                zero,
+            )
+        )
+
+    if not scores:
+        return zero
+    return jnp.mean(jnp.stack(scores))
+
+
 def predict_probabilistic_batch(
     model: ProbabilisticStableStateSpaceEmulator,
     metadata: jnp.ndarray,
@@ -1788,6 +1919,7 @@ def probabilistic_closed_loop_loss_fn(
     flex_kpi_crps_horizon_hours: tuple[float, ...],
     flex_kpi_crps_setpoint_delta_threshold: float,
     flex_kpi_crps_min_events: int,
+    flex_kpi_crps_estimator: FlexibilityKpiEstimator,
     flex_kpi_crps_ridge: float,
     flex_kpi_crps_controls: FlexibilityKpiControls,
     physics_weight: float,
@@ -1841,19 +1973,32 @@ def probabilistic_closed_loop_loss_fn(
         )
     flex_kpi_crps_component = zero
     if flex_kpi_crps_weight > 0.0:
-        flex_kpi_crps_component = flex_kpi_crps_weight * flexibility_coefficient_crps(
-            predictions,
-            targets,
-            inputs,
-            initial_temperature,
-            horizon_steps=flex_kpi_crps_horizon_steps,
-            horizon_hours=flex_kpi_crps_horizon_hours,
-            setpoint_delta_threshold=flex_kpi_crps_setpoint_delta_threshold,
-            min_events=flex_kpi_crps_min_events,
-            ridge=flex_kpi_crps_ridge,
-            controls=flex_kpi_crps_controls,
-            target_channel=2,
-        )
+        if flex_kpi_crps_estimator == "direct_ratio":
+            flex_kpi_crps = flexibility_direct_ratio_crps(
+                predictions,
+                targets,
+                inputs,
+                horizon_steps=flex_kpi_crps_horizon_steps,
+                horizon_hours=flex_kpi_crps_horizon_hours,
+                setpoint_delta_threshold=flex_kpi_crps_setpoint_delta_threshold,
+                min_events=flex_kpi_crps_min_events,
+                target_channel=2,
+            )
+        else:
+            flex_kpi_crps = flexibility_coefficient_crps(
+                predictions,
+                targets,
+                inputs,
+                initial_temperature,
+                horizon_steps=flex_kpi_crps_horizon_steps,
+                horizon_hours=flex_kpi_crps_horizon_hours,
+                setpoint_delta_threshold=flex_kpi_crps_setpoint_delta_threshold,
+                min_events=flex_kpi_crps_min_events,
+                ridge=flex_kpi_crps_ridge,
+                controls=flex_kpi_crps_controls,
+                target_channel=2,
+            )
+        flex_kpi_crps_component = flex_kpi_crps_weight * flex_kpi_crps
     softopt_component = zero
     if softopt_weight > 0.0:
         softopt_component = softopt_weight * soft_optimistic_loss(
@@ -2013,6 +2158,7 @@ def probabilistic_closed_loop_train_step(
     flex_kpi_crps_horizon_hours: tuple[float, ...],
     flex_kpi_crps_setpoint_delta_threshold: float,
     flex_kpi_crps_min_events: int,
+    flex_kpi_crps_estimator: FlexibilityKpiEstimator,
     flex_kpi_crps_ridge: float,
     flex_kpi_crps_controls: FlexibilityKpiControls,
     physics_weight: float,
@@ -2069,6 +2215,7 @@ def probabilistic_closed_loop_train_step(
         flex_kpi_crps_horizon_hours,
         flex_kpi_crps_setpoint_delta_threshold,
         flex_kpi_crps_min_events,
+        flex_kpi_crps_estimator,
         flex_kpi_crps_ridge,
         flex_kpi_crps_controls,
         physics_weight,
@@ -3962,7 +4109,8 @@ def run_closed_loop_training(
         raise ValueError(f"--model-kind {config.model_kind} requires --target-mode absolute")
     if config.target_alignment != "same_time":
         raise ValueError(
-            f"--model-kind {config.model_kind} uses fixed u[t] -> (Tin[t+1], Qroom[t], Pel[t]) "
+            f"--model-kind {config.model_kind} uses fixed "
+            "(Tin_previous, u_interval) -> (Tin_end, Qroom_interval, Pel_interval) "
             "alignment; leave --target-alignment same_time."
         )
     if config.heat_input_normalization != "per_floor_area":
@@ -4209,6 +4357,10 @@ def run_closed_loop_training(
             raise ValueError("prob_flex_kpi_crps_setpoint_threshold_c must be non-negative")
         if config.prob_flex_kpi_crps_min_events < 1:
             raise ValueError("prob_flex_kpi_crps_min_events must be positive")
+        if config.prob_flex_kpi_crps_estimator not in ("direct_ratio", "regression"):
+            raise ValueError(
+                "prob_flex_kpi_crps_estimator must be 'direct_ratio' or 'regression'"
+            )
         if config.prob_flex_kpi_crps_ridge <= 0.0:
             raise ValueError("prob_flex_kpi_crps_ridge must be positive")
         if config.prob_flex_kpi_crps_controls not in ("none", "weather", "full"):
@@ -4287,6 +4439,14 @@ def run_closed_loop_training(
     splits = load_closed_loop_result_splits(split_config)
     availability_input_index = list(splits.input_columns).index(
         SPACE_HEATING_AVAILABILITY_COLUMN
+    )
+    thermal_extra_input_indices = tuple(
+        list(splits.input_columns).index(column)
+        for column in (
+            INTERNAL_GAIN_PER_FLOOR_AREA_COLUMN,
+            OCCUPANTS_PER_FLOOR_AREA_COLUMN,
+        )
+        if column in splits.input_columns
     )
     hp_controller_masked_input_indices = (
         ()
@@ -4392,15 +4552,19 @@ def run_closed_loop_training(
         float(config.prob_flex_kpi_crps_setpoint_threshold_c)
         / max(float(input_scale[0]), 1e-6)
     )
-    flex_kpi_crps_design_dim = 3
-    if config.prob_flex_kpi_crps_controls != "none":
-        flex_kpi_crps_design_dim += (input_dim - 1) + min(3, input_dim - 1)
-        if config.prob_flex_kpi_crps_controls == "full":
-            flex_kpi_crps_design_dim += 4
-    flex_kpi_crps_required_events = max(
-        config.prob_flex_kpi_crps_min_events,
-        flex_kpi_crps_design_dim + 1,
-    )
+    flex_kpi_crps_design_dim = 0
+    if config.prob_flex_kpi_crps_estimator == "regression":
+        flex_kpi_crps_design_dim = 3
+        if config.prob_flex_kpi_crps_controls != "none":
+            flex_kpi_crps_design_dim += (input_dim - 1) + min(3, input_dim - 1)
+            if config.prob_flex_kpi_crps_controls == "full":
+                flex_kpi_crps_design_dim += 4
+    flex_kpi_crps_required_events = config.prob_flex_kpi_crps_min_events
+    if config.prob_flex_kpi_crps_estimator == "regression":
+        flex_kpi_crps_required_events = max(
+            flex_kpi_crps_required_events,
+            flex_kpi_crps_design_dim + 1,
+        )
     flex_kpi_crps_eligible_windows: tuple[int, ...] = ()
     if is_probabilistic and config.prob_flex_kpi_crps_weight > 0.0:
         raw_setpoint = np.asarray(raw_train_windows.inputs[:, :, 0], dtype=np.float32)
@@ -4415,7 +4579,24 @@ def run_closed_loop_training(
                 np.abs(setpoint_delta) >= config.prob_flex_kpi_crps_setpoint_threshold_c,
                 axis=1,
             )
-            eligible_counts.append(int(np.sum(event_count >= flex_kpi_crps_required_events)))
+            eligible = event_count >= flex_kpi_crps_required_events
+            if config.prob_flex_kpi_crps_estimator == "direct_ratio":
+                event_mask = (
+                    np.abs(setpoint_delta)
+                    >= config.prob_flex_kpi_crps_setpoint_threshold_c
+                ) & (setpoint_delta != 0.0)
+                eligible = (
+                    np.sum(event_mask, axis=1) >= flex_kpi_crps_required_events
+                )
+                eligible &= np.any(
+                    event_mask & (setpoint_delta > 0.0),
+                    axis=1,
+                )
+                eligible &= np.any(
+                    event_mask & (setpoint_delta < 0.0),
+                    axis=1,
+                )
+            eligible_counts.append(int(np.sum(eligible)))
         flex_kpi_crps_eligible_windows = tuple(eligible_counts)
         if not any(flex_kpi_crps_eligible_windows):
             raise ValueError(
@@ -4531,6 +4712,7 @@ def run_closed_loop_training(
             target_mean=tuple(float(value) for value in target_mean_np),
             target_scale=tuple(float(value) for value in target_scale_np),
             availability_input_index=availability_input_index,
+            thermal_extra_input_indices=thermal_extra_input_indices,
             bptt_truncate_steps=config.bptt_truncate_steps,
             key=key,
         )
@@ -4611,6 +4793,7 @@ def run_closed_loop_training(
             target_mean=tuple(float(value) for value in target_mean_np),
             target_scale=tuple(float(value) for value in target_scale_np),
             availability_input_index=availability_input_index,
+            thermal_extra_input_indices=thermal_extra_input_indices,
             bptt_truncate_steps=config.bptt_truncate_steps,
             key=key,
         )
@@ -4632,8 +4815,8 @@ def run_closed_loop_training(
             f"xi_weight_scale={config.init_xi_weight_scale} "
             f"hp_active_log_sigma={config.init_hp_active_log_sigma}"
         )
-    print("temperature_alignment=u[t] -> Tin[t+1]")
-    print("power_alignment=u[t] -> Qroom[t], Pel_SH[t]")
+    print("temperature_alignment=Tin_previous,u_interval -> Tin_end")
+    print("power_alignment=u_interval -> Qroom_interval, Pel_SH_interval")
     bptt_hours = config.bptt_truncate_steps * config.hp_dt_hours
     if config.bptt_truncate_steps > 0:
         print(
@@ -4857,6 +5040,7 @@ def run_closed_loop_training(
             f"flex_kpi_crps_setpoint_threshold_c="
             f"{config.prob_flex_kpi_crps_setpoint_threshold_c} "
             f"flex_kpi_crps_min_events={config.prob_flex_kpi_crps_min_events} "
+            f"flex_kpi_crps_estimator={config.prob_flex_kpi_crps_estimator} "
             f"flex_kpi_crps_ridge={config.prob_flex_kpi_crps_ridge} "
             f"flex_kpi_crps_controls={config.prob_flex_kpi_crps_controls} "
             f"flex_kpi_crps_design_dim={flex_kpi_crps_design_dim} "
@@ -5036,6 +5220,7 @@ def run_closed_loop_training(
                     prob_flex_kpi_crps_horizons_hours,
                     prob_flex_kpi_crps_setpoint_threshold_norm,
                     config.prob_flex_kpi_crps_min_events,
+                    config.prob_flex_kpi_crps_estimator,
                     config.prob_flex_kpi_crps_ridge,
                     config.prob_flex_kpi_crps_controls,
                     config.prob_physics_weight,
@@ -6694,7 +6879,17 @@ def parse_args() -> TrainConfig:
         "--prob-flex-kpi-crps-min-events",
         type=int,
         default=20,
-        help="Minimum intervention count required to score one training-window KPI regression.",
+        help="Minimum intervention count required to score one training-window KPI estimate.",
+    )
+    parser.add_argument(
+        "--prob-flex-kpi-crps-estimator",
+        choices=("direct_ratio", "regression"),
+        default="regression",
+        help=(
+            "KPI functional scored by --prob-flex-kpi-crps-weight. direct_ratio "
+            "scores the directional ratio-of-sums F_H; regression preserves the "
+            "previous controlled H*beta objective."
+        ),
     )
     parser.add_argument(
         "--prob-flex-kpi-crps-ridge",
@@ -7224,6 +7419,7 @@ def parse_args() -> TrainConfig:
         prob_flex_kpi_crps_horizons_hours=tuple(args.prob_flex_kpi_crps_horizons_hours),
         prob_flex_kpi_crps_setpoint_threshold_c=args.prob_flex_kpi_crps_setpoint_threshold_c,
         prob_flex_kpi_crps_min_events=args.prob_flex_kpi_crps_min_events,
+        prob_flex_kpi_crps_estimator=args.prob_flex_kpi_crps_estimator,
         prob_flex_kpi_crps_ridge=args.prob_flex_kpi_crps_ridge,
         prob_flex_kpi_crps_controls=args.prob_flex_kpi_crps_controls,
         prob_physics_weight=args.prob_physics_weight,

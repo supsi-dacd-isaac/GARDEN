@@ -1,0 +1,67 @@
+# Local Python / tooling
+.venv/
+venv/
+.env
+.env.*
+!.env.example
+.python-version
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+dist/
+build/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.ipynb_checkpoints/
+
+# IDE / OS
+.idea/
+.vscode/
+*.swp
+.DS_Store
+Thumbs.db
+
+# Secrets / credentials (never commit)
+**/kaggle.json
+**/*credentials*.json
+**/*.pem
+**/*.p12
+**/*.pfx
+**/id_rsa
+**/id_ed25519
+
+# Large / identifiable simulation datasets
+data/
+output/
+*.pk
+*.pkl
+*.pickle
+*.parquet
+*.h5
+*.hdf5
+*.npz
+*.pt
+*.ckpt
+*.zip
+
+# Cadastre / geography dumps downloaded locally
+ti.zip
+**/ti.zip
+
+# Generated EnergyPlus run artifacts (keep templates tracked)
+building_simulation/output/
+building_simulation/input_files/automatically_generated/
+building_simulation/input_files/building_simulation/
+
+# Analysis plot / report dumps (derived from local data)
+flexibility_estimators/**_plots/
+flexibility_estimators/**_plots_smoke/
+flexibility_estimators/**/*.png
+flexibility_estimators/**/*.csv
+flexibility_estimators/**/*.json
+
+# Scratch
+/test.py

@@ -165,6 +165,8 @@ u[t] = [
   Tout[t],
   solar[t],
   ventilation[t],
+  non_people_internal_gain[t],
+  occupants_present[t],
 ]
 ```
 
@@ -179,6 +181,11 @@ so the first input becomes:
 ```text
 zone_thermal_heating_power_per_m2
 ```
+
+The zonal non-people gain is converted from kW to W/m2 using the modeled
+zone's `floor_area`; occupant presence is converted to persons/m2. Both are
+fed directly to the input encoder. Legacy simulation datasets that predate
+these physical inputs receive zero-valued gain and occupancy channels.
 
 For the non-recommended `--heating-mode heating_electric` case, the source is
 whole-building HP power. New runs therefore divide it by
@@ -646,7 +653,7 @@ closed_loop_hp_contracting
 Closed-loop models predict three channels instead of one:
 
 ```text
-[Tin[t+1], Qroom[t], Pel_SH[t]]
+[Tin_end, Qroom_interval, Pel_SH_interval]
 ```
 
 where:
@@ -730,20 +737,29 @@ standardized with the other metadata using training-set statistics.
 Alignment is fixed:
 
 ```text
-u[t] -> Tin[t+1]
-u[t] -> Qroom[t]
-u[t] -> Pel_SH[t]
+Tin_previous, u_interval -> Tin_end
+u_interval -> Qroom_interval
+u_interval -> Pel_SH_interval
 ```
 
-Targets are constructed as:
+EnergyPlus stores the interval forcing, interval-average power, and resulting
+end-of-interval temperature under one timestamp. After dropping the first row
+because it has no preceding temperature in the export, targets are constructed
+without an additional one-row shift:
 
 ```text
-Tin_target[t] = FL0_THZ0 zone air temperature at t+1
-Qroom[t]      = zone_thermal_heating_power[t] / floor_area
-Pel_SH[t]     = heat_pump_electric_power[t] / (floor_area * totalFloors)
-Pel_SH[t]     = 0 when hp_mode_is_dhw[t] > 0.5
-Qroom[t] = Pel_SH[t] = 0 from May 15 through September 30
+Tin_target[row] = FL0_THZ0 zone air temperature[row]
+Qroom[row]      = zone_thermal_heating_power[row] / floor_area
+Pel_SH[row]     = heat_pump_electric_power[row] / (floor_area * totalFloors)
+Pel_SH[row]     = 0 when hp_mode_is_dhw[row] > 0.5
 ```
+
+Seasonal availability is an input and a hard model-output gate. It does not
+rewrite measured simulator targets.
+
+The closed-loop input encoder additionally receives the modeled zone's
+non-people internal gain in W/m2 and occupancy in persons/m2. These signals are
+time-varying exogenous inputs; they are not added to the HVAC `Qroom` target.
 
 The two power targets have different physical scopes. `Qroom` is the heat
 delivered to the modeled first-zone apartment, so its denominator is that
@@ -989,7 +1005,7 @@ heat.
 The reported outputs are:
 
 ```text
-[Tin[t+1], Qroom[t], Pel_SH[t]] = decoder(s[t+1], u[t])
+[Tin_end, Qroom_interval, Pel_SH_interval] = decoder(s_next, u_interval)
 ```
 
 `Qroom` and `Pel_SH` are positive and capped by the same data-derived caps used
@@ -1230,13 +1246,15 @@ see linked sampled `Pel -> E -> Qroom -> Tin` trajectories. The BCE and active
 power NLL remain explicit auxiliary losses. The default
 `--prob-hp-training-mode expected` preserves the previous training behavior.
 
-### Direct flexibility-KPI CRPS
+### Flexibility-KPI CRPS
 
-An optional coefficient-level score targets the same upward and downward
-event-study gains used by `flexibility_event_study_kpis.py`:
+An optional trajectory-level score targets the upward and downward flexibility
+gains used by `flexibility_event_study_kpis.py`. Two estimators are available.
+The historical `regression` mode scores the fitted event-study coefficients:
 
 ```bash
 --prob-flex-kpi-crps-weight 1.0
+--prob-flex-kpi-crps-estimator regression
 --prob-flex-kpi-crps-horizons-hours 0.5 1 2 3
 --prob-flex-kpi-crps-setpoint-threshold-c 0.05
 --prob-flex-kpi-crps-min-events 20
@@ -1271,6 +1289,31 @@ calibration target. Ridge regularization and a minimum-event mask stabilize
 short-window regressions. Startup diagnostics report the design dimension,
 effective event requirement, and eligible training windows per horizon.
 Existing behavior is unchanged when the weight is zero, which is the default.
+
+The `direct_ratio` mode instead scores the same ratio-of-sums statistic used by
+default in ex-post flexibility evaluation:
+
+```bash
+--prob-flex-kpi-crps-weight 3.0
+--prob-flex-kpi-crps-estimator direct_ratio
+--prob-flex-kpi-crps-horizons-hours 0.5 1 2 3
+--prob-flex-kpi-crps-setpoint-threshold-c 0.05
+--prob-flex-kpi-crps-min-events 20
+```
+
+For each profile window and horizon it computes, separately by intervention
+direction,
+
+```text
+F_plus  = H sum(delta_P_H | delta_Tset > 0) / sum(delta_Tset | delta_Tset > 0)
+F_minus = H sum(delta_P_H | delta_Tset < 0) / sum(delta_Tset | delta_Tset < 0)
+```
+
+It then applies empirical CRPS to the particle distribution of `F_plus` and
+`F_minus`. A particle remains intact across every event in the sum, preserving
+trajectory-level dependence. Regression controls and ridge regularization do
+not apply in this mode. The score is skipped for windows with fewer than the
+configured event count or without interventions in both directions.
 
 The contracting probabilistic model also has an optional persistent HP
 controller:

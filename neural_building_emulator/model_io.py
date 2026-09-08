@@ -16,6 +16,8 @@ import numpy as np
 from .columns import (
     CLOSED_LOOP_CALENDAR_COLUMNS,
     DISTURBANCE_COLUMNS,
+    INTERNAL_GAIN_PER_FLOOR_AREA_COLUMN,
+    OCCUPANTS_PER_FLOOR_AREA_COLUMN,
     SPACE_HEATING_AVAILABILITY_COLUMN,
 )
 from .models import (
@@ -302,6 +304,14 @@ def _build_model_skeleton(
         if SPACE_HEATING_AVAILABILITY_COLUMN in input_columns
         else -1
     )
+    thermal_extra_input_indices = tuple(
+        input_columns.index(column)
+        for column in (
+            INTERNAL_GAIN_PER_FLOOR_AREA_COLUMN,
+            OCCUPANTS_PER_FLOOR_AREA_COLUMN,
+        )
+        if column in input_columns
+    )
     hp_controller_masked_input_indices = (
         ()
         if bool(config.get("hp_controller_calendar_features", True))
@@ -389,6 +399,7 @@ def _build_model_skeleton(
             target_mean=target_mean,
             target_scale=target_scale,
             availability_input_index=availability_input_index,
+            thermal_extra_input_indices=thermal_extra_input_indices,
             bptt_truncate_steps=int(config.get("bptt_truncate_steps", 0)),
             key=key,
         )
@@ -564,6 +575,7 @@ def _build_model_skeleton(
             target_mean=target_mean,
             target_scale=target_scale,
             availability_input_index=availability_input_index,
+            thermal_extra_input_indices=thermal_extra_input_indices,
             bptt_truncate_steps=int(config.get("bptt_truncate_steps", 0)),
             key=key,
         )

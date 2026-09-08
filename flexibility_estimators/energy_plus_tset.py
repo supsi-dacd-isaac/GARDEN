@@ -503,6 +503,50 @@ def _save_or_show(fig: plt.Figure, output_dir: Path | None, name: str) -> None:
         plt.show()
 
 
+def _kpi_distribution_plot(
+    kpis: pd.DataFrame,
+    *,
+    horizon_hours: float,
+    output_dir: Path | None,
+    filename: str,
+) -> None:
+    """Histogram of up/down flex, matching ``energy_plus_turnoff`` KPI dist style."""
+    fig, ax = plt.subplots(1, 1, layout="constrained")
+    kpis[["up_flex_wh_m2_k", "down_flex_wh_m2_k"]].plot.hist(alpha=0.5, bins=50, ax=ax)
+    ax.set_xlabel(rf"Event-study flexibility KPI @ {horizon_hours:g}h [Wh/(m²·K)]")
+    ax.set_title(rf"$H\cdot\beta$  ($H={horizon_hours:g}\,\mathrm{{h}}$)")
+    ax.legend([r"up_flex $H\cdot\beta_+$", r"down_flex $H\cdot\beta_-$"])
+    ax.spines[["top", "right"]].set_visible(False)
+    _save_or_show(fig, output_dir, filename)
+
+
+def _pred_vs_true_scatter(
+    y_true: np.ndarray,
+    y_pred: np.ndarray,
+    *,
+    xlabel: str,
+    ylabel: str,
+    title: str,
+    output_dir: Path | None,
+    filename: str,
+) -> None:
+    """Hold-out scatter with identity line, matching ``energy_plus_turnoff``."""
+    y_true = np.asarray(y_true, dtype=np.float64)
+    y_pred = np.asarray(y_pred, dtype=np.float64)
+    fig, ax = plt.subplots(1, 1, layout="constrained")
+    ax.scatter(y_true, y_pred, alpha=0.8)
+    lims = [
+        float(np.nanmin([np.min(y_true), np.min(y_pred), 0.0])),
+        float(np.nanmax([np.max(y_true), np.max(y_pred)])),
+    ]
+    ax.plot(lims, lims, c="k", ls="--")
+    ax.set_xlabel(xlabel)
+    ax.set_ylabel(ylabel)
+    ax.set_title(title)
+    ax.spines[["top", "right"]].set_visible(False)
+    _save_or_show(fig, output_dir, filename)
+
+
 def _parse_horizons(raw: str, dt_hours: float) -> tuple[float, ...]:
     values = tuple(float(item.strip()) for item in raw.split(",") if item.strip())
     if not values or any(value <= 0.0 for value in values):
@@ -828,6 +872,17 @@ def _fit_lgbm_holdout(
     fig.suptitle(title)
     _save_or_show(fig, output_dir, f"{filename_prefix}_lightgbm_predictions.png")
 
+    # Turnoff-style single scatter: predicted vs true KPI on the hold-out set.
+    _pred_vs_true_scatter(
+        y_te_np,
+        pred,
+        xlabel=xlabel,
+        ylabel="Predicted",
+        title=title,
+        output_dir=output_dir,
+        filename=f"{filename_prefix}_pred_vs_true.png",
+    )
+
     if optuna_trials > 0 and comparison.get("improvement_fraction") is not None:
         imp = comparison["improvement_fraction"]
         labels = ["MAE", "RMSE", "R²", "corr", "CV MAE"]
@@ -999,6 +1054,28 @@ def run_analysis(
         f"n_valid={len(primary_kpis)} "
         f"up_flex mean={primary_kpis['up_flex_wh_m2_k'].mean():.4f} "
         f"down_flex mean={primary_kpis['down_flex_wh_m2_k'].mean():.4f}"
+    )
+    print(
+        "up_flex [Wh/(m²·K)]: "
+        f"mean={primary_kpis['up_flex_wh_m2_k'].mean():.4f} "
+        f"std={primary_kpis['up_flex_wh_m2_k'].std():.4f} "
+        f"min={primary_kpis['up_flex_wh_m2_k'].min():.4f} "
+        f"max={primary_kpis['up_flex_wh_m2_k'].max():.4f}"
+    )
+    print(
+        "down_flex [Wh/(m²·K)]: "
+        f"mean={primary_kpis['down_flex_wh_m2_k'].mean():.4f} "
+        f"std={primary_kpis['down_flex_wh_m2_k'].std():.4f} "
+        f"min={primary_kpis['down_flex_wh_m2_k'].min():.4f} "
+        f"max={primary_kpis['down_flex_wh_m2_k'].max():.4f}"
+    )
+
+    # Turnoff-style overlapping KPI distribution at the primary horizon.
+    _kpi_distribution_plot(
+        primary_kpis,
+        horizon_hours=primary,
+        output_dir=output_dir,
+        filename="02b_primary_flex_kpi_distribution.png",
     )
 
     joined = meta.join(primary_kpis, how="inner")

@@ -38,8 +38,10 @@ from .columns import (
     HPPowerAreaNormalization,
     HP_MODE_IS_DHW_COLUMN,
     HP_SIZE_BINDING_COLUMN,
+    INTERNAL_GAIN_COLUMN,
     InputFeatureMode,
     METADATA_COLUMNS,
+    OCCUPANTS_PRESENT_COLUMN,
     PROFILE_ID_COLUMN,
     SETPOINT_TIMESERIES_COLUMN,
     SPACE_HEATING_AVAILABILITY_COLUMN,
@@ -51,6 +53,12 @@ from .columns import (
     normalize_heating_mode,
     required_columns,
     source_input_columns,
+)
+from .dataset_adapter import (
+    is_entity_profile_dataset,
+    read_entity_dataset,
+    read_entity_dataset_columns,
+    read_entity_profile_ids,
 )
 
 DEFAULT_DATASET_PATH = (
@@ -160,7 +168,51 @@ class ClosedLoopWindowedArrays:
     initial_temperature: np.ndarray
 
 
-def _read_parquet(path: Path, *, columns: Sequence[str], filters=None) -> pd.DataFrame:
+LEGACY_ZERO_FORCING_COLUMNS = frozenset(
+    (INTERNAL_GAIN_COLUMN, OCCUPANTS_PRESENT_COLUMN)
+)
+LEGACY_SYNTHESIZED_COLUMNS = frozenset((SPACE_HEATING_AVAILABILITY_COLUMN,))
+LEGACY_OPTIONAL_COLUMNS = LEGACY_ZERO_FORCING_COLUMNS | LEGACY_SYNTHESIZED_COLUMNS
+
+
+def _profile_ids_from_filters(filters) -> tuple[int, ...] | None:
+    if filters is None:
+        return None
+    clauses = filters if isinstance(filters, list) else [filters]
+    for clause in clauses:
+        if (
+            isinstance(clause, tuple)
+            and len(clause) == 3
+            and clause[0] == PROFILE_ID_COLUMN
+        ):
+            if clause[1] == "in":
+                return tuple(int(value) for value in clause[2])
+            if clause[1] in ("=", "=="):
+                return (int(clause[2]),)
+    return None
+
+
+def read_dataset_frame(
+    path: Path,
+    *,
+    columns: Sequence[str],
+    profile_ids: Sequence[int] | None = None,
+    filters=None,
+) -> pd.DataFrame:
+    """Read either legacy wide parquet or entity-oriented simulation folders."""
+    path = Path(path)
+    if is_entity_profile_dataset(path):
+        selected_ids = (
+            tuple(int(value) for value in profile_ids)
+            if profile_ids is not None
+            else _profile_ids_from_filters(filters)
+        )
+        return read_entity_dataset(
+            path,
+            columns=columns,
+            profile_ids=selected_ids,
+        )
+
     read_path: Path | list[Path]
     if path.is_dir():
         read_path = sorted(path.glob("*.parquet"))
@@ -168,13 +220,49 @@ def _read_parquet(path: Path, *, columns: Sequence[str], filters=None) -> pd.Dat
             raise FileNotFoundError(f"No parquet files found in {path}")
     else:
         read_path = path
+    requested_columns = tuple(dict.fromkeys(columns))
+    available_columns = set(pq.read_schema(read_path[0] if isinstance(read_path, list) else read_path).names)
+    missing_columns = set(requested_columns).difference(available_columns)
+    hard_missing = missing_columns.difference(LEGACY_OPTIONAL_COLUMNS)
+    if hard_missing:
+        raise ValueError(
+            "Parquet dataset is missing required columns: "
+            + ", ".join(repr(column) for column in sorted(hard_missing))
+        )
+    columns_to_read = [
+        column for column in requested_columns if column in available_columns
+    ]
+    effective_filters = filters
+    if effective_filters is None and profile_ids is not None:
+        effective_filters = [
+            (PROFILE_ID_COLUMN, "in", [int(value) for value in profile_ids])
+        ]
     try:
-        return pd.read_parquet(read_path, columns=list(columns), filters=filters)
+        frame = pd.read_parquet(
+            read_path,
+            columns=columns_to_read,
+            filters=effective_filters,
+        )
     except ImportError as exc:
         raise ImportError(
             "Reading the emulator parquet dataset requires pyarrow or fastparquet. "
             "Install the project dependencies, or run `uv add pyarrow`."
         ) from exc
+    except (ValueError, NotImplementedError):
+        frame = pd.read_parquet(read_path, columns=columns_to_read)
+        if profile_ids is not None:
+            frame = frame[frame[PROFILE_ID_COLUMN].isin(profile_ids)]
+    for column in missing_columns:
+        frame[column] = (
+            np.float32(np.nan)
+            if column in LEGACY_SYNTHESIZED_COLUMNS
+            else np.float32(0.0)
+        )
+    return frame.loc[:, requested_columns]
+
+
+def _read_parquet(path: Path, *, columns: Sequence[str], filters=None) -> pd.DataFrame:
+    return read_dataset_frame(path, columns=columns, filters=filters)
 
 
 def _parquet_files(path: Path) -> list[Path]:
@@ -188,11 +276,15 @@ def _parquet_files(path: Path) -> list[Path]:
 
 def read_parquet_columns(path: Path) -> tuple[str, ...]:
     """Read column names from the first parquet part without loading row data."""
+    if is_entity_profile_dataset(path):
+        return read_entity_dataset_columns(path)
     files = _parquet_files(path)
     return tuple(pq.read_schema(files[0]).names)
 
 
 def read_profile_ids(dataset_path: Path, profile_id_column: str = PROFILE_ID_COLUMN) -> tuple[int, ...]:
+    if profile_id_column == PROFILE_ID_COLUMN and is_entity_profile_dataset(dataset_path):
+        return read_entity_profile_ids(dataset_path)
     ids = _read_parquet(dataset_path, columns=[profile_id_column])[profile_id_column]
     ids = ids.dropna().astype(int).unique()
     return tuple(sorted(int(profile_id) for profile_id in ids))
@@ -361,7 +453,11 @@ def _check_required_columns(
     context: str,
 ) -> None:
     available = set(read_parquet_columns(dataset_path))
-    missing = [column for column in required if column not in available]
+    missing = [
+        column
+        for column in required
+        if column not in available and column not in LEGACY_OPTIONAL_COLUMNS
+    ]
     if missing:
         formatted = "\n  - ".join(missing)
         raise ValueError(
@@ -585,13 +681,16 @@ def to_closed_loop_profiles(
     df: pd.DataFrame,
     *,
     include_space_heating_availability: bool = True,
+    include_internal_gains: bool = True,
     hp_power_area_normalization: HPPowerAreaNormalization = "building_heated_area",
     metadata_columns: Sequence[str] | None = None,
 ) -> list[ClosedLoopProfile]:
     """Convert a dataframe split into profile arrays for closed-loop HP training.
 
-    The alignment is explicit: exogenous inputs and power targets are taken at t,
-    while the temperature target is Tin[t+1]. The initial temperature is Tin[t].
+    EnergyPlus rows report forcing, interval-average powers, and the resulting
+    end-of-interval zone temperature under the same timestamp. Each transition
+    therefore uses the previous row's temperature as its initial condition and
+    aligns the current row's inputs, Qroom, Pel, and temperature target.
     """
     metadata_columns = tuple(
         METADATA_COLUMNS if metadata_columns is None else metadata_columns
@@ -667,23 +766,44 @@ def to_closed_loop_profiles(
 
         temperature = group.loc[:, TARGET_COLUMN].to_numpy(dtype=np.float32)
         setpoint = group.loc[:, SETPOINT_TIMESERIES_COLUMN].to_numpy(dtype=np.float32)
-        disturbances = group.loc[:, DISTURBANCE_COLUMNS].to_numpy(dtype=np.float32)
-        availability = _space_heating_availability(profile_datetime)
+        disturbance_columns = (
+            DISTURBANCE_COLUMNS
+            if include_internal_gains
+            else DISTURBANCE_COLUMNS[:3]
+        )
+        disturbances = group.loc[:, disturbance_columns].to_numpy(dtype=np.float32)
+        if include_internal_gains:
+            internal_gain_index = disturbance_columns.index(INTERNAL_GAIN_COLUMN)
+            occupants_index = disturbance_columns.index(OCCUPANTS_PRESENT_COLUMN)
+            disturbances[:, internal_gain_index] = (
+                np.float32(1000.0)
+                * disturbances[:, internal_gain_index]
+                / np.float32(floor_area)
+            )
+            disturbances[:, occupants_index] = (
+                disturbances[:, occupants_index] / np.float32(floor_area)
+            )
+        availability_values = group.get(SPACE_HEATING_AVAILABILITY_COLUMN)
+        if availability_values is not None and bool(
+            np.all(np.isfinite(availability_values.to_numpy(dtype=np.float32)))
+        ):
+            availability = availability_values.to_numpy(dtype=np.float32)
+            if bool(np.any((availability < 0.0) | (availability > 1.0))):
+                raise ValueError(
+                    f"Profile {profile_id} has {SPACE_HEATING_AVAILABILITY_COLUMN!r} "
+                    "values outside [0, 1]"
+                )
+        else:
+            availability = _space_heating_availability(profile_datetime)
         calendar = _calendar_features(profile_datetime)
 
         q_room = group.loc[:, ZONE_THERMAL_HEATING_POWER_COLUMN].to_numpy(dtype=np.float32)
         p_el = group.loc[:, HEAT_PUMP_ELECTRIC_POWER_COLUMN].to_numpy(dtype=np.float32)
         dhw_mode = group.loc[:, HP_MODE_IS_DHW_COLUMN].to_numpy(dtype=np.float32) > np.float32(0.5)
-        if include_space_heating_availability:
-            space_heating_available = availability > np.float32(0.5)
-            q_room = np.where(space_heating_available, q_room, np.float32(0.0))
-            p_el = np.where(
-                dhw_mode | ~space_heating_available,
-                np.float32(0.0),
-                p_el,
-            )
-        else:
-            p_el = np.where(dhw_mode, np.float32(0.0), p_el)
+        # Availability is a model input/output gate, not a license to rewrite
+        # simulator observations. Preserve measured Qroom and remove only the
+        # explicitly identified DHW share from whole-HP electric power.
+        p_el = np.where(dhw_mode, np.float32(0.0), p_el)
 
         q_room = _positive_heating_signal(
             q_room,
@@ -703,13 +823,13 @@ def to_closed_loop_profiles(
             input_parts.append(availability)
         input_parts.append(calendar)
         inputs = np.column_stack(input_parts).astype(np.float32)
-        targets = np.column_stack([temperature[1:], q_room[:-1], p_el[:-1]]).astype(np.float32)
+        targets = np.column_stack([temperature[1:], q_room[1:], p_el[1:]]).astype(np.float32)
         profiles.append(
             ClosedLoopProfile(
                 profile_id=int(profile_id),
                 datetime=profile_datetime[1:],
                 metadata=metadata,
-                inputs=inputs[:-1],
+                inputs=inputs[1:],
                 targets=targets,
                 initial_temperature=temperature[:-1, np.newaxis].astype(np.float32),
             )
@@ -725,12 +845,17 @@ def to_profiles(
     heating_regime_window_steps: int = 96 * 7,
     heat_on_threshold: float = 1e-6,
     hp_power_area_normalization: HPPowerAreaNormalization = "building_heated_area",
+    *,
+    include_internal_gains: bool = True,
 ) -> list[BuildingProfile]:
     """Convert a dataframe split into per-building arrays."""
     mode = normalize_heating_mode(heating_mode)
     normalization = _validate_heat_input_normalization(heat_input_normalization)
     feature_mode = _validate_input_feature_mode(input_feature_mode)
-    in_cols = source_input_columns(mode)
+    in_cols = source_input_columns(
+        mode,
+        include_internal_gains=include_internal_gains,
+    )
     profiles: list[BuildingProfile] = []
 
     for profile_id, group in df.groupby(PROFILE_ID_COLUMN, sort=True):
@@ -738,13 +863,13 @@ def to_profiles(
         profile_datetime = _simulation_calendar_datetimes(group.loc[:, DATETIME_COLUMN].to_numpy())
         metadata = group.loc[:, METADATA_COLUMNS].iloc[0].to_numpy(dtype=np.float32)
         inputs = group.loc[:, in_cols].to_numpy(dtype=np.float32)
+        floor_area = float(group.loc[:, "floor_area"].iloc[0])
+        if not np.isfinite(floor_area) or floor_area <= 0.0:
+            raise ValueError(
+                f"Profile {profile_id} has invalid floor_area={floor_area!r}; "
+                "cannot normalize per-area forcing inputs."
+            )
         if normalization == "per_floor_area":
-            floor_area = float(group.loc[:, "floor_area"].iloc[0])
-            if not np.isfinite(floor_area) or floor_area <= 0.0:
-                raise ValueError(
-                    f"Profile {profile_id} has invalid floor_area={floor_area!r}; "
-                    "cannot normalize heat input to W/m2."
-                )
             heat_input_area = floor_area
             if mode == "heating_electric":
                 total_floors = float(group.loc[:, "totalFloors"].iloc[0])
@@ -761,6 +886,17 @@ def to_profiles(
                         "'building_heated_area'"
                     )
             inputs[:, 0] = inputs[:, 0] / heat_input_area
+        if include_internal_gains:
+            internal_gain_index = in_cols.index(INTERNAL_GAIN_COLUMN)
+            occupants_index = in_cols.index(OCCUPANTS_PRESENT_COLUMN)
+            inputs[:, internal_gain_index] = (
+                np.float32(1000.0)
+                * inputs[:, internal_gain_index]
+                / np.float32(floor_area)
+            )
+            inputs[:, occupants_index] = (
+                inputs[:, occupants_index] / np.float32(floor_area)
+            )
         if feature_mode == "heating_regime":
             inputs = np.column_stack(
                 [

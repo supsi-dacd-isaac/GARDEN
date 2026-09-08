@@ -55,6 +55,7 @@ class ClosedLoopHPEmulator(eqx.Module):
     outdoor_input_index: int = eqx.field(static=True)
     solar_input_index: int = eqx.field(static=True)
     ventilation_input_index: int = eqx.field(static=True)
+    thermal_extra_input_indices: tuple[int, ...] = eqx.field(static=True)
     availability_input_index: int = eqx.field(static=True)
     temperature_target_index: int = eqx.field(static=True)
     qroom_target_index: int = eqx.field(static=True)
@@ -89,6 +90,7 @@ class ClosedLoopHPEmulator(eqx.Module):
         target_mean: tuple[float, ...] = (),
         target_scale: tuple[float, ...] = (),
         availability_input_index: int = -1,
+        thermal_extra_input_indices: tuple[int, ...] = (),
         bptt_truncate_steps: int = DEFAULT_BPTT_TRUNCATE_STEPS,
         key: jax.Array,
     ) -> None:
@@ -117,6 +119,13 @@ class ClosedLoopHPEmulator(eqx.Module):
             raise ValueError("closed_loop_hp target scalers must have exactly 3 outputs")
         if availability_input_index >= input_dim:
             raise ValueError("availability_input_index must be smaller than input_dim")
+        thermal_extra_input_indices = tuple(
+            int(index) for index in thermal_extra_input_indices
+        )
+        if any(index < 0 or index >= input_dim for index in thermal_extra_input_indices):
+            raise ValueError("thermal_extra_input_indices must be valid input indices")
+        if len(set(thermal_extra_input_indices)) != len(thermal_extra_input_indices):
+            raise ValueError("thermal_extra_input_indices must be unique")
 
         (
             theta_key,
@@ -130,7 +139,7 @@ class ClosedLoopHPEmulator(eqx.Module):
             encoder_key,
         ) = jax.random.split(key, 9)
 
-        thermal_feature_dim = 7
+        thermal_feature_dim = 7 + len(thermal_extra_input_indices)
         encoded_input_dim = thermal_feature_dim if input_encoder_dim is None else input_encoder_dim
         slices = parameter_slices(state_dim, encoded_input_dim, 1)
         controller_feature_dim = input_dim + controller_state_dim + 4
@@ -194,6 +203,7 @@ class ClosedLoopHPEmulator(eqx.Module):
         self.outdoor_input_index = 1
         self.solar_input_index = 2
         self.ventilation_input_index = 3
+        self.thermal_extra_input_indices = thermal_extra_input_indices
         self.availability_input_index = availability_input_index
         self.temperature_target_index = 0
         self.qroom_target_index = 1
@@ -310,16 +320,22 @@ class ClosedLoopHPEmulator(eqx.Module):
     ) -> jnp.ndarray:
         outdoor_gap = self._weather_as_target_scaled(input_t, self.outdoor_input_index) - temperature_t
         setpoint_gap = self._weather_as_target_scaled(input_t, self.setpoint_input_index) - temperature_t
-        features = jnp.stack(
+        exogenous = jnp.asarray(
             [
                 input_t[self.outdoor_input_index],
                 input_t[self.solar_input_index],
                 input_t[self.ventilation_input_index],
-                qroom_scaled,
-                temperature_t,
-                outdoor_gap,
-                setpoint_gap,
-            ],
+                *(input_t[index] for index in self.thermal_extra_input_indices),
+            ]
+        )
+        features = jnp.concatenate(
+            [
+                exogenous,
+                jnp.asarray(
+                    [qroom_scaled, temperature_t, outdoor_gap, setpoint_gap],
+                    dtype=input_t.dtype,
+                ),
+            ]
         )
         if self.thermal_encoder is None:
             return features

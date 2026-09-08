@@ -1,12 +1,21 @@
 """Estimate setpoint-shock flexibility KPIs from saved closed-loop emulator runs.
 
-This script uses a windowed event-study estimator. For every thermostat
-setpoint discontinuity at event time t, and for every activation duration H, it
-computes
+For every thermostat setpoint discontinuity at event time t, and for every
+activation duration H, this script computes
 
     delta_p_H = mean(P[t : t + H]) - mean(P[t - H : t])
 
-and regresses that response on the setpoint jump:
+By default, it reports the directional ratio-of-sums energy KPI
+
+    F_H^+ = H * sum(delta_p_H | delta_tset > 0)
+                  / sum(delta_tset | delta_tset > 0)
+
+    F_H^- = H * sum(delta_p_H | delta_tset < 0)
+                  / sum(delta_tset | delta_tset < 0).
+
+The previous windowed regression estimator remains available with
+``--kpi-estimator regression``. It regresses the event response on the setpoint
+jump:
 
     delta_p_H = alpha_H
               + beta_plus_H  * max(delta_tset, 0)
@@ -39,11 +48,17 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 
 from .columns import (
+    INTERNAL_GAIN_PER_FLOOR_AREA_COLUMN,
     PROFILE_ID_COLUMN,
     SPACE_HEATING_AVAILABILITY_COLUMN,
     closed_loop_required_columns,
 )
-from .data import ClosedLoopProfile, DEFAULT_DATASET_PATH, to_closed_loop_profiles
+from .data import (
+    ClosedLoopProfile,
+    DEFAULT_DATASET_PATH,
+    read_dataset_frame,
+    to_closed_loop_profiles,
+)
 from .model_io import load_training_artifact
 from .models import (
     ClosedLoopHPEmulator,
@@ -60,6 +75,7 @@ from .train import (
 ProfileSource = Literal["test", "train", "selected"]
 EmulationKpiMode = Literal["mean", "scenario_average"]
 ControlsMode = Literal["none", "weather", "full"]
+KpiEstimator = Literal["direct_ratio", "regression"]
 ProbHpScenarioMode = Literal["expected", "bernoulli"]
 ProbHpEmissionOverride = Literal["artifact", "bounded", "legacy_lognormal_mean"]
 
@@ -72,6 +88,7 @@ class EventStudyConfig:
     min_setpoint_change: float
     min_events: int
     controls: ControlsMode
+    estimator: KpiEstimator = "regression"
 
 
 @dataclass(frozen=True)
@@ -96,12 +113,16 @@ class FlexibilityKpi:
 
 
 class OLSAccumulator:
-    """Collect sufficient statistics for a pooled least-squares regression."""
+    """Collect pooled sufficient statistics for either KPI estimator."""
 
     def __init__(self) -> None:
         self.xtx: np.ndarray | None = None
         self.xty: np.ndarray | None = None
         self.event_count = 0
+        self.up_response_sum = 0.0
+        self.up_delta_sum = 0.0
+        self.down_response_sum = 0.0
+        self.down_delta_sum = 0.0
 
     def add(self, regression_data: RegressionData) -> None:
         design = regression_data.design
@@ -116,6 +137,12 @@ class OLSAccumulator:
         else:
             self.xtx = self.xtx + xtx
             self.xty = self.xty + xty
+        up = regression_data.deltas > 0.0
+        down = regression_data.deltas < 0.0
+        self.up_response_sum += float(np.sum(response[up]))
+        self.up_delta_sum += float(np.sum(regression_data.deltas[up]))
+        self.down_response_sum += float(np.sum(response[down]))
+        self.down_delta_sum += float(np.sum(regression_data.deltas[down]))
         self.event_count += int(len(response))
 
     def estimate(
@@ -125,7 +152,20 @@ class OLSAccumulator:
         horizon_hours: float,
         horizon_steps: int,
         min_events: int,
+        estimator: KpiEstimator = "regression",
     ) -> FlexibilityKpi:
+        if estimator == "direct_ratio":
+            return kpi_from_directional_sums(
+                profile_id=profile_id,
+                horizon_hours=horizon_hours,
+                horizon_steps=horizon_steps,
+                event_count=self.event_count,
+                min_events=min_events,
+                up_response_sum=self.up_response_sum,
+                up_delta_sum=self.up_delta_sum,
+                down_response_sum=self.down_response_sum,
+                down_delta_sum=self.down_delta_sum,
+            )
         if self.xtx is None or self.xty is None:
             return invalid_kpi(profile_id, horizon_hours, horizon_steps, event_count=0)
         if self.event_count < min_events or self.event_count <= self.xtx.shape[0]:
@@ -183,6 +223,71 @@ def kpi_from_coefficients(
     )
 
 
+def kpi_from_directional_sums(
+    *,
+    profile_id: int,
+    horizon_hours: float,
+    horizon_steps: int,
+    event_count: int,
+    min_events: int,
+    up_response_sum: float,
+    up_delta_sum: float,
+    down_response_sum: float,
+    down_delta_sum: float,
+) -> FlexibilityKpi:
+    if (
+        event_count < min_events
+        or not np.isfinite(up_response_sum)
+        or not np.isfinite(down_response_sum)
+        or not np.isfinite(up_delta_sum)
+        or not np.isfinite(down_delta_sum)
+        or up_delta_sum <= 1e-12
+        or down_delta_sum >= -1e-12
+    ):
+        return invalid_kpi(
+            profile_id,
+            horizon_hours,
+            horizon_steps,
+            event_count=event_count,
+        )
+    beta_plus = float(up_response_sum / up_delta_sum)
+    beta_minus = float(down_response_sum / down_delta_sum)
+    return FlexibilityKpi(
+        profile_id=int(profile_id),
+        horizon_hours=float(horizon_hours),
+        horizon_steps=int(horizon_steps),
+        event_count=int(event_count),
+        valid=True,
+        beta_plus_w_m2_k=beta_plus,
+        beta_minus_w_m2_k=beta_minus,
+        up_flex_wh_m2_k=float(horizon_hours * beta_plus),
+        down_flex_wh_m2_k=float(horizon_hours * beta_minus),
+    )
+
+
+def estimate_direct_kpi_from_regression_data(
+    *,
+    profile_id: int,
+    horizon_hours: float,
+    horizon_steps: int,
+    data: RegressionData,
+    min_events: int,
+) -> FlexibilityKpi:
+    up = data.deltas > 0.0
+    down = data.deltas < 0.0
+    return kpi_from_directional_sums(
+        profile_id=profile_id,
+        horizon_hours=horizon_hours,
+        horizon_steps=horizon_steps,
+        event_count=int(len(data.response)),
+        min_events=min_events,
+        up_response_sum=float(np.sum(data.response[up])),
+        up_delta_sum=float(np.sum(data.deltas[up])),
+        down_response_sum=float(np.sum(data.response[down])),
+        down_delta_sum=float(np.sum(data.deltas[down])),
+    )
+
+
 def estimate_kpi_from_regression_data(
     *,
     profile_id: int,
@@ -210,19 +315,11 @@ def estimate_kpi_from_regression_data(
 
 
 def _read_parquet(path: Path, *, columns: Iterable[str], profile_ids: list[int]) -> pd.DataFrame:
-    filters = [(PROFILE_ID_COLUMN, "in", profile_ids)]
-    read_path: Path | list[Path]
-    if path.is_dir():
-        read_path = sorted(path.glob("*.parquet"))
-        if not read_path:
-            raise FileNotFoundError(f"No parquet files found in {path}")
-    else:
-        read_path = path
-    try:
-        return pd.read_parquet(read_path, columns=list(columns), filters=filters)
-    except (ValueError, NotImplementedError):
-        df = pd.read_parquet(read_path, columns=list(columns))
-        return df[df[PROFILE_ID_COLUMN].isin(profile_ids)].copy()
+    return read_dataset_frame(
+        path,
+        columns=list(columns),
+        profile_ids=profile_ids,
+    )
 
 
 def _config_value(metadata: dict[str, Any], name: str, default: Any) -> Any:
@@ -314,6 +411,16 @@ def _previous_event_deltas(all_events: np.ndarray, all_deltas: np.ndarray, event
 
 
 def _window_mean(values: np.ndarray, starts: np.ndarray, ends: np.ndarray) -> np.ndarray:
+    starts = np.asarray(starts, dtype=np.int64)
+    ends = np.asarray(ends, dtype=np.int64)
+    widths = ends - starts
+    if len(starts) and np.all(widths == widths[0]) and widths[0] > 0:
+        windows = np.lib.stride_tricks.sliding_window_view(
+            values,
+            window_shape=int(widths[0]),
+            axis=0,
+        )
+        return np.asarray(np.mean(windows[starts], axis=-1), dtype=np.float64)
     return np.asarray(
         [np.mean(values[int(start) : int(end)], axis=0) for start, end in zip(starts, ends)],
         dtype=np.float64,
@@ -371,7 +478,7 @@ def regression_data_for_trace(
         dset_minus,
     ]
 
-    if config.controls != "none":
+    if config.estimator == "regression" and config.controls != "none":
         disturbances_calendar = profile.inputs[events, 1:].astype(np.float64)
         disturbance_values = profile.inputs[:, 1:4].astype(np.float64)
         pre_disturbance = _window_mean(disturbance_values, pre_starts, pre_ends)
@@ -419,8 +526,13 @@ def estimate_trace_flexibility(
             horizon_steps=horizon_steps,
             config=config,
         )
+        estimate = (
+            estimate_direct_kpi_from_regression_data
+            if config.estimator == "direct_ratio"
+            else estimate_kpi_from_regression_data
+        )
         kpis.append(
-            estimate_kpi_from_regression_data(
+            estimate(
                 profile_id=profile.profile_id,
                 horizon_hours=horizon_hours,
                 horizon_steps=horizon_steps,
@@ -481,19 +593,22 @@ def _load_closed_loop_profiles(
     profile_ids: list[int],
     *,
     include_space_heating_availability: bool,
+    include_internal_gains: bool,
     hp_power_area_normalization: str = "zone_floor_area",
     metadata_columns: Sequence[str] | None = None,
 ) -> list[ClosedLoopProfile]:
     df = _read_parquet(
         dataset_path,
         columns=closed_loop_required_columns(
-            None if metadata_columns is None else tuple(metadata_columns)
+            None if metadata_columns is None else tuple(metadata_columns),
+            include_internal_gains=include_internal_gains,
         ),
         profile_ids=profile_ids,
     )
     profiles = to_closed_loop_profiles(
         df,
         include_space_heating_availability=include_space_heating_availability,
+        include_internal_gains=include_internal_gains,
         hp_power_area_normalization=hp_power_area_normalization,  # type: ignore[arg-type]
         metadata_columns=metadata_columns,
     )
@@ -592,6 +707,7 @@ def _estimate_pooled_rows(
             horizon_hours=horizon_hours,
             horizon_steps=horizon_steps,
             min_events=config.min_events,
+            estimator=config.estimator,
         )
         rows.append(
             {
@@ -1025,6 +1141,11 @@ def run_analysis(args: argparse.Namespace) -> None:
         min_setpoint_change=float(args.min_setpoint_change),
         min_events=int(args.min_events),
         controls=args.controls,
+        estimator=args.kpi_estimator,
+    )
+    print(
+        f"kpi_estimator={config.estimator} "
+        f"controls={'not_applied' if config.estimator == 'direct_ratio' else config.controls}"
     )
 
     candidate_ids = _saved_profile_ids(metadata, args.profile_source)
@@ -1034,6 +1155,10 @@ def run_analysis(args: argparse.Namespace) -> None:
         profile_ids,
         include_space_heating_availability=(
             SPACE_HEATING_AVAILABILITY_COLUMN in artifact.metadata.get("input_columns", [])
+        ),
+        include_internal_gains=(
+            INTERNAL_GAIN_PER_FLOOR_AREA_COLUMN
+            in artifact.metadata.get("input_columns", [])
         ),
         hp_power_area_normalization=str(
             _config_value(metadata, "hp_power_area_normalization", "zone_floor_area")
@@ -1174,15 +1299,18 @@ def run_analysis(args: argparse.Namespace) -> None:
         "horizon_steps": list(config.horizon_steps),
         "dt_hours": float(config.dt_hours),
         "min_setpoint_change": float(config.min_setpoint_change),
+        "kpi_estimator": config.estimator,
         "controls": config.controls,
+        "controls_applied": config.estimator == "regression" and config.controls != "none",
         "up_flex_wh_m2_k_by_horizon": _signal_summary_by_horizon(profile_df, "up_flex_wh_m2_k"),
         "down_flex_wh_m2_k_by_horizon": _signal_summary_by_horizon(profile_df, "down_flex_wh_m2_k"),
         "kpi_coverage_by_horizon": coverage_summary,
         "pooled_kpis": pooled_rows,
         "interpretation": (
-            "Each beta is the average HP electric-power modulation over H per 1 K setpoint jump. "
-            "Energy flexibility is H*beta. down_flex uses min(delta_tset,0); a positive value means "
-            "a -1 K setpoint shock reduces electric energy by that Wh/m2 over duration H."
+            "With direct_ratio, F_H is H times the directional ratio of summed post-minus-pre "
+            "power responses to summed signed setpoint changes; beta is retained as F_H/H. "
+            "With regression, beta is the corresponding controlled OLS coefficient and F_H=H*beta. "
+            "A positive downward value means a -1 K shock reduces electrical energy."
         ),
     }
 
@@ -1210,7 +1338,8 @@ def run_analysis(args: argparse.Namespace) -> None:
             f"<br><sup>{model_kind}, {args.emulation_kpi_mode}, "
             f"hp_emission={getattr(artifact.model, 'hp_emission_mode', None)}, "
             f"H={','.join(f'{h:g}' for h in config.horizons_hours)} h, "
-            f"controls={config.controls}</sup>"
+            f"estimator={config.estimator}, "
+            f"controls={'not applied' if config.estimator == 'direct_ratio' else config.controls}</sup>"
         ),
     )
     if not coverage_df.empty:
@@ -1308,11 +1437,21 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--min-setpoint-change", type=float, default=0.05)
     parser.add_argument("--min-events", type=int, default=20)
     parser.add_argument(
+        "--kpi-estimator",
+        choices=("direct_ratio", "regression"),
+        default="direct_ratio",
+        help=(
+            "direct_ratio computes F_H directly from directional ratios of aggregate event "
+            "responses (default); regression retains the previous controlled OLS beta estimator."
+        ),
+    )
+    parser.add_argument(
         "--controls",
         choices=("none", "weather", "full"),
         default="full",
         help=(
-            "none uses only setpoint jumps; weather adds event weather/calendar and "
+            "Only used by --kpi-estimator regression. none uses only setpoint jumps; "
+            "weather adds event weather/calendar and "
             "post-minus-pre weather-window changes; full also adds pre-window power, "
             "pre-event indoor temperature, previous setpoint, and previous setpoint jump."
         ),

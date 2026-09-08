@@ -22,6 +22,12 @@ HP_REF_COP_COLUMN = "hp_ref_cop"
 HP_MODEL_NAME_COLUMN = "hp_model_name"
 SH_DESIGN_CAPACITY_COLUMN = "SH_design_cap_W"
 SH_VOLUME_COLUMN = "shVolume_m3"
+INTERNAL_GAIN_COLUMN = "input_non_people_internal_gain_net_kw"
+OCCUPANTS_PRESENT_COLUMN = "input_occupants_present"
+INTERNAL_GAIN_PER_FLOOR_AREA_COLUMN = (
+    "input_non_people_internal_gain_net_w_per_m2"
+)
+OCCUPANTS_PER_FLOOR_AREA_COLUMN = "input_occupants_present_per_m2"
 
 HEATING_INPUT_COLUMNS: dict[str, str] = {
     "zone_thermal": "zone_thermal_heating_power",
@@ -40,6 +46,14 @@ DISTURBANCE_COLUMNS = [
     "Environment, Site Outdoor Air Drybulb Temperature",
     "Environment, Site Global Horizontal Solar Radiation Rate per Area",
     "FL0_THZ0, Zone Ventilation Standard Density Volume Flow Rate",
+    INTERNAL_GAIN_COLUMN,
+    OCCUPANTS_PRESENT_COLUMN,
+]
+
+DISTURBANCE_INPUT_COLUMNS = [
+    *DISTURBANCE_COLUMNS[:3],
+    INTERNAL_GAIN_PER_FLOOR_AREA_COLUMN,
+    OCCUPANTS_PER_FLOOR_AREA_COLUMN,
 ]
 
 CLOSED_LOOP_CALENDAR_COLUMNS = [
@@ -51,7 +65,7 @@ CLOSED_LOOP_CALENDAR_COLUMNS = [
 
 CLOSED_LOOP_INPUT_COLUMNS = [
     SETPOINT_TIMESERIES_COLUMN,
-    *DISTURBANCE_COLUMNS,
+    *DISTURBANCE_INPUT_COLUMNS,
     SPACE_HEATING_AVAILABILITY_COLUMN,
     *CLOSED_LOOP_CALENDAR_COLUMNS,
 ]
@@ -120,10 +134,19 @@ def normalize_heating_mode(mode: str) -> HeatingMode:
     return normalized  # type: ignore[return-value]
 
 
-def source_input_columns(heating_mode: str) -> list[str]:
+def source_input_columns(
+    heating_mode: str,
+    *,
+    include_internal_gains: bool = True,
+) -> list[str]:
     """Return raw parquet input columns: selected heat signal plus disturbances."""
     mode = normalize_heating_mode(heating_mode)
-    return [HEATING_INPUT_COLUMNS[mode], *DISTURBANCE_COLUMNS]
+    disturbances = (
+        DISTURBANCE_COLUMNS
+        if include_internal_gains
+        else DISTURBANCE_COLUMNS[:3]
+    )
+    return [HEATING_INPUT_COLUMNS[mode], *disturbances]
 
 
 def input_columns(
@@ -131,15 +154,26 @@ def input_columns(
     heat_input_normalization: HeatInputNormalization = "raw",
     input_feature_mode: InputFeatureMode = "base",
     heating_regime_window_steps: int = 96 * 7,
+    *,
+    include_internal_gains: bool = True,
 ) -> list[str]:
     """Return model input names after optional heat-channel normalization."""
-    raw_columns = source_input_columns(heating_mode)
+    raw_columns = source_input_columns(
+        heating_mode,
+        include_internal_gains=include_internal_gains,
+    )
     if heat_input_normalization == "raw":
-        columns = raw_columns
+        heat_column = raw_columns[0]
     elif heat_input_normalization == "per_floor_area":
-        columns = [f"{raw_columns[0]}_per_m2", *raw_columns[1:]]
+        heat_column = f"{raw_columns[0]}_per_m2"
     else:
         raise ValueError("heat_input_normalization must be 'raw' or 'per_floor_area'")
+    disturbance_columns = (
+        DISTURBANCE_INPUT_COLUMNS
+        if include_internal_gains
+        else DISTURBANCE_INPUT_COLUMNS[:3]
+    )
+    columns = [heat_column, *disturbance_columns]
 
     if input_feature_mode == "base":
         return columns
@@ -153,19 +187,28 @@ def input_columns(
     raise ValueError("input_feature_mode must be 'base' or 'heating_regime'")
 
 
-def required_columns(heating_mode: str) -> list[str]:
+def required_columns(
+    heating_mode: str,
+    *,
+    include_internal_gains: bool = True,
+) -> list[str]:
     """Return the full parquet column subset needed for a training split."""
     return [
         DATETIME_COLUMN,
         PROFILE_ID_COLUMN,
         TARGET_COLUMN,
-        *source_input_columns(heating_mode),
+        *source_input_columns(
+            heating_mode,
+            include_internal_gains=include_internal_gains,
+        ),
         *METADATA_COLUMNS,
     ]
 
 
 def closed_loop_required_columns(
     metadata_columns: list[str] | tuple[str, ...] | None = None,
+    *,
+    include_internal_gains: bool = True,
 ) -> list[str]:
     """Return the parquet columns needed by the closed-loop HP emulator."""
     resolved_metadata = METADATA_COLUMNS if metadata_columns is None else metadata_columns
@@ -177,10 +220,15 @@ def closed_loop_required_columns(
         PROFILE_ID_COLUMN,
         TARGET_COLUMN,
         SETPOINT_TIMESERIES_COLUMN,
-        *DISTURBANCE_COLUMNS,
+        *(
+            DISTURBANCE_COLUMNS
+            if include_internal_gains
+            else DISTURBANCE_COLUMNS[:3]
+        ),
         ZONE_THERMAL_HEATING_POWER_COLUMN,
         HEAT_PUMP_ELECTRIC_POWER_COLUMN,
         HP_MODE_IS_DHW_COLUMN,
+        SPACE_HEATING_AVAILABILITY_COLUMN,
         *METADATA_COLUMNS,
         *(CLOSED_LOOP_HP_METADATA_SOURCE_COLUMNS if requires_hp_metadata else ()),
     ]

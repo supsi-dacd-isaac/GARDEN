@@ -8,8 +8,8 @@ from typing import Any, Iterable
 
 import numpy as np
 import pandas as pd
-
 from .columns import (
+    INTERNAL_GAIN_PER_FLOOR_AREA_COLUMN,
     PROFILE_ID_COLUMN,
     SPACE_HEATING_AVAILABILITY_COLUMN,
     closed_loop_required_columns,
@@ -20,6 +20,7 @@ from .data import (
     WindowConfig,
     make_closed_loop_windows,
     make_windows,
+    read_dataset_frame,
     to_closed_loop_profiles,
     to_profiles,
 )
@@ -43,19 +44,11 @@ from .train import (
 
 
 def _read_parquet(path: Path, *, columns: Iterable[str], profile_ids: list[int]) -> pd.DataFrame:
-    filters = [(PROFILE_ID_COLUMN, "in", profile_ids)]
-    read_path: Path | list[Path]
-    if path.is_dir():
-        read_path = sorted(path.glob("*.parquet"))
-        if not read_path:
-            raise FileNotFoundError(f"No parquet files found in {path}")
-    else:
-        read_path = path
-    try:
-        return pd.read_parquet(read_path, columns=list(columns), filters=filters)
-    except (ValueError, NotImplementedError):
-        df = pd.read_parquet(read_path, columns=list(columns))
-        return df[df[PROFILE_ID_COLUMN].isin(profile_ids)].copy()
+    return read_dataset_frame(
+        path,
+        columns=list(columns),
+        profile_ids=profile_ids,
+    )
 
 
 def _config_value(metadata: dict[str, Any], name: str, default: Any) -> Any:
@@ -99,10 +92,16 @@ def regenerate_closed_loop_plots(
     model_kind = str(metadata["model_kind"])
     test_ids = _saved_test_ids(metadata)
     metadata_columns = tuple(metadata.get("metadata_columns", ()))
+    include_internal_gains = (
+        INTERNAL_GAIN_PER_FLOOR_AREA_COLUMN in metadata.get("input_columns", [])
+    )
 
     df = _read_parquet(
         dataset_path,
-        columns=closed_loop_required_columns(metadata_columns or None),
+        columns=closed_loop_required_columns(
+            metadata_columns or None,
+            include_internal_gains=include_internal_gains,
+        ),
         profile_ids=test_ids,
     )
     profiles = to_closed_loop_profiles(
@@ -110,6 +109,7 @@ def regenerate_closed_loop_plots(
         include_space_heating_availability=(
             SPACE_HEATING_AVAILABILITY_COLUMN in metadata.get("input_columns", [])
         ),
+        include_internal_gains=include_internal_gains,
         hp_power_area_normalization=str(
             _config_value(metadata, "hp_power_area_normalization", "zone_floor_area")
         ),  # type: ignore[arg-type]
@@ -222,10 +222,16 @@ def regenerate_q_to_t_plots(
             _config_value(metadata, "heating_regime_window_steps", 96 * 7),
         )
     )
+    include_internal_gains = (
+        INTERNAL_GAIN_PER_FLOOR_AREA_COLUMN in metadata.get("input_columns", [])
+    )
 
     df = _read_parquet(
         dataset_path,
-        columns=required_columns(heating_mode),
+        columns=required_columns(
+            heating_mode,
+            include_internal_gains=include_internal_gains,
+        ),
         profile_ids=test_ids,
     )
     profiles = to_profiles(
@@ -238,6 +244,7 @@ def regenerate_q_to_t_plots(
         hp_power_area_normalization=str(
             _config_value(metadata, "hp_power_area_normalization", "zone_floor_area")
         ),  # type: ignore[arg-type]
+        include_internal_gains=include_internal_gains,
     )
     profiles = [profile for profile in profiles if profile.profile_id in set(test_ids)]
     profiles.sort(key=lambda profile: test_ids.index(profile.profile_id))
