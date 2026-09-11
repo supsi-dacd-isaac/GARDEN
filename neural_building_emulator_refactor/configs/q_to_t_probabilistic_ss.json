@@ -1,0 +1,21 @@
+{
+  "state_dim": 5,
+  "hidden_dim": 32,
+  "depth": 3,
+  "input_encoder_dim": 8,
+  "input_encoder_hidden_dim": 64,
+  "input_encoder_depth": 2,
+  "input_encoder_feedback": "thermal_gaps",
+  "zero_d": true,
+  "schur_mode": "near_identity",
+  "schur_gamma": 0.99,
+  "target_mode": "absolute",
+  "prob_particles": 10,
+  "prob_eval_particles": 16,
+  "prob_plot_particles": 100,
+  "prob_latent_dim": 4,
+  "prob_process_noise": "heteroscedastic",
+  "prob_softopt_weight": 0.1,
+  "prob_variogram_weight": 0.1,
+  "num_full_profile_plots": 5
+}
