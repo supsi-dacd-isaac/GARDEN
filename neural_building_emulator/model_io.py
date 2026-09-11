@@ -15,6 +15,7 @@ import numpy as np
 
 from .columns import (
     CLOSED_LOOP_CALENDAR_COLUMNS,
+    DHW_MIXED_WATER_PER_HEATED_AREA_COLUMN,
     DISTURBANCE_COLUMNS,
     INTERNAL_GAIN_PER_FLOOR_AREA_COLUMN,
     OCCUPANTS_PER_FLOOR_AREA_COLUMN,
@@ -321,6 +322,14 @@ def _build_model_skeleton(
             if column in CLOSED_LOOP_CALENDAR_COLUMNS
         )
     )
+    dhw_request_input_index = (
+        input_columns.index(DHW_MIXED_WATER_PER_HEATED_AREA_COLUMN)
+        if DHW_MIXED_WATER_PER_HEATED_AREA_COLUMN in input_columns
+        else -1
+    )
+    thermal_dynamics_masked_input_indices = (
+        (dhw_request_input_index,) if dhw_request_input_index >= 0 else ()
+    )
 
     if model_kind == "deterministic":
         return MetadataStateSpaceEmulator(
@@ -442,6 +451,7 @@ def _build_model_skeleton(
             availability_input_index=availability_input_index,
             bptt_truncate_steps=int(config.get("bptt_truncate_steps", 0)),
             hp_controller_masked_input_indices=hp_controller_masked_input_indices,
+            thermal_dynamics_masked_input_indices=thermal_dynamics_masked_input_indices,
             thermostat_demand_mode=config.get("hp_thermostat_demand_mode", "unconstrained"),
             thermostat_slope_min=float(config.get("hp_thermostat_slope_min", 0.1)),
             thermostat_slope_max=float(config.get("hp_thermostat_slope_max", 6.0)),
@@ -493,6 +503,12 @@ def _build_model_skeleton(
                 config.get("prob_hp_controller_noise_scale", 0.0)
             ),
             hp_history_hours=float(config.get("prob_hp_history_hours", 3.0)),
+            hp_setpoint_shock_timescales_hours=tuple(
+                float(value)
+                for value in config.get(
+                    "prob_hp_setpoint_shock_timescales_hours", ()
+                )
+            ),
             contraction_gamma=float(config.get("contracting_gamma", 0.99)),
             state_bound=float(config.get("contracting_state_bound", 5.0)),
             temperature_output_scale=float(config.get("contracting_temperature_scale", 8.0)),
@@ -517,6 +533,7 @@ def _build_model_skeleton(
             availability_input_index=availability_input_index,
             bptt_truncate_steps=int(config.get("bptt_truncate_steps", 0)),
             hp_controller_masked_input_indices=hp_controller_masked_input_indices,
+            thermal_dynamics_masked_input_indices=thermal_dynamics_masked_input_indices,
             thermostat_demand_mode=config.get("hp_thermostat_demand_mode", "unconstrained"),
             thermostat_slope_min=float(config.get("hp_thermostat_slope_min", 0.1)),
             thermostat_slope_max=float(config.get("hp_thermostat_slope_max", 6.0)),

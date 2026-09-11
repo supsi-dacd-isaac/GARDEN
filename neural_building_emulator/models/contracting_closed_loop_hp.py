@@ -96,6 +96,7 @@ class ContractingClosedLoopHPEmulator(eqx.Module):
     pel_target_index: int = eqx.field(static=True)
     bptt_truncate_steps: int = eqx.field(static=True)
     hp_controller_masked_input_indices: tuple[int, ...] = eqx.field(static=True)
+    thermal_dynamics_masked_input_indices: tuple[int, ...] = eqx.field(static=True)
     thermostat_demand_mode: ThermostatDemandMode = eqx.field(static=True)
     thermostat_slope_min: float = eqx.field(static=True)
     thermostat_slope_max: float = eqx.field(static=True)
@@ -137,6 +138,7 @@ class ContractingClosedLoopHPEmulator(eqx.Module):
         availability_input_index: int = -1,
         bptt_truncate_steps: int = DEFAULT_BPTT_TRUNCATE_STEPS,
         hp_controller_masked_input_indices: tuple[int, ...] = (),
+        thermal_dynamics_masked_input_indices: tuple[int, ...] = (),
         thermostat_demand_mode: ThermostatDemandMode = "unconstrained",
         thermostat_slope_min: float = 0.1,
         thermostat_slope_max: float = 6.0,
@@ -268,6 +270,15 @@ class ContractingClosedLoopHPEmulator(eqx.Module):
             hp_controller_masked_input_indices
         ):
             raise ValueError("hp_controller_masked_input_indices must be unique")
+        thermal_dynamics_masked_input_indices = tuple(
+            int(index) for index in thermal_dynamics_masked_input_indices
+        )
+        if any(index < 0 or index >= input_dim for index in thermal_dynamics_masked_input_indices):
+            raise ValueError("thermal_dynamics_masked_input_indices must be valid input indices")
+        if len(set(thermal_dynamics_masked_input_indices)) != len(
+            thermal_dynamics_masked_input_indices
+        ):
+            raise ValueError("thermal_dynamics_masked_input_indices must be unique")
 
         (
             encoder_key,
@@ -415,6 +426,7 @@ class ContractingClosedLoopHPEmulator(eqx.Module):
         self.pel_target_index = 2
         self.bptt_truncate_steps = bptt_truncate_steps
         self.hp_controller_masked_input_indices = hp_controller_masked_input_indices
+        self.thermal_dynamics_masked_input_indices = thermal_dynamics_masked_input_indices
         self.thermostat_demand_mode = thermostat_demand_mode
         self.thermostat_slope_min = float(thermostat_slope_min)
         self.thermostat_slope_max = float(thermostat_slope_max)
@@ -665,6 +677,9 @@ class ContractingClosedLoopHPEmulator(eqx.Module):
         thermal_inputs = input_t[1:]
         if self.availability_input_index >= 1:
             thermal_inputs = thermal_inputs.at[self.availability_input_index - 1].set(0.0)
+        for index in self.thermal_dynamics_masked_input_indices:
+            if index >= 1:
+                thermal_inputs = thermal_inputs.at[index - 1].set(0.0)
         if self.q_to_t_mode == "positive_leaky":
             return jnp.concatenate(
                 [

@@ -20,7 +20,9 @@ from plotly.subplots import make_subplots
 
 from .columns import (
     CLOSED_LOOP_CALENDAR_COLUMNS,
+    CLOSED_LOOP_METADATA_COLUMNS,
     CLOSED_LOOP_TARGET_COLUMNS,
+    DHW_MIXED_WATER_PER_HEATED_AREA_COLUMN,
     DISTURBANCE_COLUMNS,
     HEATING_INPUT_COLUMNS,
     HPPowerAreaNormalization,
@@ -75,6 +77,7 @@ from .scaling import (
     transform_profiles,
     transform_windows,
 )
+from .ventilation import VentilationRolloutMode, build_eplus_ventilation_schedule
 
 TargetMode = Literal["absolute", "delta", "residual"]
 CheckpointMetric = Literal[
@@ -309,6 +312,7 @@ class TrainConfig:
     prob_hp_controller_leak: float = 0.25
     prob_hp_controller_noise_scale: float = 0.0
     prob_hp_history_hours: float = 3.0
+    prob_hp_setpoint_shock_timescales_hours: tuple[float, ...] = ()
     hp_active_power_nll_weight: float = 1.0
     hp_inactive_leakage_weight: float = 0.1
     bptt_truncate_steps: int = DEFAULT_BPTT_TRUNCATE_STEPS
@@ -1765,6 +1769,7 @@ def closed_loop_stability_penalty(
         hp_mode_history = aux[PROB_CLOSED_LOOP_AUX_HP_MODE_HISTORY]
         previous_mode = aux[PROB_CLOSED_LOOP_AUX_HP_PREVIOUS_MODE]
         q_response_state = aux[PROB_CLOSED_LOOP_AUX_Q_RESPONSE_STATE]
+        setpoint_shock_features = jax.vmap(model.setpoint_shock_features)(inputs)
         state_size = model.stability_state_dim()
         directions = jax.random.normal(
             direction_key,
@@ -1813,6 +1818,7 @@ def closed_loop_stability_penalty(
                 state,
                 process_noise_t,
                 controller_noise_t,
+                setpoint_shock_features[batch_index, time_index],
             )
             sigma_max = local_jacobian_spectral_norm(
                 step_fn,
@@ -2020,7 +2026,7 @@ def probabilistic_closed_loop_loss_fn(
 
     hp_bce_component = zero
     if hp_mode_loss_weight > 0.0:
-        if hp_activation_model == "persistent_markov" and inputs.shape[1] > 1:
+        if hp_activation_model in ("persistent_markov", "asymmetric_markov") and inputs.shape[1] > 1:
             p_start = jnp.mean(
                 aux[PROB_CLOSED_LOOP_AUX_HP_P_START][:, :, 1:],
                 axis=1,
@@ -2933,6 +2939,39 @@ def predict_closed_loop_full_profile(
     return inverse_target(np.asarray(prediction[0]), scalers)
 
 
+def _probabilistic_ventilation_rollout_kwargs(
+    profile: ClosedLoopProfile,
+    *,
+    mode: VentilationRolloutMode,
+    metadata_columns: Sequence[str] | None,
+) -> dict[str, jnp.ndarray | float]:
+    if mode == "recorded":
+        return {}
+    if mode != "eplus_rule":
+        raise ValueError("ventilation_rollout_mode must be 'recorded' or 'eplus_rule'")
+    resolved_metadata_columns = tuple(metadata_columns or CLOSED_LOOP_METADATA_COLUMNS)
+    if len(resolved_metadata_columns) != profile.metadata.shape[-1]:
+        raise ValueError(
+            "EnergyPlus ventilation rollout needs the artifact metadata_columns in "
+            "the same order as profile.metadata"
+        )
+    schedule = build_eplus_ventilation_schedule(
+        profile.datetime,
+        profile.metadata,
+        resolved_metadata_columns,
+    )
+    return {
+        "ventilation_time_available": jnp.asarray(schedule.time_available),
+        "ventilation_minimum_indoor_temperature_c": jnp.asarray(
+            schedule.minimum_indoor_temperature_c
+        ),
+        "ventilation_nominal_flow_m3_s": schedule.nominal_flow_m3_s,
+        "ventilation_minimum_indoor_outdoor_delta_c": (
+            schedule.minimum_indoor_outdoor_delta_c
+        ),
+    }
+
+
 def predict_probabilistic_closed_loop_full_profile(
     model: ProbabilisticClosedLoopModel,
     profile: ClosedLoopProfile,
@@ -2940,6 +2979,8 @@ def predict_probabilistic_closed_loop_full_profile(
     *,
     key: jax.Array,
     num_particles: int,
+    ventilation_rollout_mode: VentilationRolloutMode = "recorded",
+    metadata_columns: Sequence[str] | None = None,
 ) -> np.ndarray:
     """Run one mean probabilistic closed-loop rollout over a complete profile."""
     metadata = scalers.metadata.transform(profile.metadata)
@@ -2949,6 +2990,11 @@ def predict_probabilistic_closed_loop_full_profile(
     initial_temperature = (
         (profile.initial_temperature[0] - target_mean[:1]) / target_scale[:1]
     ).astype(np.float32)
+    ventilation_kwargs = _probabilistic_ventilation_rollout_kwargs(
+        profile,
+        mode=ventilation_rollout_mode,
+        metadata_columns=metadata_columns,
+    )
     particles = model.sample(
         jnp.asarray(metadata),
         jnp.asarray(inputs),
@@ -2957,6 +3003,7 @@ def predict_probabilistic_closed_loop_full_profile(
         num_particles=num_particles,
         sample_process_noise=False,
         hp_scenario_mode="expected",
+        **ventilation_kwargs,
     )
     prediction = np.asarray(jnp.mean(particles, axis=0))
     return inverse_target(prediction, scalers)
@@ -2970,6 +3017,8 @@ def sample_probabilistic_closed_loop_full_profile_scenarios(
     key: jax.Array,
     num_particles: int,
     hp_scenario_mode: HPElectricScenarioMode,
+    ventilation_rollout_mode: VentilationRolloutMode = "recorded",
+    metadata_columns: Sequence[str] | None = None,
 ) -> np.ndarray:
     """Sample joint closed-loop scenarios in physical units.
 
@@ -2983,6 +3032,11 @@ def sample_probabilistic_closed_loop_full_profile_scenarios(
     initial_temperature = (
         (profile.initial_temperature[0] - target_mean[:1]) / target_scale[:1]
     ).astype(np.float32)
+    ventilation_kwargs = _probabilistic_ventilation_rollout_kwargs(
+        profile,
+        mode=ventilation_rollout_mode,
+        metadata_columns=metadata_columns,
+    )
     raw_predictions = model.sample(
         jnp.asarray(metadata),
         jnp.asarray(inputs),
@@ -2991,6 +3045,7 @@ def sample_probabilistic_closed_loop_full_profile_scenarios(
         num_particles=num_particles,
         sample_process_noise=True,
         hp_scenario_mode=hp_scenario_mode,
+        **ventilation_kwargs,
     )
     return inverse_target(np.asarray(raw_predictions), scalers)
 
@@ -3027,6 +3082,8 @@ def evaluate_probabilistic_closed_loop_full_profiles(
     scalers: WindowScalers,
     *,
     num_particles: int,
+    ventilation_rollout_mode: VentilationRolloutMode = "recorded",
+    metadata_columns: Sequence[str] | None = None,
 ) -> dict[str, float]:
     """Evaluate one continuous mean probabilistic closed-loop rollout per profile."""
     if not profiles:
@@ -3050,6 +3107,8 @@ def evaluate_probabilistic_closed_loop_full_profiles(
                 scalers,
                 key=profile_key,
                 num_particles=num_particles,
+                ventilation_rollout_mode=ventilation_rollout_mode,
+                metadata_columns=metadata_columns,
             )
         )
     targets = [profile.targets for profile in profiles]
@@ -3425,6 +3484,8 @@ def save_probabilistic_closed_loop_prediction_visualizations(
     hp_scenario_mode: HPElectricScenarioMode,
     filename_suffix: str = "_closed_loop_hp_prob",
     title_label: str = "probabilistic closed-loop HP",
+    ventilation_rollout_mode: VentilationRolloutMode = "recorded",
+    metadata_columns: Sequence[str] | None = None,
 ) -> dict[str, Path]:
     """Save probabilistic closed-loop rollout plots with joint scenario intervals."""
     if test_windows.targets.shape[0] == 0 or not test_profiles:
@@ -3493,6 +3554,8 @@ def save_probabilistic_closed_loop_prediction_visualizations(
             key=profile_key,
             num_particles=num_particles,
             hp_scenario_mode=hp_scenario_mode,
+            ventilation_rollout_mode=ventilation_rollout_mode,
+            metadata_columns=metadata_columns,
         )
         prediction = np.mean(scenarios, axis=0)
         lower = np.quantile(scenarios, 0.025, axis=0)
@@ -4298,10 +4361,11 @@ def run_closed_loop_training(
             "independent",
             "persistent_markov",
             "power_history",
+            "asymmetric_markov",
         ):
             raise ValueError(
                 "prob_hp_activation_model must be 'independent', 'persistent_markov', "
-                "or 'power_history'"
+                "'power_history', or 'asymmetric_markov'"
             )
         if config.prob_hp_persistent_latent_dim < 1:
             raise ValueError("prob_hp_persistent_latent_dim must be positive")
@@ -4311,8 +4375,25 @@ def run_closed_loop_training(
             raise ValueError("prob_hp_controller_noise_scale must be non-negative")
         if config.prob_hp_history_hours <= 0.0:
             raise ValueError("prob_hp_history_hours must be positive")
+        if any(
+            value <= 0.0
+            for value in config.prob_hp_setpoint_shock_timescales_hours
+        ):
+            raise ValueError(
+                "prob_hp_setpoint_shock_timescales_hours must contain positive durations"
+            )
+        if len(set(config.prob_hp_setpoint_shock_timescales_hours)) != len(
+            config.prob_hp_setpoint_shock_timescales_hours
+        ):
+            raise ValueError(
+                "prob_hp_setpoint_shock_timescales_hours must contain unique durations"
+            )
         if (
-            config.prob_hp_activation_model in ("persistent_markov", "power_history")
+            config.prob_hp_activation_model in (
+                "persistent_markov",
+                "power_history",
+                "asymmetric_markov",
+            )
             and not is_contracting_probabilistic
         ):
             raise ValueError(
@@ -4456,6 +4537,14 @@ def run_closed_loop_training(
             for index, column in enumerate(splits.input_columns)
             if column in CLOSED_LOOP_CALENDAR_COLUMNS
         )
+    )
+    dhw_request_input_index = (
+        list(splits.input_columns).index(DHW_MIXED_WATER_PER_HEATED_AREA_COLUMN)
+        if DHW_MIXED_WATER_PER_HEATED_AREA_COLUMN in splits.input_columns
+        else -1
+    )
+    thermal_dynamics_masked_input_indices = (
+        (dhw_request_input_index,) if dhw_request_input_index >= 0 else ()
     )
     window_config = WindowConfig(
         sequence_length=config.sequence_length,
@@ -4650,6 +4739,9 @@ def run_closed_loop_training(
             hp_controller_leak=config.prob_hp_controller_leak,
             hp_controller_noise_scale=config.prob_hp_controller_noise_scale,
             hp_history_hours=config.prob_hp_history_hours,
+            hp_setpoint_shock_timescales_hours=(
+                config.prob_hp_setpoint_shock_timescales_hours
+            ),
             contraction_gamma=config.contracting_gamma,
             state_bound=config.contracting_state_bound,
             temperature_output_scale=config.contracting_temperature_scale,
@@ -4672,6 +4764,7 @@ def run_closed_loop_training(
             availability_input_index=availability_input_index,
             bptt_truncate_steps=config.bptt_truncate_steps,
             hp_controller_masked_input_indices=hp_controller_masked_input_indices,
+            thermal_dynamics_masked_input_indices=thermal_dynamics_masked_input_indices,
             thermostat_demand_mode=config.hp_thermostat_demand_mode,
             thermostat_slope_min=config.hp_thermostat_slope_min,
             thermostat_slope_max=config.hp_thermostat_slope_max,
@@ -4757,6 +4850,7 @@ def run_closed_loop_training(
             availability_input_index=availability_input_index,
             bptt_truncate_steps=config.bptt_truncate_steps,
             hp_controller_masked_input_indices=hp_controller_masked_input_indices,
+            thermal_dynamics_masked_input_indices=thermal_dynamics_masked_input_indices,
             thermostat_demand_mode=config.hp_thermostat_demand_mode,
             thermostat_slope_min=config.hp_thermostat_slope_min,
             thermostat_slope_max=config.hp_thermostat_slope_max,
@@ -4852,6 +4946,13 @@ def run_closed_loop_training(
         "space_heating_availability=hard_gate "
         f"input_index={availability_input_index} off=May15-Sep30 "
         "gated_outputs=[Qroom,Pel_SH] thermal_direct_input=false"
+    )
+    print(
+        "dhw_request_input="
+        f"{'enabled' if dhw_request_input_index >= 0 else 'disabled'} "
+        f"input_index={dhw_request_input_index} "
+        "thermal_direct_input=false initialization_input=false "
+        "hp_controller_input=true"
     )
     print(
         "closed_loop_hp_profile_filter=hp_ref_capacity_W>0,hp_size_binding=SH "
@@ -5017,7 +5118,9 @@ def run_closed_loop_training(
             f"hp_persistent_latent_dim={config.prob_hp_persistent_latent_dim} "
             f"hp_controller_leak={config.prob_hp_controller_leak} "
             f"hp_controller_noise_scale={config.prob_hp_controller_noise_scale} "
-            f"hp_history_hours={config.prob_hp_history_hours}"
+            f"hp_history_hours={config.prob_hp_history_hours} "
+            "hp_setpoint_shock_timescales_hours="
+            f"{list(config.prob_hp_setpoint_shock_timescales_hours)}"
         )
         print(
             "probabilistic_closed_loop_loss "
@@ -5490,6 +5593,11 @@ def run_closed_loop_training(
             ),
             "prob_hp_history_hours": (
                 config.prob_hp_history_hours if is_probabilistic else ""
+            ),
+            "prob_hp_setpoint_shock_timescales_hours": (
+                list(config.prob_hp_setpoint_shock_timescales_hours)
+                if is_probabilistic
+                else ""
             ),
             "prob_hp_concrete_temperature": (
                 config.prob_hp_concrete_temperature if is_probabilistic else ""
@@ -7153,14 +7261,17 @@ def parse_args() -> TrainConfig:
     )
     parser.add_argument(
         "--prob-hp-activation-model",
-        choices=("independent", "persistent_markov", "power_history"),
+        choices=("independent", "persistent_markov", "power_history", "asymmetric_markov"),
         default="independent",
         help=(
             "HP on/off dynamics for the contracting probabilistic closed-loop model. "
             "'independent' preserves per-step Bernoulli activation. 'persistent_markov' "
             "uses particle-persistent HP heterogeneity, a bounded recurrent controller state, "
             "and separate learned start/stop probabilities. 'power_history' conditions the "
-            "emission on causal bounded EWMAs of generated HP power and duty cycle."
+            "emission on causal bounded EWMAs of generated HP power and duty cycle. "
+            "'asymmetric_markov' combines those causal histories with separate learned "
+            "off-to-on and on-to-off transition probabilities; expected training propagates "
+            "the mode probability and Bernoulli inference samples the resulting Markov chain."
         ),
     )
     parser.add_argument(
@@ -7194,6 +7305,17 @@ def parse_args() -> TrainConfig:
         help=(
             "Positive EWMA time constant in hours for generated HP power and duty-cycle "
             "history when --prob-hp-activation-model power_history."
+        ),
+    )
+    parser.add_argument(
+        "--prob-hp-setpoint-shock-timescales-hours",
+        type=float,
+        nargs="+",
+        default=(),
+        help=(
+            "Optional decay timescales in hours for causal positive and negative "
+            "setpoint-jump traces supplied to the contracting probabilistic HP "
+            "emission and transition heads. An empty list preserves the previous model."
         ),
     )
     parser.add_argument(
@@ -7433,6 +7555,9 @@ def parse_args() -> TrainConfig:
         prob_hp_controller_leak=args.prob_hp_controller_leak,
         prob_hp_controller_noise_scale=args.prob_hp_controller_noise_scale,
         prob_hp_history_hours=args.prob_hp_history_hours,
+        prob_hp_setpoint_shock_timescales_hours=tuple(
+            args.prob_hp_setpoint_shock_timescales_hours
+        ),
         hp_controller_state_dim=args.hp_controller_state_dim,
         hp_controller_calendar_features=args.hp_controller_calendar_features,
         hp_thermostat_demand_mode=args.hp_thermostat_demand_mode,

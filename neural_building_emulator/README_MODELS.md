@@ -1351,6 +1351,56 @@ architecture. The persistent controller is currently implemented only for
 previous-mode probability are included in the sampled whole-state Jacobian
 penalty.
 
+For a smaller, explicitly asymmetric controller, use:
+
+```bash
+--prob-hp-activation-model asymmetric_markov
+--prob-hp-training-mode expected
+--prob-hp-scenario-mode bernoulli
+--prob-hp-history-hours 3
+```
+
+This mode has no additional recurrent controller network. It carries causal
+EWMAs of generated HP electric power and duty cycle and learns two transition
+probabilities:
+
+```text
+p01[t] = Pr(m[t]=1 | m[t-1]=0, c, xi, u[t], T[t], E[t], history[t])
+p10[t] = Pr(m[t]=0 | m[t-1]=1, c, xi, u[t], T[t], E[t], history[t])
+p[t]   = (1-p[t-1]) p01[t] + p[t-1] (1-p10[t])
+```
+
+Expected-mode training propagates `p[t]` and expected electric power through
+the buffer and thermal model. Bernoulli scenario generation instead carries a
+hard sampled mode, so each trajectory is a sample from the corresponding
+two-state Markov chain. The same sampled `xi` remains fixed for the complete
+trajectory and conditions both transition heads. This mode is intended to
+represent asymmetric startup and shutdown persistence without the extra
+latent recurrent state used by `persistent_markov`.
+
+The contracting probabilistic HP controller can additionally receive causal
+setpoint-shock traces:
+
+```bash
+--prob-hp-setpoint-shock-timescales-hours 0.5 1 2 3
+```
+
+For each configured timescale `h`, the model constructs separate positive and
+negative states from the normalized setpoint change:
+
+```text
+r_plus[h,t]  = exp(-dt/h) r_plus[h,t-1]  + max(dTset[t], 0)
+r_minus[h,t] = exp(-dt/h) r_minus[h,t-1] + max(-dTset[t], 0)
+```
+
+The current traces are supplied to the HP emission network and, when present,
+the start/stop transition network. They are deterministic functions of the
+known setpoint sequence, are shared by all particles, and do not enlarge the
+endogenous state covered by the contraction condition. The first sample of a
+rollout has zero shock because its preceding setpoint is unavailable. Omitting
+the option preserves the previous architecture and keeps old artifacts
+loadable.
+
 Scenario plots use:
 
 ```bash
@@ -1399,7 +1449,7 @@ The training HP path is selected independently from plot generation:
 ```text
 --prob-hp-training-mode expected|straight_through
 --prob-hp-scenario-mode expected|bernoulli
---prob-hp-activation-model independent|persistent_markov
+--prob-hp-activation-model independent|persistent_markov|power_history|asymmetric_markov
 ```
 
 The straight-through gradient is biased, even though its forward trajectories
@@ -1438,7 +1488,8 @@ s = active recurrent state
 ```
 
 The active state contains `[x, E, T]` plus the controller/previous-mode state
-for `persistent_markov`, or the power/mode histories for `power_history`.
+for `persistent_markov`, the power/mode histories for `power_history`, or both
+the previous-mode probability and histories for `asymmetric_markov`.
 Dormant identity states are excluded. Heteroscedastic-noise checks use sampled
 nonzero noise. The default differentiable power iteration is evaluated only
 once every configured number of optimizer steps; `exact_svd` remains available

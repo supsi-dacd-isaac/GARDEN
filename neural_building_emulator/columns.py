@@ -15,6 +15,7 @@ TARGET_COLUMN = "FL0_THZ0, Zone Air Temperature"
 SETPOINT_TIMESERIES_COLUMN = "FL0_THZ0, Zone Thermostat Heating Setpoint Temperature"
 SPACE_HEATING_AVAILABILITY_COLUMN = "space_heating_available"
 HP_MODE_IS_DHW_COLUMN = "hp_mode_is_dhw"
+DHW_MIXED_WATER_COLUMN = "input_dhw_mixed_water_l"
 HP_SIZE_BINDING_COLUMN = "hp_size_binding"
 SPACE_HEATING_HP_SIZE_BINDING = "SH"
 HP_REF_CAPACITY_COLUMN = "hp_ref_capacity_W"
@@ -28,6 +29,9 @@ INTERNAL_GAIN_PER_FLOOR_AREA_COLUMN = (
     "input_non_people_internal_gain_net_w_per_m2"
 )
 OCCUPANTS_PER_FLOOR_AREA_COLUMN = "input_occupants_present_per_m2"
+DHW_MIXED_WATER_PER_HEATED_AREA_COLUMN = (
+    "input_dhw_mixed_water_l_per_h_m2_heated_area"
+)
 
 HEATING_INPUT_COLUMNS: dict[str, str] = {
     "zone_thermal": "zone_thermal_heating_power",
@@ -66,6 +70,7 @@ CLOSED_LOOP_CALENDAR_COLUMNS = [
 CLOSED_LOOP_INPUT_COLUMNS = [
     SETPOINT_TIMESERIES_COLUMN,
     *DISTURBANCE_INPUT_COLUMNS,
+    DHW_MIXED_WATER_PER_HEATED_AREA_COLUMN,
     SPACE_HEATING_AVAILABILITY_COLUMN,
     *CLOSED_LOOP_CALENDAR_COLUMNS,
 ]
@@ -209,6 +214,7 @@ def closed_loop_required_columns(
     metadata_columns: list[str] | tuple[str, ...] | None = None,
     *,
     include_internal_gains: bool = True,
+    include_dhw_request: bool = True,
 ) -> list[str]:
     """Return the parquet columns needed by the closed-loop HP emulator."""
     resolved_metadata = METADATA_COLUMNS if metadata_columns is None else metadata_columns
@@ -225,6 +231,7 @@ def closed_loop_required_columns(
             if include_internal_gains
             else DISTURBANCE_COLUMNS[:3]
         ),
+        *([DHW_MIXED_WATER_COLUMN] if include_dhw_request else ()),
         ZONE_THERMAL_HEATING_POWER_COLUMN,
         HEAT_PUMP_ELECTRIC_POWER_COLUMN,
         HP_MODE_IS_DHW_COLUMN,

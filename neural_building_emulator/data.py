@@ -20,6 +20,7 @@ from .columns import (
     CLOSED_LOOP_METADATA_COLUMNS,
     CLOSED_LOOP_INPUT_COLUMNS,
     CLOSED_LOOP_TARGET_COLUMNS,
+    DHW_MIXED_WATER_COLUMN,
     HP_MODEL_NAME_CATEGORIES,
     HP_MODEL_NAME_COLUMN,
     HP_MODEL_NAME_ONE_HOT_COLUMNS,
@@ -169,7 +170,7 @@ class ClosedLoopWindowedArrays:
 
 
 LEGACY_ZERO_FORCING_COLUMNS = frozenset(
-    (INTERNAL_GAIN_COLUMN, OCCUPANTS_PRESENT_COLUMN)
+    (INTERNAL_GAIN_COLUMN, OCCUPANTS_PRESENT_COLUMN, DHW_MIXED_WATER_COLUMN)
 )
 LEGACY_SYNTHESIZED_COLUMNS = frozenset((SPACE_HEATING_AVAILABILITY_COLUMN,))
 LEGACY_OPTIONAL_COLUMNS = LEGACY_ZERO_FORCING_COLUMNS | LEGACY_SYNTHESIZED_COLUMNS
@@ -652,6 +653,15 @@ def _calendar_features(datetime_values: np.ndarray) -> np.ndarray:
     ).astype(np.float32)
 
 
+def _median_timestep_hours(datetime_values: np.ndarray) -> np.float32:
+    datetimes = pd.to_datetime(pd.Series(_simulation_calendar_datetimes(datetime_values)))
+    seconds = datetimes.diff().dt.total_seconds().dropna().to_numpy(dtype=np.float32)
+    seconds = seconds[seconds > np.float32(0.0)]
+    if seconds.size == 0:
+        return np.float32(0.25)
+    return np.float32(np.median(seconds) / np.float32(3600.0))
+
+
 def _space_heating_availability(datetime_values: np.ndarray) -> np.ndarray:
     """Reproduce the EnergyPlus May 15 through September 30 SH lockout."""
     datetimes = pd.to_datetime(pd.Series(_simulation_calendar_datetimes(datetime_values)))
@@ -682,6 +692,7 @@ def to_closed_loop_profiles(
     *,
     include_space_heating_availability: bool = True,
     include_internal_gains: bool = True,
+    include_dhw_request: bool = True,
     hp_power_area_normalization: HPPowerAreaNormalization = "building_heated_area",
     metadata_columns: Sequence[str] | None = None,
 ) -> list[ClosedLoopProfile]:
@@ -796,6 +807,13 @@ def to_closed_loop_profiles(
         else:
             availability = _space_heating_availability(profile_datetime)
         calendar = _calendar_features(profile_datetime)
+        if include_dhw_request:
+            timestep_hours = max(float(_median_timestep_hours(profile_datetime)), 1e-6)
+            if DHW_MIXED_WATER_COLUMN in group:
+                dhw_l = group.loc[:, DHW_MIXED_WATER_COLUMN].to_numpy(dtype=np.float32)
+            else:
+                dhw_l = np.zeros(len(group), dtype=np.float32)
+            dhw_request = dhw_l / np.float32(timestep_hours * heated_area)
 
         q_room = group.loc[:, ZONE_THERMAL_HEATING_POWER_COLUMN].to_numpy(dtype=np.float32)
         p_el = group.loc[:, HEAT_PUMP_ELECTRIC_POWER_COLUMN].to_numpy(dtype=np.float32)
@@ -819,6 +837,8 @@ def to_closed_loop_profiles(
         p_el = p_el / np.float32(hp_power_area)
 
         input_parts: list[np.ndarray] = [setpoint, disturbances]
+        if include_dhw_request:
+            input_parts.append(dhw_request)
         if include_space_heating_availability:
             input_parts.append(availability)
         input_parts.append(calendar)

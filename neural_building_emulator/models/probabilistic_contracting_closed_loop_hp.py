@@ -8,6 +8,7 @@ import equinox as eqx
 import jax
 import jax.numpy as jnp
 
+from ..ventilation import replace_with_eplus_ventilation
 from .emulator import MLP
 from .probabilistic_closed_loop_hp import (
     HPActivationModel,
@@ -72,6 +73,7 @@ class ProbabilisticContractingClosedLoopHPEmulator(eqx.Module):
     hp_controller_noise_scale: float = eqx.field(static=True)
     hp_history_hours: float = eqx.field(static=True)
     hp_history_timescales_hours: tuple[float, ...] = eqx.field(static=True)
+    hp_setpoint_shock_timescales_hours: tuple[float, ...] = eqx.field(static=True)
     contraction_gamma: float = eqx.field(static=True)
     state_bound: float = eqx.field(static=True)
     temperature_output_scale: float = eqx.field(static=True)
@@ -102,6 +104,7 @@ class ProbabilisticContractingClosedLoopHPEmulator(eqx.Module):
     additive_feedback_gain_bound: float = eqx.field(static=True)
     transition_forcing_encoded_dim: int = eqx.field(static=True)
     hp_controller_masked_input_indices: tuple[int, ...] = eqx.field(static=True)
+    thermal_dynamics_masked_input_indices: tuple[int, ...] = eqx.field(static=True)
     thermostat_demand_mode: ThermostatDemandMode = eqx.field(static=True)
     thermostat_slope_min: float = eqx.field(static=True)
     thermostat_slope_max: float = eqx.field(static=True)
@@ -136,6 +139,7 @@ class ProbabilisticContractingClosedLoopHPEmulator(eqx.Module):
         hp_controller_noise_scale: float = 0.0,
         hp_history_hours: float = 3.0,
         hp_history_timescales_hours: tuple[float, ...] = (),
+        hp_setpoint_shock_timescales_hours: tuple[float, ...] = (),
         contraction_gamma: float = 0.99,
         state_bound: float = 5.0,
         temperature_output_scale: float = 8.0,
@@ -157,6 +161,7 @@ class ProbabilisticContractingClosedLoopHPEmulator(eqx.Module):
         transition_conditioning: TransitionConditioningMode = "state_feedback",
         additive_feedback_gain_bound: float = 1.0,
         hp_controller_masked_input_indices: tuple[int, ...] = (),
+        thermal_dynamics_masked_input_indices: tuple[int, ...] = (),
         thermostat_demand_mode: ThermostatDemandMode = "unconstrained",
         thermostat_slope_min: float = 0.1,
         thermostat_slope_max: float = 6.0,
@@ -193,10 +198,15 @@ class ProbabilisticContractingClosedLoopHPEmulator(eqx.Module):
             raise ValueError("process_noise_cap must be positive")
         if hp_emission_mode not in ("bounded", "legacy_lognormal_mean"):
             raise ValueError("hp_emission_mode must be 'bounded' or 'legacy_lognormal_mean'")
-        if hp_activation_model not in ("independent", "persistent_markov", "power_history"):
+        if hp_activation_model not in (
+            "independent",
+            "persistent_markov",
+            "power_history",
+            "asymmetric_markov",
+        ):
             raise ValueError(
                 "hp_activation_model must be 'independent', 'persistent_markov', "
-                "or 'power_history'"
+                "'power_history', or 'asymmetric_markov'"
             )
         if hp_persistent_latent_dim < 1:
             raise ValueError("hp_persistent_latent_dim must be positive")
@@ -213,6 +223,19 @@ class ProbabilisticContractingClosedLoopHPEmulator(eqx.Module):
             raise ValueError("hp_history_timescales_hours values must be positive")
         if len(set(hp_history_timescales_hours)) != len(hp_history_timescales_hours):
             raise ValueError("hp_history_timescales_hours values must be unique")
+        hp_setpoint_shock_timescales_hours = tuple(
+            float(value) for value in hp_setpoint_shock_timescales_hours
+        )
+        if any(value <= 0.0 for value in hp_setpoint_shock_timescales_hours):
+            raise ValueError(
+                "hp_setpoint_shock_timescales_hours values must be positive"
+            )
+        if len(set(hp_setpoint_shock_timescales_hours)) != len(
+            hp_setpoint_shock_timescales_hours
+        ):
+            raise ValueError(
+                "hp_setpoint_shock_timescales_hours values must be unique"
+            )
         if not 0.0 < contraction_gamma < 1.0:
             raise ValueError("contraction_gamma must be in (0, 1)")
         if state_bound <= 0.0:
@@ -320,6 +343,15 @@ class ProbabilisticContractingClosedLoopHPEmulator(eqx.Module):
             hp_controller_masked_input_indices
         ):
             raise ValueError("hp_controller_masked_input_indices must be unique")
+        thermal_dynamics_masked_input_indices = tuple(
+            int(index) for index in thermal_dynamics_masked_input_indices
+        )
+        if any(index < 0 or index >= input_dim for index in thermal_dynamics_masked_input_indices):
+            raise ValueError("thermal_dynamics_masked_input_indices must be valid input indices")
+        if len(set(thermal_dynamics_masked_input_indices)) != len(
+            thermal_dynamics_masked_input_indices
+        ):
+            raise ValueError("thermal_dynamics_masked_input_indices must be unique")
 
         (
             encoder_key,
@@ -341,11 +373,16 @@ class ProbabilisticContractingClosedLoopHPEmulator(eqx.Module):
             thermal_forcing_dim if input_encoder_dim is None else input_encoder_dim
         )
         uses_persistent_controller = hp_activation_model == "persistent_markov"
-        uses_power_history = hp_activation_model == "power_history"
+        uses_asymmetric_markov = hp_activation_model == "asymmetric_markov"
+        uses_markov_transitions = uses_persistent_controller or uses_asymmetric_markov
+        uses_power_history = hp_activation_model in ("power_history", "asymmetric_markov")
         hp_history_feature_dim = (
             1 + len(hp_history_timescales_hours)
             if hp_history_timescales_hours
             else 1
+        )
+        hp_setpoint_shock_feature_dim = 2 * len(
+            hp_setpoint_shock_timescales_hours
         )
         hp_latent_dim = hp_persistent_latent_dim if uses_persistent_controller else 0
         generator_input_dim = metadata_dim + latent_dim
@@ -360,6 +397,7 @@ class ProbabilisticContractingClosedLoopHPEmulator(eqx.Module):
             + hp_latent_dim
             + (controller_state_dim if uses_persistent_controller else 0)
             + (2 * hp_history_feature_dim if uses_power_history else 0)
+            + hp_setpoint_shock_feature_dim
         )
 
         self.input_encoder = None
@@ -458,7 +496,6 @@ class ProbabilisticContractingClosedLoopHPEmulator(eqx.Module):
         if uses_persistent_controller:
             controller_init_key = jax.random.fold_in(output_key, 101)
             controller_transition_key = jax.random.fold_in(output_key, 102)
-            hp_transition_key = jax.random.fold_in(output_key, 103)
             hp_mode0_key = jax.random.fold_in(output_key, 104)
             initial_controller_input_dim = metadata_dim + hp_latent_dim + 1
             self.hp_controller_init_net = MLP(
@@ -475,19 +512,20 @@ class ProbabilisticContractingClosedLoopHPEmulator(eqx.Module):
                 depth=depth,
                 key=controller_transition_key,
             )
-            self.hp_transition_net = MLP(
-                output_input_dim,
-                2,
-                hidden_dim=hidden_dim,
-                depth=depth,
-                key=hp_transition_key,
-            )
             self.hp_mode0_net = MLP(
                 initial_controller_input_dim,
                 1,
                 hidden_dim=hidden_dim,
                 depth=depth,
                 key=hp_mode0_key,
+            )
+        if uses_markov_transitions:
+            self.hp_transition_net = MLP(
+                output_input_dim,
+                2,
+                hidden_dim=hidden_dim,
+                depth=depth,
+                key=jax.random.fold_in(output_key, 103),
             )
 
         self.raw_process_scale = jnp.full((state_dim,), process_noise_init)
@@ -509,6 +547,9 @@ class ProbabilisticContractingClosedLoopHPEmulator(eqx.Module):
         self.hp_controller_noise_scale = hp_controller_noise_scale
         self.hp_history_hours = hp_history_hours
         self.hp_history_timescales_hours = hp_history_timescales_hours
+        self.hp_setpoint_shock_timescales_hours = (
+            hp_setpoint_shock_timescales_hours
+        )
         self.contraction_gamma = contraction_gamma
         self.state_bound = state_bound
         self.temperature_output_scale = temperature_output_scale
@@ -539,6 +580,7 @@ class ProbabilisticContractingClosedLoopHPEmulator(eqx.Module):
         self.additive_feedback_gain_bound = float(additive_feedback_gain_bound)
         self.transition_forcing_encoded_dim = transition_forcing_encoded_dim
         self.hp_controller_masked_input_indices = hp_controller_masked_input_indices
+        self.thermal_dynamics_masked_input_indices = thermal_dynamics_masked_input_indices
         self.thermostat_demand_mode = thermostat_demand_mode
         self.thermostat_slope_min = float(thermostat_slope_min)
         self.thermostat_slope_max = float(thermostat_slope_max)
@@ -733,6 +775,7 @@ class ProbabilisticContractingClosedLoopHPEmulator(eqx.Module):
         hp_latent: jnp.ndarray | None = None,
         hp_power_history_t: jnp.ndarray | None = None,
         hp_mode_history_t: jnp.ndarray | None = None,
+        hp_setpoint_shock_t: jnp.ndarray | None = None,
     ) -> jnp.ndarray:
         gap_feature = self._setpoint_gap_scaled(input_t, temperature_t)
         values = [
@@ -747,15 +790,29 @@ class ProbabilisticContractingClosedLoopHPEmulator(eqx.Module):
             if controller_state_t is None or hp_latent is None:
                 raise ValueError("persistent_markov HP activation requires controller state and HP latent")
             values.extend([hp_latent, controller_state_t])
-        elif self.hp_activation_model == "power_history":
+        elif self.hp_activation_model in ("power_history", "asymmetric_markov"):
             if hp_power_history_t is None or hp_mode_history_t is None:
-                raise ValueError("power_history HP activation requires both history states")
+                raise ValueError(
+                    f"{self.hp_activation_model} HP activation requires both history states"
+                )
             values.extend(
                 [
                     jnp.ravel(hp_power_history_t).astype(encoded_input_t.dtype),
                     jnp.ravel(hp_mode_history_t).astype(encoded_input_t.dtype),
                 ]
             )
+        shock_feature_dim = 2 * len(self.hp_setpoint_shock_timescales_hours)
+        if shock_feature_dim:
+            if hp_setpoint_shock_t is None:
+                hp_setpoint_shock_t = jnp.zeros(
+                    (shock_feature_dim,), dtype=encoded_input_t.dtype
+                )
+            if hp_setpoint_shock_t.shape != (shock_feature_dim,):
+                raise ValueError(
+                    "hp_setpoint_shock_t must contain one positive and one negative "
+                    "trace per configured timescale"
+                )
+            values.append(hp_setpoint_shock_t.astype(encoded_input_t.dtype))
         return jnp.concatenate(values, axis=0)
 
     def initial_controller_state(
@@ -775,6 +832,39 @@ class ProbabilisticContractingClosedLoopHPEmulator(eqx.Module):
         controller_state = jnp.tanh(self.hp_controller_init_net(features))
         previous_mode = jax.nn.sigmoid(self.hp_mode0_net(features)[0])
         return controller_state, previous_mode
+
+    def initial_asymmetric_markov_mode(
+        self,
+        metadata: jnp.ndarray,
+        xi: jnp.ndarray,
+        input_t: jnp.ndarray,
+        energy_t: jnp.ndarray,
+        temperature_t: jnp.ndarray,
+        hp_power_history_t: jnp.ndarray,
+        hp_mode_history_t: jnp.ndarray,
+        hp_setpoint_shock_t: jnp.ndarray | None = None,
+    ) -> jnp.ndarray:
+        """Infer initial occupancy from the local two-state stationary distribution."""
+        if self.hp_activation_model != "asymmetric_markov":
+            return jnp.asarray(0.0, dtype=input_t.dtype)
+        assert self.hp_transition_net is not None
+        features = self.hp_features(
+            metadata,
+            xi,
+            self.encode_input(input_t),
+            input_t,
+            energy_t,
+            temperature_t,
+            hp_power_history_t=hp_power_history_t,
+            hp_mode_history_t=hp_mode_history_t,
+            hp_setpoint_shock_t=hp_setpoint_shock_t,
+        )
+        start_logit, stop_logit = self.hp_transition_net(features)
+        p_start = jax.nn.sigmoid(start_logit)
+        p_stop = jax.nn.sigmoid(stop_logit)
+        eps = jnp.asarray(1e-6, dtype=input_t.dtype)
+        stationary_on = p_start / jnp.maximum(p_start + p_stop, eps)
+        return self._space_heating_availability(input_t) * stationary_on
 
     def next_controller_state(
         self,
@@ -804,6 +894,46 @@ class ProbabilisticContractingClosedLoopHPEmulator(eqx.Module):
         dt_hours = jnp.asarray(self.hp_dt_hours, dtype=dtype)
         history_hours = jnp.asarray(self.hp_history_hours, dtype=dtype)
         return -jnp.expm1(-dt_hours / history_hours)
+
+    def setpoint_shock_features(self, inputs: jnp.ndarray) -> jnp.ndarray:
+        """Return causal positive/negative setpoint-shock traces.
+
+        Each trace receives the normalized setpoint jump at the current step
+        and subsequently decays with its configured physical time constant.
+        The first step has no preceding observation and therefore no shock.
+        """
+        timescales = self.hp_setpoint_shock_timescales_hours
+        if not timescales:
+            return jnp.zeros((inputs.shape[0], 0), dtype=inputs.dtype)
+
+        setpoint = inputs[:, self.setpoint_input_index]
+        delta = jnp.concatenate(
+            [jnp.zeros((1,), dtype=inputs.dtype), jnp.diff(setpoint)], axis=0
+        )
+        positive = jnp.maximum(delta, jnp.asarray(0.0, dtype=inputs.dtype))
+        negative = jnp.maximum(-delta, jnp.asarray(0.0, dtype=inputs.dtype))
+        timescale_values = jnp.asarray(timescales, dtype=inputs.dtype)
+        retention = jnp.exp(
+            -jnp.asarray(self.hp_dt_hours, dtype=inputs.dtype) / timescale_values
+        )
+
+        def step(
+            traces: tuple[jnp.ndarray, jnp.ndarray],
+            shocks: tuple[jnp.ndarray, jnp.ndarray],
+        ) -> tuple[tuple[jnp.ndarray, jnp.ndarray], jnp.ndarray]:
+            positive_trace, negative_trace = traces
+            positive_shock, negative_shock = shocks
+            positive_next = retention * positive_trace + positive_shock
+            negative_next = retention * negative_trace + negative_shock
+            next_traces = (positive_next, negative_next)
+            return next_traces, jnp.concatenate(next_traces, axis=0)
+
+        initial = (
+            jnp.zeros_like(retention),
+            jnp.zeros_like(retention),
+        )
+        _, traces = jax.lax.scan(step, initial, (positive, negative))
+        return traces
 
     def initial_hp_history(self, dtype: jnp.dtype) -> tuple[jnp.ndarray, jnp.ndarray]:
         if not self.hp_history_timescales_hours:
@@ -858,6 +988,9 @@ class ProbabilisticContractingClosedLoopHPEmulator(eqx.Module):
         thermal_inputs = input_t[1:]
         if self.availability_input_index >= 1:
             thermal_inputs = thermal_inputs.at[self.availability_input_index - 1].set(0.0)
+        for index in self.thermal_dynamics_masked_input_indices:
+            if index >= 1:
+                thermal_inputs = thermal_inputs.at[index - 1].set(0.0)
         if self.q_to_t_mode == "positive_leaky":
             return jnp.concatenate(
                 [
@@ -1319,6 +1452,7 @@ class ProbabilisticContractingClosedLoopHPEmulator(eqx.Module):
         hp_mode_history_t: jnp.ndarray,
         hp_latent: jnp.ndarray,
         controller_noise_t: jnp.ndarray,
+        hp_setpoint_shock_t: jnp.ndarray | None = None,
         *,
         hp_scenario_mode: HPElectricRolloutMode,
         hp_concrete_temperature: jnp.ndarray | float,
@@ -1349,6 +1483,7 @@ class ProbabilisticContractingClosedLoopHPEmulator(eqx.Module):
             hp_latent,
             hp_power_history_t,
             hp_mode_history_t,
+            hp_setpoint_shock_t,
         )
         availability_t = self._space_heating_availability(input_t)
         output = self.output_net(features)
@@ -1400,7 +1535,7 @@ class ProbabilisticContractingClosedLoopHPEmulator(eqx.Module):
             pel_sigma_logit,
             mode_logit,
         )
-        if self.hp_activation_model == "persistent_markov":
+        if self.hp_activation_model in ("persistent_markov", "asymmetric_markov"):
             assert self.hp_transition_net is not None
             start_logit_t, stop_logit_t = self.hp_transition_net(features)
             p_start_t = jax.nn.sigmoid(start_logit_t)
@@ -1423,7 +1558,7 @@ class ProbabilisticContractingClosedLoopHPEmulator(eqx.Module):
             sampled_log_active_t = log_mu_t + log_sigma_t * power_noise_t
             pel_active_t = self._sample_active_power_from_log(sampled_log_active_t)
             if hp_scenario_mode == "straight_through":
-                if self.hp_activation_model == "persistent_markov":
+                if self.hp_activation_model in ("persistent_markov", "asymmetric_markov"):
                     eps = jnp.asarray(1e-5, dtype=input_t.dtype)
                     clipped_pi_t = jnp.clip(pi_unavailable_t, eps, 1.0 - eps)
                     effective_mode_logit = jnp.log(clipped_pi_t) - jnp.log1p(-clipped_pi_t)
@@ -1489,6 +1624,10 @@ class ProbabilisticContractingClosedLoopHPEmulator(eqx.Module):
         hp_teacher_forcing_ratio: jnp.ndarray | float = 0.0,
         hp_feedback_temperature: jnp.ndarray | None = None,
         hp_temperature_teacher_forcing_ratio: jnp.ndarray | float = 0.0,
+        ventilation_time_available: jnp.ndarray | None = None,
+        ventilation_minimum_indoor_temperature_c: jnp.ndarray | None = None,
+        ventilation_nominal_flow_m3_s: jnp.ndarray | float = 0.0,
+        ventilation_minimum_indoor_outdoor_delta_c: jnp.ndarray | float = 2.0,
     ) -> tuple[jnp.ndarray, ProbClosedLoopAux]:
         if hp_scenario_mode not in ("expected", "bernoulli", "straight_through"):
             raise ValueError(
@@ -1506,6 +1645,20 @@ class ProbabilisticContractingClosedLoopHPEmulator(eqx.Module):
             and hp_feedback_temperature.shape != (inputs.shape[0],)
         ):
             raise ValueError("hp_feedback_temperature must have shape [horizon]")
+        generated_ventilation = ventilation_time_available is not None
+        if generated_ventilation != (ventilation_minimum_indoor_temperature_c is not None):
+            raise ValueError(
+                "ventilation_time_available and ventilation_minimum_indoor_temperature_c "
+                "must be provided together"
+            )
+        if generated_ventilation:
+            if ventilation_time_available.shape != (inputs.shape[0],):
+                raise ValueError("ventilation_time_available must have shape [horizon]")
+            if ventilation_minimum_indoor_temperature_c.shape != (inputs.shape[0],):
+                raise ValueError(
+                    "ventilation_minimum_indoor_temperature_c must have shape [horizon]"
+                )
+        setpoint_shock_features = self.setpoint_shock_features(inputs)
         state0 = self.initial_state(metadata, initial_temperature, xi)
         energy0 = self.initial_energy(metadata, initial_temperature, xi)
         temperature0 = initial_temperature[0]
@@ -1521,6 +1674,17 @@ class ProbabilisticContractingClosedLoopHPEmulator(eqx.Module):
             hp_latent,
         )
         hp_power_history0, hp_mode_history0 = self.initial_hp_history(metadata.dtype)
+        if self.hp_activation_model == "asymmetric_markov":
+            previous_mode0 = self.initial_asymmetric_markov_mode(
+                metadata,
+                xi,
+                inputs[0],
+                energy0,
+                temperature0,
+                hp_power_history0,
+                hp_mode_history0,
+                setpoint_shock_features[0],
+            )
         fixed_matrix = (
             self.transition_matrix(metadata, xi)
             if self.transition_matrix_mode == "fixed"
@@ -1545,6 +1709,7 @@ class ProbabilisticContractingClosedLoopHPEmulator(eqx.Module):
                 jnp.ndarray,
                 jnp.ndarray,
                 jnp.ndarray,
+                jnp.ndarray,
             ],
         ) -> tuple[tuple[jnp.ndarray, ...], tuple[jnp.ndarray, ...]]:
             (
@@ -1557,7 +1722,38 @@ class ProbabilisticContractingClosedLoopHPEmulator(eqx.Module):
                 hp_mode_history_t,
                 q_response_state_t,
             ) = carry
-            time_index, input_t, eps_t, mode_uniform_t, power_noise_t, controller_noise_t = step_inputs
+            (
+                time_index,
+                input_t,
+                eps_t,
+                mode_uniform_t,
+                power_noise_t,
+                controller_noise_t,
+                setpoint_shock_t,
+            ) = step_inputs
+            if generated_ventilation:
+                input_t = replace_with_eplus_ventilation(
+                    input_t,
+                    temperature_t,
+                    time_available_t=ventilation_time_available[time_index],
+                    minimum_indoor_temperature_c_t=(
+                        ventilation_minimum_indoor_temperature_c[time_index]
+                    ),
+                    nominal_flow_m3_s=jnp.asarray(
+                        ventilation_nominal_flow_m3_s,
+                        dtype=input_t.dtype,
+                    ),
+                    minimum_indoor_outdoor_delta_c=jnp.asarray(
+                        ventilation_minimum_indoor_outdoor_delta_c,
+                        dtype=input_t.dtype,
+                    ),
+                    ventilation_input_index=self.ventilation_input_index,
+                    outdoor_input_index=self.outdoor_input_index,
+                    input_mean=self.input_mean,
+                    input_scale=self.input_scale,
+                    temperature_mean_c=self.target_mean[self.temperature_target_index],
+                    temperature_scale_c=self.target_scale[self.temperature_target_index],
+                )
             encoded_input_t = self.encode_input(input_t)
             hp_temperature_t = (
                 temperature_t
@@ -1599,6 +1795,7 @@ class ProbabilisticContractingClosedLoopHPEmulator(eqx.Module):
                 hp_mode_history_t,
                 hp_latent,
                 controller_noise_t,
+                setpoint_shock_t,
                 hp_scenario_mode=hp_scenario_mode,
                 hp_concrete_temperature=hp_concrete_temperature,
             )
@@ -1698,7 +1895,15 @@ class ProbabilisticContractingClosedLoopHPEmulator(eqx.Module):
                 hp_mode_history0,
                 q_response_state0,
             ),
-            (time_index, inputs, process_noise, hp_mode_uniform, hp_power_noise, controller_noise),
+            (
+                time_index,
+                inputs,
+                process_noise,
+                hp_mode_uniform,
+                hp_power_noise,
+                controller_noise,
+                setpoint_shock_features,
+            ),
         )
         (
             predictions,
@@ -1761,6 +1966,10 @@ class ProbabilisticContractingClosedLoopHPEmulator(eqx.Module):
         hp_teacher_forcing_ratio: jnp.ndarray | float = 0.0,
         hp_feedback_temperature: jnp.ndarray | None = None,
         hp_temperature_teacher_forcing_ratio: jnp.ndarray | float = 0.0,
+        ventilation_time_available: jnp.ndarray | None = None,
+        ventilation_minimum_indoor_temperature_c: jnp.ndarray | None = None,
+        ventilation_nominal_flow_m3_s: jnp.ndarray | float = 0.0,
+        ventilation_minimum_indoor_outdoor_delta_c: jnp.ndarray | float = 2.0,
     ) -> tuple[jnp.ndarray, ProbClosedLoopAux]:
         if num_particles < 1:
             raise ValueError("num_particles must be positive")
@@ -1817,6 +2026,14 @@ class ProbabilisticContractingClosedLoopHPEmulator(eqx.Module):
                 hp_teacher_forcing_ratio=hp_teacher_forcing_ratio,
                 hp_feedback_temperature=hp_feedback_temperature,
                 hp_temperature_teacher_forcing_ratio=hp_temperature_teacher_forcing_ratio,
+                ventilation_time_available=ventilation_time_available,
+                ventilation_minimum_indoor_temperature_c=(
+                    ventilation_minimum_indoor_temperature_c
+                ),
+                ventilation_nominal_flow_m3_s=ventilation_nominal_flow_m3_s,
+                ventilation_minimum_indoor_outdoor_delta_c=(
+                    ventilation_minimum_indoor_outdoor_delta_c
+                ),
             )
         )(xi, process_noise, hp_mode_uniform, hp_power_noise, hp_latent, controller_noise)
         return predictions, (
@@ -1843,6 +2060,10 @@ class ProbabilisticContractingClosedLoopHPEmulator(eqx.Module):
         hp_teacher_forcing_ratio: jnp.ndarray | float = 0.0,
         hp_feedback_temperature: jnp.ndarray | None = None,
         hp_temperature_teacher_forcing_ratio: jnp.ndarray | float = 0.0,
+        ventilation_time_available: jnp.ndarray | None = None,
+        ventilation_minimum_indoor_temperature_c: jnp.ndarray | None = None,
+        ventilation_nominal_flow_m3_s: jnp.ndarray | float = 0.0,
+        ventilation_minimum_indoor_outdoor_delta_c: jnp.ndarray | float = 2.0,
     ) -> jnp.ndarray:
         predictions, _ = self.sample_with_aux(
             metadata,
@@ -1858,6 +2079,14 @@ class ProbabilisticContractingClosedLoopHPEmulator(eqx.Module):
             hp_teacher_forcing_ratio=hp_teacher_forcing_ratio,
             hp_feedback_temperature=hp_feedback_temperature,
             hp_temperature_teacher_forcing_ratio=hp_temperature_teacher_forcing_ratio,
+            ventilation_time_available=ventilation_time_available,
+            ventilation_minimum_indoor_temperature_c=(
+                ventilation_minimum_indoor_temperature_c
+            ),
+            ventilation_nominal_flow_m3_s=ventilation_nominal_flow_m3_s,
+            ventilation_minimum_indoor_outdoor_delta_c=(
+                ventilation_minimum_indoor_outdoor_delta_c
+            ),
         )
         return predictions
 
@@ -1870,6 +2099,9 @@ class ProbabilisticContractingClosedLoopHPEmulator(eqx.Module):
         elif self.hp_activation_model == "power_history":
             history_dim = 1 + len(self.hp_history_timescales_hours)
             size += 2 * history_dim
+        elif self.hp_activation_model == "asymmetric_markov":
+            history_dim = 1 + len(self.hp_history_timescales_hours)
+            size += 1 + 2 * history_dim
         return size
 
     def pack_stability_state(
@@ -1904,6 +2136,14 @@ class ProbabilisticContractingClosedLoopHPEmulator(eqx.Module):
         elif self.hp_activation_model == "power_history":
             parts.extend(
                 [
+                    jnp.ravel(hp_power_history_t),
+                    jnp.ravel(hp_mode_history_t),
+                ]
+            )
+        elif self.hp_activation_model == "asymmetric_markov":
+            parts.extend(
+                [
+                    jnp.asarray([previous_mode_t], dtype=state_t.dtype),
                     jnp.ravel(hp_power_history_t),
                     jnp.ravel(hp_mode_history_t),
                 ]
@@ -1954,6 +2194,14 @@ class ProbabilisticContractingClosedLoopHPEmulator(eqx.Module):
             cursor += history_dim
             hp_mode_history_t = augmented_state[cursor : cursor + history_dim]
             cursor += history_dim
+        elif self.hp_activation_model == "asymmetric_markov":
+            previous_mode_t = augmented_state[cursor]
+            cursor += 1
+            history_dim = 1 + len(self.hp_history_timescales_hours)
+            hp_power_history_t = augmented_state[cursor : cursor + history_dim]
+            cursor += history_dim
+            hp_mode_history_t = augmented_state[cursor : cursor + history_dim]
+            cursor += history_dim
         if cursor != augmented_state.shape[0]:
             raise ValueError(
                 "augmented stability state has incompatible size: "
@@ -1979,6 +2227,7 @@ class ProbabilisticContractingClosedLoopHPEmulator(eqx.Module):
         augmented_state: jnp.ndarray,
         process_noise_t: jnp.ndarray,
         controller_noise_t: jnp.ndarray,
+        hp_setpoint_shock_t: jnp.ndarray | None = None,
     ) -> jnp.ndarray:
         (
             state_t,
@@ -2022,6 +2271,7 @@ class ProbabilisticContractingClosedLoopHPEmulator(eqx.Module):
             hp_mode_history_t,
             hp_latent,
             controller_noise_t,
+            hp_setpoint_shock_t,
             hp_scenario_mode="expected",
             hp_concrete_temperature=jnp.asarray(0.5, dtype=state_t.dtype),
         )

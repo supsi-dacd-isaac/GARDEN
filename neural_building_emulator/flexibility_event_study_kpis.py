@@ -48,6 +48,7 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 
 from .columns import (
+    DHW_MIXED_WATER_PER_HEATED_AREA_COLUMN,
     INTERNAL_GAIN_PER_FLOOR_AREA_COLUMN,
     PROFILE_ID_COLUMN,
     SPACE_HEATING_AVAILABILITY_COLUMN,
@@ -594,6 +595,7 @@ def _load_closed_loop_profiles(
     *,
     include_space_heating_availability: bool,
     include_internal_gains: bool,
+    include_dhw_request: bool,
     hp_power_area_normalization: str = "zone_floor_area",
     metadata_columns: Sequence[str] | None = None,
 ) -> list[ClosedLoopProfile]:
@@ -602,6 +604,7 @@ def _load_closed_loop_profiles(
         columns=closed_loop_required_columns(
             None if metadata_columns is None else tuple(metadata_columns),
             include_internal_gains=include_internal_gains,
+            include_dhw_request=include_dhw_request,
         ),
         profile_ids=profile_ids,
     )
@@ -609,6 +612,7 @@ def _load_closed_loop_profiles(
         df,
         include_space_heating_availability=include_space_heating_availability,
         include_internal_gains=include_internal_gains,
+        include_dhw_request=include_dhw_request,
         hp_power_area_normalization=hp_power_area_normalization,  # type: ignore[arg-type]
         metadata_columns=metadata_columns,
     )
@@ -629,10 +633,16 @@ def _predict_mean_trace(
     *,
     key: jax.Array,
     num_particles: int,
+    ventilation_rollout_mode: str,
 ) -> np.ndarray:
     model = artifact.model
     model_kind = str(artifact.metadata["model_kind"])
     if model_kind in ("closed_loop_hp", "closed_loop_hp_contracting"):
+        if ventilation_rollout_mode != "recorded":
+            raise ValueError(
+                "--ventilation-rollout-mode eplus_rule currently requires a probabilistic "
+                "closed-loop artifact"
+            )
         if not isinstance(model, (ClosedLoopHPEmulator, ContractingClosedLoopHPEmulator)):
             raise TypeError(f"Loaded model has unexpected type {type(model)!r}")
         return predict_closed_loop_full_profile(model, profile, artifact.scalers)
@@ -645,6 +655,8 @@ def _predict_mean_trace(
             artifact.scalers,
             key=key,
             num_particles=num_particles,
+            ventilation_rollout_mode=ventilation_rollout_mode,  # type: ignore[arg-type]
+            metadata_columns=tuple(artifact.metadata.get("metadata_columns", ())) or None,
         )
     raise ValueError(f"Unsupported model_kind for flexibility KPIs: {model_kind!r}")
 
@@ -656,6 +668,7 @@ def _sample_scenario_traces(
     key: jax.Array,
     num_scenarios: int,
     hp_scenario_mode: ProbHpScenarioMode,
+    ventilation_rollout_mode: str,
 ) -> np.ndarray:
     model = artifact.model
     model_kind = str(artifact.metadata["model_kind"])
@@ -670,6 +683,8 @@ def _sample_scenario_traces(
         key=key,
         num_particles=num_scenarios,
         hp_scenario_mode=hp_scenario_mode,
+        ventilation_rollout_mode=ventilation_rollout_mode,  # type: ignore[arg-type]
+        metadata_columns=tuple(artifact.metadata.get("metadata_columns", ())) or None,
     )
 
 
@@ -1102,6 +1117,290 @@ def _write_coverage_html(path: Path, coverage_df: pd.DataFrame, *, title: str) -
     fig.write_html(path)
 
 
+class TemporalTraceCalibrationAccumulator:
+    """Online tie-aware ensemble-rank calibration for Tin, Qroom, and Pel."""
+
+    signal_names = ("Tin", "Qroom", "Pel_SH")
+    signal_units = ("degC", "W/m2", "W/m2")
+    signal_scopes = (
+        "all timestamps",
+        "space-heating available",
+        "space-heating available",
+    )
+
+    def __init__(
+        self,
+        quantiles: tuple[float, ...],
+        *,
+        histogram_bins: int = 10,
+    ) -> None:
+        if not quantiles:
+            raise ValueError("Temporal trace calibration requires at least one quantile")
+        if histogram_bins < 2:
+            raise ValueError("histogram_bins must be at least 2")
+        self.quantiles = np.asarray(quantiles, dtype=np.float64)
+        self.histogram_edges = np.linspace(0.0, 1.0, histogram_bins + 1)
+        self.cdf_sums = np.zeros((len(quantiles), 3), dtype=np.float64)
+        self.histogram_sums = np.zeros((histogram_bins, 3), dtype=np.float64)
+        self.observation_counts = np.zeros(3, dtype=np.int64)
+        self.profile_count = 0
+        self.min_scenarios: int | None = None
+        self.max_scenarios = 0
+
+    def add(
+        self,
+        truth: np.ndarray,
+        scenarios: np.ndarray,
+        *,
+        masks: np.ndarray | None = None,
+    ) -> None:
+        truth = np.asarray(truth, dtype=np.float64)
+        scenarios = np.asarray(scenarios, dtype=np.float64)
+        if truth.ndim != 2 or truth.shape[1] != 3:
+            raise ValueError("truth must have shape [time, 3]")
+        if scenarios.ndim != 3 or scenarios.shape[1:] != truth.shape:
+            raise ValueError("scenarios must have shape [scenario, time, 3]")
+        if scenarios.shape[0] < 1:
+            raise ValueError("Temporal trace calibration requires at least one scenario")
+        if masks is None:
+            masks = np.ones_like(truth, dtype=bool)
+        else:
+            masks = np.asarray(masks, dtype=bool)
+            if masks.shape != truth.shape:
+                raise ValueError("masks must have shape [time, 3]")
+
+        scenario_count = int(scenarios.shape[0])
+        self.profile_count += 1
+        self.min_scenarios = (
+            scenario_count
+            if self.min_scenarios is None
+            else min(self.min_scenarios, scenario_count)
+        )
+        self.max_scenarios = max(self.max_scenarios, scenario_count)
+
+        for channel in range(3):
+            channel_scenarios = scenarios[:, :, channel]
+            valid = (
+                masks[:, channel]
+                & np.isfinite(truth[:, channel])
+                & np.all(np.isfinite(channel_scenarios), axis=0)
+            )
+            if not np.any(valid):
+                continue
+            observed = truth[valid, channel]
+            samples = channel_scenarios[:, valid]
+            less = np.sum(samples < observed[np.newaxis, :], axis=0)
+            equal = np.sum(samples == observed[np.newaxis, :], axis=0)
+
+            # Random tie breaking among the observation and matching ensemble
+            # members makes the rank uniform on this interval. Integrating the
+            # interval analytically avoids arbitrary Monte Carlo jitter.
+            denominator = np.float64(scenario_count + 1)
+            lower = less.astype(np.float64) / denominator
+            upper = (less + equal + 1).astype(np.float64) / denominator
+            width = upper - lower
+
+            conditional_cdf = np.clip(
+                (self.quantiles[:, np.newaxis] - lower[np.newaxis, :])
+                / width[np.newaxis, :],
+                0.0,
+                1.0,
+            )
+            self.cdf_sums[:, channel] += np.sum(conditional_cdf, axis=1)
+
+            bin_lower = self.histogram_edges[:-1, np.newaxis]
+            bin_upper = self.histogram_edges[1:, np.newaxis]
+            overlap = np.maximum(
+                0.0,
+                np.minimum(bin_upper, upper[np.newaxis, :])
+                - np.maximum(bin_lower, lower[np.newaxis, :]),
+            )
+            self.histogram_sums[:, channel] += np.sum(
+                overlap / width[np.newaxis, :], axis=1
+            )
+            self.observation_counts[channel] += int(np.sum(valid))
+
+    def reliability_rows(self) -> list[dict[str, Any]]:
+        rows: list[dict[str, Any]] = []
+        for channel, signal in enumerate(self.signal_names):
+            count = int(self.observation_counts[channel])
+            if count == 0:
+                continue
+            empirical = self.cdf_sums[:, channel] / np.float64(count)
+            for quantile, coverage in zip(self.quantiles, empirical):
+                rows.append(
+                    {
+                        "signal": signal,
+                        "unit": self.signal_units[channel],
+                        "scope": self.signal_scopes[channel],
+                        "quantile": float(quantile),
+                        "empirical_coverage": float(coverage),
+                        "calibration_error": float(coverage - quantile),
+                        "abs_calibration_error": float(abs(coverage - quantile)),
+                        "observation_count": count,
+                        "profile_count": int(self.profile_count),
+                        "min_scenarios_per_profile": int(self.min_scenarios or 0),
+                        "max_scenarios_per_profile": int(self.max_scenarios),
+                        "method": "tie_aware_randomized_ensemble_rank",
+                    }
+                )
+        return rows
+
+    def histogram_rows(self) -> list[dict[str, Any]]:
+        rows: list[dict[str, Any]] = []
+        expected_probability = 1.0 / len(self.histogram_edges[:-1])
+        for channel, signal in enumerate(self.signal_names):
+            count = int(self.observation_counts[channel])
+            if count == 0:
+                continue
+            probabilities = self.histogram_sums[:, channel] / np.float64(count)
+            for index, probability in enumerate(probabilities):
+                lower = float(self.histogram_edges[index])
+                upper = float(self.histogram_edges[index + 1])
+                rows.append(
+                    {
+                        "signal": signal,
+                        "unit": self.signal_units[channel],
+                        "scope": self.signal_scopes[channel],
+                        "bin_left": lower,
+                        "bin_right": upper,
+                        "bin_center": 0.5 * (lower + upper),
+                        "probability": float(probability),
+                        "expected_probability": expected_probability,
+                        "observation_count": count,
+                        "profile_count": int(self.profile_count),
+                    }
+                )
+        return rows
+
+
+def _temporal_calibration_summary(
+    reliability_df: pd.DataFrame,
+) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    if reliability_df.empty:
+        return rows
+    for signal, part in reliability_df.groupby("signal", sort=False):
+        quantiles = part["quantile"].to_numpy(dtype=float)
+        empirical = part["empirical_coverage"].to_numpy(dtype=float)
+        order = np.argsort(quantiles)
+        quantiles = quantiles[order]
+        empirical = empirical[order]
+        lower = float(np.interp(0.05, quantiles, empirical))
+        upper = float(np.interp(0.95, quantiles, empirical))
+        rows.append(
+            {
+                "signal": str(signal),
+                "scope": str(part["scope"].iloc[0]),
+                "mean_abs_calibration_error": float(
+                    part["abs_calibration_error"].mean()
+                ),
+                "max_abs_calibration_error": float(
+                    part["abs_calibration_error"].max()
+                ),
+                "empirical_central_90_coverage": upper - lower,
+                "observation_count": int(part["observation_count"].max()),
+                "profile_count": int(part["profile_count"].max()),
+            }
+        )
+    return rows
+
+
+def _write_temporal_calibration_html(
+    path: Path,
+    reliability_df: pd.DataFrame,
+    histogram_df: pd.DataFrame,
+    *,
+    title: str,
+) -> None:
+    signals = TemporalTraceCalibrationAccumulator.signal_names
+    scopes = TemporalTraceCalibrationAccumulator.signal_scopes
+    fig = make_subplots(
+        rows=2,
+        cols=3,
+        subplot_titles=[
+            *(f"{signal} reliability<br><sup>{scope}</sup>" for signal, scope in zip(signals, scopes)),
+            *(f"{signal} ensemble-rank histogram" for signal in signals),
+        ],
+        vertical_spacing=0.14,
+    )
+    colors = ("#1f77b4", "#2ca02c", "#d62728")
+    for column, (signal, color) in enumerate(zip(signals, colors), start=1):
+        reliability = reliability_df[reliability_df["signal"] == signal]
+        histogram = histogram_df[histogram_df["signal"] == signal]
+        if reliability.empty or histogram.empty:
+            continue
+        fig.add_trace(
+            go.Scatter(
+                x=reliability["quantile"],
+                y=reliability["empirical_coverage"],
+                mode="lines+markers",
+                name=signal,
+                line=dict(color=color, width=2),
+                hovertemplate=(
+                    "nominal=%{x:.2f}<br>empirical=%{y:.3f}<extra>"
+                    + signal
+                    + "</extra>"
+                ),
+            ),
+            row=1,
+            col=column,
+        )
+        fig.add_trace(
+            go.Scatter(
+                x=[0.0, 1.0],
+                y=[0.0, 1.0],
+                mode="lines",
+                name="ideal",
+                line=dict(color="black", dash="dash"),
+                showlegend=(column == 1),
+            ),
+            row=1,
+            col=column,
+        )
+        fig.add_trace(
+            go.Bar(
+                x=histogram["bin_center"],
+                y=histogram["probability"],
+                width=histogram["bin_right"] - histogram["bin_left"],
+                name=f"{signal} ranks",
+                marker_color=color,
+                showlegend=False,
+                hovertemplate="rank bin=%{x:.2f}<br>probability=%{y:.3f}<extra></extra>",
+            ),
+            row=2,
+            col=column,
+        )
+        expected = float(histogram["expected_probability"].iloc[0])
+        fig.add_trace(
+            go.Scatter(
+                x=[0.0, 1.0],
+                y=[expected, expected],
+                mode="lines",
+                line=dict(color="black", dash="dash"),
+                showlegend=False,
+                hoverinfo="skip",
+            ),
+            row=2,
+            col=column,
+        )
+        fig.update_xaxes(title_text="nominal quantile", range=[0.0, 1.0], row=1, col=column)
+        fig.update_yaxes(title_text="empirical rank CDF", range=[0.0, 1.0], row=1, col=column)
+        fig.update_xaxes(title_text="randomized ensemble rank", range=[0.0, 1.0], row=2, col=column)
+        fig.update_yaxes(title_text="probability", rangemode="tozero", row=2, col=column)
+
+    fig.update_layout(
+        title=title,
+        template="plotly_white",
+        height=920,
+        width=1550,
+        bargap=0.04,
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1.0),
+    )
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fig.write_html(path)
+
+
 def run_analysis(args: argparse.Namespace) -> None:
     if args.min_events < 1:
         raise ValueError("--min-events must be positive")
@@ -1160,6 +1459,10 @@ def run_analysis(args: argparse.Namespace) -> None:
             INTERNAL_GAIN_PER_FLOOR_AREA_COLUMN
             in artifact.metadata.get("input_columns", [])
         ),
+        include_dhw_request=(
+            DHW_MIXED_WATER_PER_HEATED_AREA_COLUMN
+            in artifact.metadata.get("input_columns", [])
+        ),
         hp_power_area_normalization=str(
             _config_value(metadata, "hp_power_area_normalization", "zone_floor_area")
         ),
@@ -1170,6 +1473,13 @@ def run_analysis(args: argparse.Namespace) -> None:
     profile_rows: list[dict[str, Any]] = []
     scenario_rows: list[dict[str, Any]] = []
     pooled_rows: list[dict[str, Any]] = []
+    temporal_calibration = TemporalTraceCalibrationAccumulator(coverage_quantiles)
+    input_columns = list(artifact.metadata.get("input_columns", ()))
+    availability_input_index = (
+        input_columns.index(SPACE_HEATING_AVAILABILITY_COLUMN)
+        if SPACE_HEATING_AVAILABILITY_COLUMN in input_columns
+        else None
+    )
     pooled_simulation = _empty_pooled_accumulators(config)
     pooled_emulation = _empty_pooled_accumulators(config)
     pooled_scenarios = [
@@ -1189,6 +1499,7 @@ def run_analysis(args: argparse.Namespace) -> None:
                 profile,
                 key=profile_key,
                 num_particles=prob_eval_particles,
+                ventilation_rollout_mode=args.ventilation_rollout_mode,
             )
             emulated_kpis = estimate_trace_flexibility(profile, emulated_trace, config)
             _add_trace_to_pooled(pooled_emulation, profile, emulated_trace, config)
@@ -1199,6 +1510,19 @@ def run_analysis(args: argparse.Namespace) -> None:
                 key=profile_key,
                 num_scenarios=int(args.num_scenarios),
                 hp_scenario_mode=args.prob_hp_scenario_mode,
+                ventilation_rollout_mode=args.ventilation_rollout_mode,
+            )
+            temporal_masks = np.ones_like(profile.targets, dtype=bool)
+            if availability_input_index is not None:
+                heating_available = (
+                    profile.inputs[:, availability_input_index] > np.float32(0.5)
+                )
+                temporal_masks[:, 1] = heating_available
+                temporal_masks[:, 2] = heating_available
+            temporal_calibration.add(
+                profile.targets,
+                scenarios,
+                masks=temporal_masks,
             )
             kpis_by_scenario: list[list[FlexibilityKpi]] = []
             for scenario_index in range(scenarios.shape[0]):
@@ -1281,6 +1605,15 @@ def run_analysis(args: argparse.Namespace) -> None:
         _coverage_rows(profile_df, scenario_df, coverage_quantiles)
     )
     coverage_summary = _coverage_summary(coverage_df)
+    temporal_calibration_df = pd.DataFrame(
+        temporal_calibration.reliability_rows()
+    )
+    temporal_rank_histogram_df = pd.DataFrame(
+        temporal_calibration.histogram_rows()
+    )
+    temporal_calibration_summary = _temporal_calibration_summary(
+        temporal_calibration_df
+    )
 
     summary = {
         "artifact_dir": str(args.artifact_dir),
@@ -1293,6 +1626,7 @@ def run_analysis(args: argparse.Namespace) -> None:
         "emulation_kpi_mode": args.emulation_kpi_mode,
         "num_scenarios": int(args.num_scenarios) if args.emulation_kpi_mode == "scenario_average" else 0,
         "prob_hp_scenario_mode": args.prob_hp_scenario_mode,
+        "ventilation_rollout_mode": args.ventilation_rollout_mode,
         "prob_hp_emission_mode": getattr(artifact.model, "hp_emission_mode", None),
         "prob_hp_emission_mode_arg": args.prob_hp_emission_mode,
         "horizons_hours": list(config.horizons_hours),
@@ -1305,6 +1639,7 @@ def run_analysis(args: argparse.Namespace) -> None:
         "up_flex_wh_m2_k_by_horizon": _signal_summary_by_horizon(profile_df, "up_flex_wh_m2_k"),
         "down_flex_wh_m2_k_by_horizon": _signal_summary_by_horizon(profile_df, "down_flex_wh_m2_k"),
         "kpi_coverage_by_horizon": coverage_summary,
+        "temporal_trace_calibration": temporal_calibration_summary,
         "pooled_kpis": pooled_rows,
         "interpretation": (
             "With direct_ratio, F_H is H times the directional ratio of summed post-minus-pre "
@@ -1321,6 +1656,9 @@ def run_analysis(args: argparse.Namespace) -> None:
     summary_json = output_dir / "flexibility_event_study_summary.json"
     html_path = output_dir / "flexibility_event_study_comparison.html"
     coverage_html_path = output_dir / "flexibility_event_study_kpi_coverage.html"
+    temporal_calibration_csv = output_dir / "temporal_trace_calibration.csv"
+    temporal_rank_histogram_csv = output_dir / "temporal_trace_rank_histogram.csv"
+    temporal_calibration_html = output_dir / "temporal_trace_calibration.html"
 
     profile_df.to_csv(profile_csv, index=False)
     pooled_df.to_csv(pooled_csv, index=False)
@@ -1328,6 +1666,9 @@ def run_analysis(args: argparse.Namespace) -> None:
         scenario_df.to_csv(scenario_csv, index=False)
     if not coverage_df.empty:
         coverage_df.to_csv(coverage_csv, index=False)
+    if not temporal_calibration_df.empty:
+        temporal_calibration_df.to_csv(temporal_calibration_csv, index=False)
+        temporal_rank_histogram_df.to_csv(temporal_rank_histogram_csv, index=False)
     summary_json.write_text(json.dumps(_json_safe(summary), indent=2, sort_keys=True))
     _write_html(
         html_path,
@@ -1353,6 +1694,17 @@ def run_analysis(args: argparse.Namespace) -> None:
             f"H={','.join(f'{h:g}' for h in config.horizons_hours)} h</sup>"
         ),
         )
+    if not temporal_calibration_df.empty:
+        _write_temporal_calibration_html(
+            temporal_calibration_html,
+            temporal_calibration_df,
+            temporal_rank_histogram_df,
+            title=(
+                "Temporal trace distribution calibration"
+                f"<br><sup>{model_kind}, scenarios={args.num_scenarios}, "
+                "tie-aware randomized ensemble ranks</sup>"
+            ),
+        )
 
     print(f"saved_profile_kpis={profile_csv}")
     print(f"saved_pooled_kpis={pooled_csv}")
@@ -1361,6 +1713,10 @@ def run_analysis(args: argparse.Namespace) -> None:
     if not coverage_df.empty:
         print(f"saved_kpi_coverage={coverage_csv}")
         print(f"saved_kpi_coverage_html={coverage_html_path}")
+    if not temporal_calibration_df.empty:
+        print(f"saved_temporal_trace_calibration={temporal_calibration_csv}")
+        print(f"saved_temporal_trace_rank_histogram={temporal_rank_histogram_csv}")
+        print(f"saved_temporal_trace_calibration_html={temporal_calibration_html}")
     print(f"saved_summary={summary_json}")
     print(f"saved_html={html_path}")
     print(
@@ -1410,6 +1766,15 @@ def parse_args() -> argparse.Namespace:
         "--prob-hp-scenario-mode",
         choices=("expected", "bernoulli"),
         default="bernoulli",
+    )
+    parser.add_argument(
+        "--ventilation-rollout-mode",
+        choices=("recorded", "eplus_rule"),
+        default="recorded",
+        help=(
+            "Use recorded ventilation or regenerate the EnergyPlus window-ventilation "
+            "rule sequentially from each scenario's predicted indoor temperature."
+        ),
     )
     parser.add_argument(
         "--prob-hp-emission-mode",

@@ -9,6 +9,7 @@ import jax
 import jax.numpy as jnp
 from jax.scipy.special import ndtr
 
+from ..ventilation import replace_with_eplus_ventilation
 from .emulator import MLP, ParameterSlices, parameter_slices
 from .schur import SchurMode, simba_schur_matrix
 from .state_space import StateSpaceMatrices
@@ -19,7 +20,12 @@ HPElectricScenarioMode = Literal["expected", "bernoulli"]
 HPElectricRolloutMode = Literal["expected", "bernoulli", "straight_through"]
 HPTrainingMode = Literal["expected", "straight_through"]
 ProbHpEmissionMode = Literal["bounded", "legacy_lognormal_mean"]
-HPActivationModel = Literal["independent", "persistent_markov", "power_history"]
+HPActivationModel = Literal[
+    "independent",
+    "persistent_markov",
+    "power_history",
+    "asymmetric_markov",
+]
 ProbClosedLoopAux = tuple[jnp.ndarray, ...]
 
 
@@ -658,11 +664,28 @@ class ProbabilisticClosedLoopHPEmulator(eqx.Module):
         *,
         hp_scenario_mode: HPElectricRolloutMode = "expected",
         hp_concrete_temperature: jnp.ndarray | float = 0.5,
+        ventilation_time_available: jnp.ndarray | None = None,
+        ventilation_minimum_indoor_temperature_c: jnp.ndarray | None = None,
+        ventilation_nominal_flow_m3_s: jnp.ndarray | float = 0.0,
+        ventilation_minimum_indoor_outdoor_delta_c: jnp.ndarray | float = 2.0,
     ) -> tuple[jnp.ndarray, ProbClosedLoopAux]:
         if hp_scenario_mode not in ("expected", "bernoulli", "straight_through"):
             raise ValueError(
                 "hp_scenario_mode must be 'expected', 'bernoulli', or 'straight_through'"
             )
+        generated_ventilation = ventilation_time_available is not None
+        if generated_ventilation != (ventilation_minimum_indoor_temperature_c is not None):
+            raise ValueError(
+                "ventilation_time_available and ventilation_minimum_indoor_temperature_c "
+                "must be provided together"
+            )
+        if generated_ventilation:
+            if ventilation_time_available.shape != (inputs.shape[0],):
+                raise ValueError("ventilation_time_available must have shape [horizon]")
+            if ventilation_minimum_indoor_temperature_c.shape != (inputs.shape[0],):
+                raise ValueError(
+                    "ventilation_minimum_indoor_temperature_c must have shape [horizon]"
+                )
         matrices = self.matrices(metadata, xi)
         x0 = self.initial_state(metadata, initial_temperature, xi)
         w0, e0 = self.initial_controller_state(metadata, initial_temperature, xi)
@@ -694,6 +717,29 @@ class ProbabilisticClosedLoopHPEmulator(eqx.Module):
         ]:
             x_t, w_t, energy_t, temperature_t = carry
             time_index, input_t, eps_t, mode_uniform_t, power_noise_t = step_inputs
+            if generated_ventilation:
+                input_t = replace_with_eplus_ventilation(
+                    input_t,
+                    temperature_t,
+                    time_available_t=ventilation_time_available[time_index],
+                    minimum_indoor_temperature_c_t=(
+                        ventilation_minimum_indoor_temperature_c[time_index]
+                    ),
+                    nominal_flow_m3_s=jnp.asarray(
+                        ventilation_nominal_flow_m3_s,
+                        dtype=input_t.dtype,
+                    ),
+                    minimum_indoor_outdoor_delta_c=jnp.asarray(
+                        ventilation_minimum_indoor_outdoor_delta_c,
+                        dtype=input_t.dtype,
+                    ),
+                    ventilation_input_index=self.ventilation_input_index,
+                    outdoor_input_index=self.outdoor_input_index,
+                    input_mean=self.input_mean,
+                    input_scale=self.input_scale,
+                    temperature_mean_c=self.target_mean[0],
+                    temperature_scale_c=self.target_scale[0],
+                )
             features = self._controller_features(input_t, temperature_t, energy_t, w_t)
             availability_t = self._space_heating_availability(input_t)
 
@@ -817,6 +863,10 @@ class ProbabilisticClosedLoopHPEmulator(eqx.Module):
         sample_process_noise: bool = True,
         hp_scenario_mode: HPElectricRolloutMode = "expected",
         hp_concrete_temperature: jnp.ndarray | float = 0.5,
+        ventilation_time_available: jnp.ndarray | None = None,
+        ventilation_minimum_indoor_temperature_c: jnp.ndarray | None = None,
+        ventilation_nominal_flow_m3_s: jnp.ndarray | float = 0.0,
+        ventilation_minimum_indoor_outdoor_delta_c: jnp.ndarray | float = 2.0,
     ) -> tuple[jnp.ndarray, ProbClosedLoopAux]:
         if num_particles < 1:
             raise ValueError("num_particles must be positive")
@@ -843,6 +893,14 @@ class ProbabilisticClosedLoopHPEmulator(eqx.Module):
                 particle_power_noise,
                 hp_scenario_mode=hp_scenario_mode,
                 hp_concrete_temperature=hp_concrete_temperature,
+                ventilation_time_available=ventilation_time_available,
+                ventilation_minimum_indoor_temperature_c=(
+                    ventilation_minimum_indoor_temperature_c
+                ),
+                ventilation_nominal_flow_m3_s=ventilation_nominal_flow_m3_s,
+                ventilation_minimum_indoor_outdoor_delta_c=(
+                    ventilation_minimum_indoor_outdoor_delta_c
+                ),
             )
         )(xi, process_noise, hp_mode_uniform, hp_power_noise)
         return predictions, (*aux, xi)
@@ -858,6 +916,10 @@ class ProbabilisticClosedLoopHPEmulator(eqx.Module):
         sample_process_noise: bool = True,
         hp_scenario_mode: HPElectricRolloutMode = "expected",
         hp_concrete_temperature: jnp.ndarray | float = 0.5,
+        ventilation_time_available: jnp.ndarray | None = None,
+        ventilation_minimum_indoor_temperature_c: jnp.ndarray | None = None,
+        ventilation_nominal_flow_m3_s: jnp.ndarray | float = 0.0,
+        ventilation_minimum_indoor_outdoor_delta_c: jnp.ndarray | float = 2.0,
     ) -> jnp.ndarray:
         predictions, _ = self.sample_with_aux(
             metadata,
@@ -868,6 +930,14 @@ class ProbabilisticClosedLoopHPEmulator(eqx.Module):
             sample_process_noise=sample_process_noise,
             hp_scenario_mode=hp_scenario_mode,
             hp_concrete_temperature=hp_concrete_temperature,
+            ventilation_time_available=ventilation_time_available,
+            ventilation_minimum_indoor_temperature_c=(
+                ventilation_minimum_indoor_temperature_c
+            ),
+            ventilation_nominal_flow_m3_s=ventilation_nominal_flow_m3_s,
+            ventilation_minimum_indoor_outdoor_delta_c=(
+                ventilation_minimum_indoor_outdoor_delta_c
+            ),
         )
         return predictions
 

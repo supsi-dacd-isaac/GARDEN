@@ -9,6 +9,7 @@ from typing import Any, Iterable
 import numpy as np
 import pandas as pd
 from .columns import (
+    DHW_MIXED_WATER_PER_HEATED_AREA_COLUMN,
     INTERNAL_GAIN_PER_FLOOR_AREA_COLUMN,
     PROFILE_ID_COLUMN,
     SPACE_HEATING_AVAILABILITY_COLUMN,
@@ -86,6 +87,7 @@ def regenerate_closed_loop_plots(
     prob_plot_particles: int | None,
     prob_eval_particles: int | None,
     prob_hp_scenario_mode: str | None,
+    ventilation_rollout_mode: str,
 ) -> None:
     artifact = load_training_artifact(artifact_dir)
     metadata = artifact.metadata
@@ -95,12 +97,16 @@ def regenerate_closed_loop_plots(
     include_internal_gains = (
         INTERNAL_GAIN_PER_FLOOR_AREA_COLUMN in metadata.get("input_columns", [])
     )
+    include_dhw_request = (
+        DHW_MIXED_WATER_PER_HEATED_AREA_COLUMN in metadata.get("input_columns", [])
+    )
 
     df = _read_parquet(
         dataset_path,
         columns=closed_loop_required_columns(
             metadata_columns or None,
             include_internal_gains=include_internal_gains,
+            include_dhw_request=include_dhw_request,
         ),
         profile_ids=test_ids,
     )
@@ -110,6 +116,7 @@ def regenerate_closed_loop_plots(
             SPACE_HEATING_AVAILABILITY_COLUMN in metadata.get("input_columns", [])
         ),
         include_internal_gains=include_internal_gains,
+        include_dhw_request=include_dhw_request,
         hp_power_area_normalization=str(
             _config_value(metadata, "hp_power_area_normalization", "zone_floor_area")
         ),  # type: ignore[arg-type]
@@ -139,6 +146,8 @@ def regenerate_closed_loop_plots(
             profiles,
             artifact.scalers,
             num_particles=eval_particles,
+            ventilation_rollout_mode=ventilation_rollout_mode,  # type: ignore[arg-type]
+            metadata_columns=metadata_columns or None,
         )
         print(
             "full_profile_test "
@@ -160,8 +169,15 @@ def regenerate_closed_loop_plots(
             hp_scenario_mode=scenario_mode,  # type: ignore[arg-type]
             filename_suffix=suffix,
             title_label=title,
+            ventilation_rollout_mode=ventilation_rollout_mode,  # type: ignore[arg-type]
+            metadata_columns=metadata_columns or None,
         )
     else:
+        if ventilation_rollout_mode != "recorded":
+            raise ValueError(
+                "--ventilation-rollout-mode eplus_rule currently requires a probabilistic "
+                "closed-loop artifact"
+            )
         model = artifact.model
         if not isinstance(model, (ClosedLoopHPEmulator, ContractingClosedLoopHPEmulator)):
             raise TypeError(f"Loaded model has unexpected type {type(model)!r}")
@@ -322,6 +338,11 @@ def parse_args() -> argparse.Namespace:
         choices=("expected", "bernoulli"),
         default=None,
     )
+    parser.add_argument(
+        "--ventilation-rollout-mode",
+        choices=("recorded", "eplus_rule"),
+        default="recorded",
+    )
     return parser.parse_args()
 
 
@@ -363,6 +384,7 @@ def main() -> None:
             prob_plot_particles=args.prob_plot_particles,
             prob_eval_particles=args.prob_eval_particles,
             prob_hp_scenario_mode=args.prob_hp_scenario_mode,
+            ventilation_rollout_mode=args.ventilation_rollout_mode,
         )
         return
 
