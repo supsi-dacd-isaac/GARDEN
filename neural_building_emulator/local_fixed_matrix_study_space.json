@@ -1,0 +1,16 @@
+{
+  "thermal_matrix_mode": [
+    "time_varying",
+    "fixed"
+  ],
+  "stability_weight": [
+    0.0,
+    0.01
+  ],
+  "temperature_update_mode": [
+    "leaky_equilibrium"
+  ],
+  "process_noise_mode": [
+    "none"
+  ]
+}

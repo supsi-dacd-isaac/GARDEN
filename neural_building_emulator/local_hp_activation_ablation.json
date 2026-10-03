@@ -1,0 +1,17 @@
+{
+  "hp_activation_model": [
+    "independent",
+    "persistent_markov",
+    "power_history"
+  ],
+  "hp_training_mode": [
+    "expected"
+  ],
+  "process_noise_mode": [
+    "none",
+    "heteroscedastic"
+  ],
+  "temperature_update_mode": [
+    "leaky_equilibrium"
+  ]
+}

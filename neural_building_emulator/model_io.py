@@ -18,6 +18,7 @@ from .columns import (
     DHW_MIXED_WATER_PER_HEATED_AREA_COLUMN,
     DISTURBANCE_COLUMNS,
     INTERNAL_GAIN_PER_FLOOR_AREA_COLUMN,
+    HP_FORCE_OFF_REQUESTED_COLUMN,
     OCCUPANTS_PER_FLOOR_AREA_COLUMN,
     SPACE_HEATING_AVAILABILITY_COLUMN,
 )
@@ -305,6 +306,11 @@ def _build_model_skeleton(
         if SPACE_HEATING_AVAILABILITY_COLUMN in input_columns
         else -1
     )
+    hp_force_off_input_index = (
+        input_columns.index(HP_FORCE_OFF_REQUESTED_COLUMN)
+        if HP_FORCE_OFF_REQUESTED_COLUMN in input_columns
+        else -1
+    )
     thermal_extra_input_indices = tuple(
         input_columns.index(column)
         for column in (
@@ -313,13 +319,20 @@ def _build_model_skeleton(
         )
         if column in input_columns
     )
-    hp_controller_masked_input_indices = (
-        ()
-        if bool(config.get("hp_controller_calendar_features", True))
-        else tuple(
-            index
-            for index, column in enumerate(input_columns)
-            if column in CLOSED_LOOP_CALENDAR_COLUMNS
+    hp_controller_masked_input_indices = tuple(
+        dict.fromkeys(
+            (
+                *((hp_force_off_input_index,) if hp_force_off_input_index >= 0 else ()),
+                *(
+                    ()
+                    if bool(config.get("hp_controller_calendar_features", True))
+                    else tuple(
+                        index
+                        for index, column in enumerate(input_columns)
+                        if column in CLOSED_LOOP_CALENDAR_COLUMNS
+                    )
+                ),
+            )
         )
     )
     dhw_request_input_index = (
@@ -327,8 +340,10 @@ def _build_model_skeleton(
         if DHW_MIXED_WATER_PER_HEATED_AREA_COLUMN in input_columns
         else -1
     )
-    thermal_dynamics_masked_input_indices = (
-        (dhw_request_input_index,) if dhw_request_input_index >= 0 else ()
+    thermal_dynamics_masked_input_indices = tuple(
+        index
+        for index in (dhw_request_input_index, hp_force_off_input_index)
+        if index >= 0
     )
 
     if model_kind == "deterministic":
@@ -408,6 +423,7 @@ def _build_model_skeleton(
             target_mean=target_mean,
             target_scale=target_scale,
             availability_input_index=availability_input_index,
+            hp_force_off_input_index=hp_force_off_input_index,
             thermal_extra_input_indices=thermal_extra_input_indices,
             bptt_truncate_steps=int(config.get("bptt_truncate_steps", 0)),
             key=key,
@@ -431,9 +447,17 @@ def _build_model_skeleton(
             state_bound=float(config.get("contracting_state_bound", 5.0)),
             temperature_output_scale=float(config.get("contracting_temperature_scale", 8.0)),
             temperature_delta_max_c=float(config.get("contracting_temperature_delta_max_c", 0.0)),
+            temperature_alpha_cap=float(config.get("contracting_temperature_alpha_cap", 1.0)),
+            temperature_fixed_alpha=float(config.get("contracting_temperature_fixed_alpha", 0.0)),
             temperature_update_mode=config.get("contracting_temperature_update", "auto"),
+            temperature_feedback_gradient_scale=float(
+                config.get("contracting_temperature_feedback_gradient_scale", 1.0)
+            ),
             transition_conditioning=config.get(
                 "contracting_transition_conditioning", "state_feedback"
+            ),
+            thermal_architecture=config.get(
+                "contracting_thermal_architecture", "bounded_mlp"
             ),
             additive_feedback_gain_bound=float(
                 config.get("contracting_additive_feedback_gain_bound", 1.0)
@@ -449,6 +473,7 @@ def _build_model_skeleton(
             target_mean=target_mean,
             target_scale=target_scale,
             availability_input_index=availability_input_index,
+            hp_force_off_input_index=hp_force_off_input_index,
             bptt_truncate_steps=int(config.get("bptt_truncate_steps", 0)),
             hp_controller_masked_input_indices=hp_controller_masked_input_indices,
             thermal_dynamics_masked_input_indices=thermal_dynamics_masked_input_indices,
@@ -488,6 +513,12 @@ def _build_model_skeleton(
             state_dim=int(config["state_dim"]),
             controller_state_dim=int(config.get("hp_controller_state_dim", 2)),
             latent_dim=int(config.get("prob_latent_dim", 4)),
+            persistent_xi_pathways=tuple(
+                config.get(
+                    "prob_persistent_xi_pathways",
+                    ("initial", "thermal", "q_to_t", "hp"),
+                )
+            ),
             hidden_dim=int(config["hidden_dim"]),
             depth=int(config["depth"]),
             input_encoder_dim=config["input_encoder_dim"],
@@ -497,6 +528,9 @@ def _build_model_skeleton(
             process_noise_init=float(config.get("prob_process_noise_init", -6.0)),
             hp_emission_mode=config.get("prob_hp_emission_mode", "legacy_lognormal_mean"),
             hp_activation_model=config.get("prob_hp_activation_model", "independent"),
+            qroom_activation_model=config.get(
+                "prob_qroom_activation_model", "continuous"
+            ),
             hp_persistent_latent_dim=int(config.get("prob_hp_persistent_latent_dim", 2)),
             hp_controller_leak=float(config.get("prob_hp_controller_leak", 0.25)),
             hp_controller_noise_scale=float(
@@ -509,13 +543,30 @@ def _build_model_skeleton(
                     "prob_hp_setpoint_shock_timescales_hours", ()
                 )
             ),
+            hp_force_off_debt_timescales_hours=tuple(
+                float(value)
+                for value in config.get(
+                    "prob_hp_force_off_debt_timescales_hours", ()
+                )
+            ),
             contraction_gamma=float(config.get("contracting_gamma", 0.99)),
             state_bound=float(config.get("contracting_state_bound", 5.0)),
             temperature_output_scale=float(config.get("contracting_temperature_scale", 8.0)),
             temperature_delta_max_c=float(config.get("contracting_temperature_delta_max_c", 0.0)),
+            temperature_alpha_cap=float(config.get("contracting_temperature_alpha_cap", 1.0)),
+            temperature_fixed_alpha=float(config.get("contracting_temperature_fixed_alpha", 0.0)),
+            temperature_alpha_conditioning=config.get(
+                "contracting_temperature_alpha_conditioning", "metadata_xi"
+            ),
             temperature_update_mode=config.get("contracting_temperature_update", "auto"),
+            temperature_feedback_gradient_scale=float(
+                config.get("contracting_temperature_feedback_gradient_scale", 1.0)
+            ),
             transition_conditioning=config.get(
                 "contracting_transition_conditioning", "state_feedback"
+            ),
+            thermal_architecture=config.get(
+                "contracting_thermal_architecture", "bounded_mlp"
             ),
             additive_feedback_gain_bound=float(
                 config.get("contracting_additive_feedback_gain_bound", 1.0)
@@ -531,6 +582,7 @@ def _build_model_skeleton(
             target_mean=target_mean,
             target_scale=target_scale,
             availability_input_index=availability_input_index,
+            hp_force_off_input_index=hp_force_off_input_index,
             bptt_truncate_steps=int(config.get("bptt_truncate_steps", 0)),
             hp_controller_masked_input_indices=hp_controller_masked_input_indices,
             thermal_dynamics_masked_input_indices=thermal_dynamics_masked_input_indices,
@@ -555,6 +607,15 @@ def _build_model_skeleton(
             ),
             q_to_t_gain_max_c_per_w_m2=float(
                 config.get("contracting_q_to_t_gain_max_c_per_w_m2", 2.0)
+            ),
+            hydronic_innovation_enabled=bool(
+                config.get("prob_hydronic_innovation", False)
+            ),
+            hydronic_innovation_cap_w_m2=float(
+                config.get("prob_hydronic_innovation_cap_w_m2", 20.0)
+            ),
+            hydronic_innovation_time_constant_hours=float(
+                config.get("prob_hydronic_innovation_time_constant_hours", 0.5)
             ),
             key=key,
         )
@@ -592,6 +653,7 @@ def _build_model_skeleton(
             target_mean=target_mean,
             target_scale=target_scale,
             availability_input_index=availability_input_index,
+            hp_force_off_input_index=hp_force_off_input_index,
             thermal_extra_input_indices=thermal_extra_input_indices,
             bptt_truncate_steps=int(config.get("bptt_truncate_steps", 0)),
             key=key,

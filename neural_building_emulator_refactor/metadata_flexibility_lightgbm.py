@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import re
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Iterable, Literal, Sequence
@@ -45,10 +46,222 @@ from neural_building_emulator.flexibility_event_study_kpis import (
 )
 
 from .artifacts import LoadedArtifact, load_artifact
-from .profiles import saved_profile_ids
+from .profiles import artifact_value, saved_profile_ids
+from .scoring import score_artifact
 
 
 Direction = Literal["up", "down"]
+KpiKind = Literal["f", "regression_based"]
+
+KPI_ESTIMATORS: dict[KpiKind, str] = {
+    "f": "direct_ratio",
+    "regression_based": "regression",
+}
+KPI_ALIASES: dict[str, KpiKind] = {
+    "f": "f",
+    "direct_ratio": "f",
+    "regression_based": "regression_based",
+    "regression": "regression_based",
+}
+RESERVED_COMPARISON_METHODS = {
+    "true",
+    "train_mean",
+    "lightgbm",
+    "emulator",
+}
+
+
+def _normalize_kpi_kinds(values: Sequence[str]) -> tuple[KpiKind, ...]:
+    normalized: list[KpiKind] = []
+    for value in values:
+        try:
+            kind = KPI_ALIASES[value]
+        except KeyError as exc:
+            choices = ", ".join(sorted(KPI_ALIASES))
+            raise ValueError(f"Unknown KPI {value!r}; expected one of: {choices}") from exc
+        if kind not in normalized:
+            normalized.append(kind)
+    if not normalized:
+        raise ValueError("At least one KPI must be selected")
+    return tuple(normalized)
+
+
+def _resolve_emulator_kpi_csvs(
+    values: Sequence[str | Path],
+    kpi_kinds: Sequence[KpiKind],
+) -> dict[KpiKind, Path]:
+    mapped: dict[KpiKind, Path] = {}
+    bare: list[Path] = []
+    for raw_value in values:
+        value = str(raw_value)
+        name, separator, path_value = value.partition("=")
+        if separator and name in KPI_ALIASES:
+            kind = KPI_ALIASES[name]
+            if kind not in kpi_kinds:
+                raise ValueError(
+                    f"Emulator KPI CSV was supplied for unselected KPI {kind!r}"
+                )
+            if kind in mapped:
+                raise ValueError(f"Duplicate emulator KPI CSV for {kind!r}")
+            mapped[kind] = Path(path_value)
+        else:
+            bare.append(Path(value))
+    if bare:
+        if len(bare) != 1 or len(kpi_kinds) != 1:
+            raise ValueError(
+                "Bare --emulator-kpi-csv paths are accepted only for a single KPI. "
+                "For multiple KPIs use f=PATH and regression_based=PATH."
+            )
+        kind = kpi_kinds[0]
+        if kind in mapped:
+            raise ValueError(f"Duplicate emulator KPI CSV for {kind!r}")
+        mapped[kind] = bare[0]
+    return mapped
+
+
+def _resolve_additional_emulator_artifacts(
+    values: Sequence[str],
+) -> dict[str, Path]:
+    artifacts: dict[str, Path] = {}
+    for value in values:
+        label, separator, path_value = value.partition("=")
+        if not separator or not label or not path_value:
+            raise ValueError(
+                "--additional-emulator-artifact must use the form NAME=PATH"
+            )
+        if not re.fullmatch(r"[A-Za-z0-9_.-]+", label):
+            raise ValueError(
+                f"Invalid additional emulator label {label!r}; use letters, digits, "
+                "dots, dashes, or underscores"
+            )
+        if label in RESERVED_COMPARISON_METHODS:
+            raise ValueError(f"Reserved additional emulator label {label!r}")
+        if label in artifacts:
+            raise ValueError(f"Duplicate additional emulator label {label!r}")
+        artifacts[label] = Path(path_value)
+    return artifacts
+
+
+def _validate_comparison_artifact(
+    reference: LoadedArtifact,
+    candidate: LoadedArtifact,
+    *,
+    label: str,
+) -> None:
+    if candidate.spec.task != "closed_loop_hp":
+        raise ValueError(
+            f"Additional emulator {label!r} has task {candidate.spec.task!r}; "
+            "expected 'closed_loop_hp'"
+        )
+    reference_ids = set(saved_profile_ids(reference, "test"))
+    candidate_ids = set(saved_profile_ids(candidate, "test"))
+    if candidate_ids != reference_ids:
+        raise ValueError(
+            f"Additional emulator {label!r} does not use the reference artifact's "
+            "test-building split"
+        )
+    reference_normalization = str(
+        artifact_value(reference, "hp_power_area_normalization")
+        or "zone_floor_area"
+    )
+    candidate_normalization = str(
+        artifact_value(candidate, "hp_power_area_normalization")
+        or "zone_floor_area"
+    )
+    if candidate_normalization != reference_normalization:
+        raise ValueError(
+            f"Additional emulator {label!r} uses HP power normalization "
+            f"{candidate_normalization!r}, but the reference uses "
+            f"{reference_normalization!r}"
+        )
+
+
+def _resolve_dataset_path(
+    artifact: LoadedArtifact,
+    override: Path | None,
+) -> tuple[Path, str]:
+    if override is not None:
+        return Path(override), "override"
+    inferred = artifact_value(artifact, "dataset_path")
+    if not inferred:
+        raise ValueError(
+            "The artifact does not record dataset_path; pass --dataset explicitly"
+        )
+    return Path(inferred), "artifact"
+
+
+def _automatic_emulator_scoring_plan(
+    kpi_kinds: Sequence[KpiKind],
+    output_dir: Path,
+) -> tuple[str, bool, dict[KpiKind, Path]]:
+    """Plan one artifact rollout that supplies all requested emulator KPI tables."""
+    selected = tuple(kpi_kinds)
+    if "regression_based" in selected:
+        primary_estimator = "regression"
+        evaluate_direct_f = "f" in selected
+        paths: dict[KpiKind, Path] = {
+            "regression_based": output_dir / "flexibility_kpis.csv"
+        }
+        if evaluate_direct_f:
+            paths["f"] = output_dir / "flexibility_kpis_f.csv"
+        return primary_estimator, evaluate_direct_f, paths
+    return "direct_ratio", False, {"f": output_dir / "flexibility_kpis.csv"}
+
+
+def _generate_emulator_kpi_csvs(
+    args: argparse.Namespace,
+    *,
+    artifact_dir: Path,
+    artifact: LoadedArtifact,
+    dataset_path: Path,
+    kpi_kinds: Sequence[KpiKind],
+    output_dir: Path,
+) -> dict[KpiKind, Path]:
+    """Roll out the artifact once and derive every selected KPI from those traces."""
+    estimator, evaluate_direct_f, paths = _automatic_emulator_scoring_plan(
+        kpi_kinds,
+        output_dir,
+    )
+    if artifact.spec.probabilistic and args.emulator_num_scenarios < 1:
+        raise ValueError("--emulator-num-scenarios must be positive")
+    if args.emulator_max_profiles is not None and args.emulator_max_profiles < 1:
+        raise ValueError("--emulator-max-profiles must be positive")
+    kpi_mode = "scenario_average" if artifact.spec.probabilistic else "mean"
+    scenario_count = args.emulator_num_scenarios if artifact.spec.probabilistic else 0
+    print(
+        "emulator_kpi_csv=auto_generate "
+        f"mode={kpi_mode} scenarios={scenario_count} "
+        f"hp_scenario_mode={args.emulator_hp_scenario_mode} "
+        f"ventilation_rollout_mode={args.emulator_ventilation_rollout_mode} "
+        f"output={output_dir}"
+    )
+    score_artifact(
+        artifact_dir,
+        dataset_path=dataset_path,
+        output_dir=output_dir,
+        profile_source="test",
+        max_profiles=args.emulator_max_profiles,
+        kpi_mode=kpi_mode,
+        num_scenarios=args.emulator_num_scenarios,
+        hp_scenario_mode=args.emulator_hp_scenario_mode,
+        ventilation_rollout_mode=args.emulator_ventilation_rollout_mode,
+        horizons_hours=tuple(args.horizons_hours),
+        dt_hours=args.dt_hours,
+        min_setpoint_change=args.min_setpoint_change,
+        min_events=args.min_events,
+        kpi_estimator=estimator,
+        controls=args.controls,
+        seed=args.seed,
+        num_profile_plots=args.emulator_num_profile_plots,
+        evaluate_direct_f=evaluate_direct_f,
+    )
+    missing = [str(path) for path in paths.values() if not path.exists()]
+    if missing:
+        raise RuntimeError(
+            "Automatic emulator scoring did not produce the expected KPI tables: "
+            + ", ".join(missing)
+        )
+    return paths
 
 
 @dataclass(frozen=True)
@@ -461,10 +674,16 @@ def _load_emulator_predictions(path: Path | None) -> pd.DataFrame:
     )
 
 
-def _emulator_target_frame(emulator: pd.DataFrame, target: TargetSpec) -> pd.DataFrame:
+def _emulator_target_frame(
+    emulator: pd.DataFrame,
+    target: TargetSpec,
+    *,
+    method: str = "emulator",
+) -> pd.DataFrame:
     if emulator.empty:
         return emulator
     rows = emulator[np.isclose(emulator["horizon_hours"], target.horizon_hours)].copy()
+    truth_column = f"{method}__csv_truth"
     return rows.loc[
         :,
         [
@@ -474,8 +693,8 @@ def _emulator_target_frame(emulator: pd.DataFrame, target: TargetSpec) -> pd.Dat
         ],
     ].rename(
         columns={
-            f"sim_{target.direction}_flex_wh_m2_k": "emulator_csv_truth",
-            f"emu_{target.direction}_flex_wh_m2_k": "emulator",
+            f"sim_{target.direction}_flex_wh_m2_k": truth_column,
+            f"emu_{target.direction}_flex_wh_m2_k": method,
         }
     )
 
@@ -484,7 +703,7 @@ def _write_scatter_dashboard(
     path: Path,
     predictions: pd.DataFrame,
     targets: Sequence[TargetSpec],
-    has_emulator: bool,
+    emulator_methods: Sequence[str],
 ) -> None:
     horizons = sorted({target.horizon_hours for target in targets})
     figure = make_subplots(
@@ -498,7 +717,14 @@ def _write_scatter_dashboard(
         horizontal_spacing=0.08,
         vertical_spacing=max(0.04, 0.12 / len(horizons)),
     )
-    colors = {"lightgbm": "#16846b", "emulator": "#d95f02", "train_mean": "#757575"}
+    palette = ("#d95f02", "#6a3d9a", "#1f78b4", "#e31a1c", "#ff7f00")
+    colors = {"lightgbm": "#16846b", "train_mean": "#757575"}
+    colors.update(
+        {
+            method: palette[index % len(palette)]
+            for index, method in enumerate(emulator_methods)
+        }
+    )
     for row, horizon in enumerate(horizons, start=1):
         for col, direction in enumerate(("up", "down"), start=1):
             target = next(
@@ -507,8 +733,7 @@ def _write_scatter_dashboard(
             )
             frame = predictions[predictions["target_key"] == target.key]
             values = [frame["true"].to_numpy(), frame["lightgbm"].to_numpy()]
-            if has_emulator:
-                values.append(frame["emulator"].to_numpy())
+            values.extend(frame[method].to_numpy() for method in emulator_methods)
             finite = np.concatenate(values)
             finite = finite[np.isfinite(finite)]
             low = float(np.min(finite)) if len(finite) else 0.0
@@ -525,7 +750,7 @@ def _write_scatter_dashboard(
                 row=row,
                 col=col,
             )
-            methods = ["lightgbm", "emulator"] if has_emulator else ["lightgbm"]
+            methods = ["lightgbm", *emulator_methods]
             for method in methods:
                 figure.add_trace(
                     go.Scattergl(
@@ -616,10 +841,16 @@ def _write_score_dashboard(
     figure.write_html(path)
 
 
-def run_benchmark(args: argparse.Namespace) -> Path:
-    artifact = load_artifact(args.artifact_dir)
-    if artifact.spec.task != "closed_loop_hp":
-        raise ValueError("Metadata flexibility prediction requires a closed-loop HP artifact")
+def _run_single_benchmark(
+    args: argparse.Namespace,
+    *,
+    artifact: LoadedArtifact,
+    dataset_path: Path,
+    output_dir: Path,
+    kpi_kind: KpiKind,
+    kpi_estimator: str,
+    emulator_kpi_csvs: dict[str, Path],
+) -> Path:
     metadata = _artifact_metadata(artifact)
     metadata_columns = tuple(metadata.get("metadata_columns", METADATA_COLUMNS))
     if not metadata_columns:
@@ -637,7 +868,7 @@ def run_benchmark(args: argparse.Namespace) -> Path:
         min_setpoint_change=args.min_setpoint_change,
         min_events=args.min_events,
         controls=args.controls,
-        estimator=args.kpi_estimator,
+        estimator=kpi_estimator,
     )
     include_availability = SPACE_HEATING_AVAILABILITY_COLUMN in metadata.get("input_columns", [])
     include_internal_gains = (
@@ -649,13 +880,12 @@ def run_benchmark(args: argparse.Namespace) -> Path:
     hp_power_area_normalization = str(
         _metadata_value(metadata, "hp_power_area_normalization", "zone_floor_area")
     )
-    output_dir = Path(args.output_dir)
     model_dir = output_dir / "models"
     output_dir.mkdir(parents=True, exist_ok=True)
     model_dir.mkdir(parents=True, exist_ok=True)
 
     kpi_frame = extract_metadata_kpis(
-        Path(args.dataset),
+        dataset_path,
         train_ids=train_ids,
         test_ids=test_ids,
         metadata_columns=metadata_columns,
@@ -668,7 +898,10 @@ def run_benchmark(args: argparse.Namespace) -> Path:
     kpi_frame.to_csv(output_dir / "metadata_flexibility_targets.csv", index=False)
     train_frame = kpi_frame[kpi_frame["split"] == "train"].copy()
     test_frame = kpi_frame[kpi_frame["split"] == "test"].copy()
-    emulator = _load_emulator_predictions(args.emulator_kpi_csv)
+    emulators = {
+        method: _load_emulator_predictions(path)
+        for method, path in emulator_kpi_csvs.items()
+    }
     lgbm_config = LightGBMConfig(
         learning_rate=args.learning_rate,
         max_estimators=args.max_estimators,
@@ -726,8 +959,16 @@ def run_benchmark(args: argparse.Namespace) -> Path:
                 "train_mean": np.full(len(test_frame), train_mean),
             }
         )
-        emulator_target = _emulator_target_frame(emulator, target)
-        if not emulator_target.empty:
+        emulator_methods: list[str] = []
+        for emulator_index, (method, emulator) in enumerate(emulators.items()):
+            emulator_target = _emulator_target_frame(
+                emulator,
+                target,
+                method=method,
+            )
+            if emulator_target.empty:
+                continue
+            truth_column = f"{method}__csv_truth"
             target_predictions = target_predictions.merge(
                 emulator_target,
                 on="profile_id",
@@ -736,12 +977,14 @@ def run_benchmark(args: argparse.Namespace) -> Path:
             )
             mismatch = np.abs(
                 target_predictions["true"].to_numpy(dtype=np.float64)
-                - target_predictions["emulator_csv_truth"].to_numpy(dtype=np.float64)
+                - target_predictions[truth_column].to_numpy(dtype=np.float64)
             )
-            truth_mismatch[target.key] = float(np.nanmax(mismatch))
-            target_predictions = target_predictions.drop(columns="emulator_csv_truth")
+            truth_mismatch[f"{method}:{target.key}"] = float(np.nanmax(mismatch))
+            target_predictions = target_predictions.drop(columns=truth_column)
+            emulator_methods.append(method)
             comparison_rows.append(
                 {
+                    "emulator_model": method,
                     "target_key": target.key,
                     "target_display": target.display_name,
                     "direction": target.direction,
@@ -749,16 +992,21 @@ def run_benchmark(args: argparse.Namespace) -> Path:
                     **paired_error_comparison(
                         target_predictions["true"].to_numpy(),
                         target_predictions["lightgbm"].to_numpy(),
-                        target_predictions["emulator"].to_numpy(),
-                        seed=args.seed + 1000 + target_index,
+                        target_predictions[method].to_numpy(),
+                        seed=(
+                            args.seed
+                            + 1000
+                            + target_index
+                            + 100 * emulator_index
+                        ),
                     ),
                 }
             )
         prediction_rows.extend(target_predictions.to_dict(orient="records"))
 
+        metric_start = len(metric_rows)
         methods = ["train_mean", "lightgbm"]
-        if "emulator" in target_predictions:
-            methods.append("emulator")
+        methods.extend(emulator_methods)
         for method in methods:
             values = regression_metrics(
                 target_predictions["true"].to_numpy(),
@@ -794,7 +1042,7 @@ def run_benchmark(args: argparse.Namespace) -> Path:
             )
         print(
             f"metadata_flex_model={target.key} best_iteration={best_iteration} "
-            f"test_nrmse={metric_rows[-1 if methods[-1] == 'lightgbm' else -2]['nrmse']:.4f}"
+            f"test_nrmse={metric_rows[metric_start + 1]['nrmse']:.4f}"
         )
 
     predictions = pd.DataFrame(prediction_rows)
@@ -809,12 +1057,12 @@ def run_benchmark(args: argparse.Namespace) -> Path:
             output_dir / "metadata_flexibility_emulator_comparison.csv",
             index=False,
         )
-    has_emulator = "emulator" in predictions.columns
+    emulator_methods = [method for method in emulators if method in predictions.columns]
     _write_scatter_dashboard(
         output_dir / "metadata_flexibility_scatter.html",
         predictions,
         targets,
-        has_emulator,
+        emulator_methods,
     )
     _write_score_dashboard(
         output_dir / "metadata_flexibility_dashboard.html",
@@ -824,7 +1072,8 @@ def run_benchmark(args: argparse.Namespace) -> Path:
     )
     summary = {
         "artifact_dir": str(args.artifact_dir),
-        "dataset": str(args.dataset),
+        "dataset": str(dataset_path),
+        "kpi_kind": kpi_kind,
         "train_profiles": len(train_ids),
         "test_profiles": len(test_ids),
         "metadata_columns": list(metadata_columns),
@@ -844,7 +1093,14 @@ def run_benchmark(args: argparse.Namespace) -> Path:
         },
         "lightgbm": asdict(lgbm_config),
         "models": model_manifest,
-        "emulator_kpi_csv": str(args.emulator_kpi_csv) if args.emulator_kpi_csv else None,
+        "emulator_kpi_csv": (
+            str(emulator_kpi_csvs["emulator"])
+            if "emulator" in emulator_kpi_csvs
+            else None
+        ),
+        "emulator_kpi_csvs": {
+            method: str(path) for method, path in emulator_kpi_csvs.items()
+        },
         "emulator_truth_max_abs_mismatch": truth_mismatch,
         "metrics": metric_rows,
         "paired_lightgbm_minus_emulator": comparison_rows,
@@ -852,8 +1108,168 @@ def run_benchmark(args: argparse.Namespace) -> Path:
     (output_dir / "metadata_flexibility_summary.json").write_text(
         json.dumps(summary, indent=2) + "\n"
     )
-    print(f"saved_metadata_flexibility_benchmark={output_dir}")
+    print(
+        f"saved_metadata_flexibility_benchmark={output_dir} "
+        f"kpi={kpi_kind} estimator={kpi_estimator}"
+    )
     return output_dir
+
+
+def _write_multi_kpi_dashboard(path: Path, metrics: pd.DataFrame) -> None:
+    figure = go.Figure()
+    colors = {
+        "train_mean": "#757575",
+        "lightgbm": "#16846b",
+        "emulator": "#d95f02",
+    }
+    for (kpi_kind, method), frame in metrics.groupby(["kpi_kind", "method"]):
+        figure.add_trace(
+            go.Bar(
+                x=[f"{kpi_kind}: {value}" for value in frame["target_display"]],
+                y=frame["nrmse"],
+                name=f"{kpi_kind}: {method}",
+                marker_color=colors.get(str(method)),
+            )
+        )
+    figure.update_layout(
+        title="Metadata-to-flexibility benchmark across KPI definitions",
+        template="plotly_white",
+        width=1500,
+        height=760,
+        barmode="group",
+        xaxis_title="KPI and response horizon",
+        yaxis_title="RMSE / training-target standard deviation",
+        legend={"orientation": "h", "y": -0.3},
+        margin={"b": 230},
+    )
+    figure.write_html(path)
+
+
+def run_benchmark(args: argparse.Namespace) -> Path:
+    artifact = load_artifact(args.artifact_dir)
+    if artifact.spec.task != "closed_loop_hp":
+        raise ValueError("Metadata flexibility prediction requires a closed-loop HP artifact")
+    dataset_path, dataset_source = _resolve_dataset_path(artifact, args.dataset)
+    if args.dataset is None:
+        print(f"dataset=inferred_from_artifact path={dataset_path}")
+    else:
+        print(f"dataset=explicit_override path={dataset_path}")
+
+    explicit_kpis = args.kpis is not None
+    kpi_kinds = _normalize_kpi_kinds(
+        args.kpis if explicit_kpis else (args.kpi_estimator,)
+    )
+    root_output = Path(args.output_dir)
+    root_output.mkdir(parents=True, exist_ok=True)
+    emulator_paths = _resolve_emulator_kpi_csvs(
+        args.emulator_kpi_csv,
+        kpi_kinds,
+    )
+    emulator_kpi_sources: dict[str, str] = {}
+    if not args.emulator_kpi_csv:
+        emulator_paths = _generate_emulator_kpi_csvs(
+            args,
+            artifact_dir=args.artifact_dir,
+            artifact=artifact,
+            dataset_path=dataset_path,
+            kpi_kinds=kpi_kinds,
+            output_dir=root_output / "emulator_scoring",
+        )
+        emulator_kpi_sources["emulator"] = "generated"
+    else:
+        emulator_kpi_sources["emulator"] = "explicit"
+
+    emulator_paths_by_kpi: dict[KpiKind, dict[str, Path]] = {
+        kind: ({"emulator": emulator_paths[kind]} if kind in emulator_paths else {})
+        for kind in kpi_kinds
+    }
+    additional_artifact_dirs = _resolve_additional_emulator_artifacts(
+        args.additional_emulator_artifact
+    )
+    for label, artifact_dir in additional_artifact_dirs.items():
+        additional_artifact = load_artifact(artifact_dir)
+        _validate_comparison_artifact(
+            artifact,
+            additional_artifact,
+            label=label,
+        )
+        additional_paths = _generate_emulator_kpi_csvs(
+            args,
+            artifact_dir=artifact_dir,
+            artifact=additional_artifact,
+            dataset_path=dataset_path,
+            kpi_kinds=kpi_kinds,
+            output_dir=root_output / "additional_emulator_scoring" / label,
+        )
+        for kind, path in additional_paths.items():
+            emulator_paths_by_kpi[kind][label] = path
+        emulator_kpi_sources[label] = "generated"
+
+    result_dirs: dict[KpiKind, Path] = {}
+    for kind in kpi_kinds:
+        output_dir = root_output / kind if explicit_kpis else root_output
+        result_dirs[kind] = _run_single_benchmark(
+            args,
+            artifact=artifact,
+            dataset_path=dataset_path,
+            output_dir=output_dir,
+            kpi_kind=kind,
+            kpi_estimator=KPI_ESTIMATORS[kind],
+            emulator_kpi_csvs=emulator_paths_by_kpi[kind],
+        )
+
+    if explicit_kpis:
+        metric_frames: list[pd.DataFrame] = []
+        comparison_frames: list[pd.DataFrame] = []
+        for kind, result_dir in result_dirs.items():
+            metrics = pd.read_csv(result_dir / "metadata_flexibility_metrics.csv")
+            metrics.insert(0, "kpi_kind", kind)
+            metric_frames.append(metrics)
+            comparison_path = result_dir / "metadata_flexibility_emulator_comparison.csv"
+            if comparison_path.exists():
+                comparison = pd.read_csv(comparison_path)
+                comparison.insert(0, "kpi_kind", kind)
+                comparison_frames.append(comparison)
+        combined_metrics = pd.concat(metric_frames, ignore_index=True)
+        combined_metrics.to_csv(
+            root_output / "metadata_flexibility_all_metrics.csv", index=False
+        )
+        if comparison_frames:
+            pd.concat(comparison_frames, ignore_index=True).to_csv(
+                root_output / "metadata_flexibility_all_emulator_comparisons.csv",
+                index=False,
+            )
+        dashboard = root_output / "metadata_flexibility_all_kpis.html"
+        _write_multi_kpi_dashboard(dashboard, combined_metrics)
+        (root_output / "metadata_flexibility_all_kpis_summary.json").write_text(
+            json.dumps(
+                {
+                    "artifact_dir": str(args.artifact_dir),
+                    "dataset": str(dataset_path),
+                    "dataset_source": dataset_source,
+                    "kpis": list(kpi_kinds),
+                    "result_directories": {
+                        kind: str(path) for kind, path in result_dirs.items()
+                    },
+                    "emulator_kpi_csvs": {
+                        kind: {
+                            method: str(path)
+                            for method, path in method_paths.items()
+                        }
+                        for kind, method_paths in emulator_paths_by_kpi.items()
+                    },
+                    "emulator_kpi_sources": emulator_kpi_sources,
+                    "additional_emulator_artifacts": {
+                        label: str(path)
+                        for label, path in additional_artifact_dirs.items()
+                    },
+                },
+                indent=2,
+            )
+            + "\n"
+        )
+        print(f"saved_metadata_flexibility_multi_kpi_dashboard={dashboard}")
+    return root_output
 
 
 def parse_args() -> argparse.Namespace:
@@ -861,9 +1277,72 @@ def parse_args() -> argparse.Namespace:
         description="Train LightGBM regressors from emulator metadata to simulated flexibility KPIs."
     )
     parser.add_argument("--artifact-dir", type=Path, required=True)
-    parser.add_argument("--dataset", type=Path, required=True)
+    parser.add_argument(
+        "--dataset",
+        type=Path,
+        help="Optional dataset override; defaults to dataset_path saved in the artifact.",
+    )
     parser.add_argument("--output-dir", type=Path, required=True)
-    parser.add_argument("--emulator-kpi-csv", type=Path)
+    parser.add_argument(
+        "--emulator-kpi-csv",
+        action="append",
+        default=[],
+        metavar="[KPI=]PATH",
+        help=(
+            "Optional precomputed emulator KPI table. For --kpis with multiple "
+            "entries, repeat as f=PATH and regression_based=PATH. A bare path "
+            "remains valid for a single KPI. If omitted, the saved emulator is "
+            "rolled out automatically on its test split."
+        ),
+    )
+    parser.add_argument(
+        "--emulator-num-scenarios",
+        type=int,
+        default=100,
+        help="Linked full-profile scenarios used for automatic probabilistic scoring.",
+    )
+    parser.add_argument(
+        "--additional-emulator-artifact",
+        action="append",
+        default=[],
+        metavar="NAME=PATH",
+        help=(
+            "Additional saved closed-loop emulator to score on the reference test "
+            "split and include in every comparison. Repeat for multiple models."
+        ),
+    )
+    parser.add_argument(
+        "--emulator-hp-scenario-mode",
+        choices=("bernoulli", "expected"),
+        default="bernoulli",
+        help="HP emission used when automatically rolling out a probabilistic artifact.",
+    )
+    parser.add_argument(
+        "--emulator-ventilation-rollout-mode",
+        choices=("recorded", "eplus_rule"),
+        default="recorded",
+        help="Ventilation input used during automatic full-profile emulator rollouts.",
+    )
+    parser.add_argument(
+        "--emulator-max-profiles",
+        type=int,
+        help="Optional test-profile cap for automatic scoring; defaults to the full test split.",
+    )
+    parser.add_argument(
+        "--emulator-num-profile-plots",
+        type=int,
+        default=0,
+        help="Number of annual trace plots written by the automatic scorer.",
+    )
+    parser.add_argument(
+        "--kpis",
+        nargs="+",
+        choices=tuple(KPI_ALIASES),
+        help=(
+            "Evaluate multiple KPI definitions in one run. Canonical names are "
+            "'f' and 'regression_based'; direct_ratio/regression are accepted aliases."
+        ),
+    )
     parser.add_argument("--horizons-hours", type=float, nargs="+", default=[0.5, 1.0, 2.0, 3.0])
     parser.add_argument("--dt-hours", type=float, default=0.25)
     parser.add_argument("--min-setpoint-change", type=float, default=0.05)

@@ -18,8 +18,16 @@ from neural_building_emulator.train import (
     checkpoint_metric_value,
     resolve_checkpoint_metric,
 )
-from neural_building_emulator_refactor.artifacts import load_artifact, save_lstm_artifact
-from neural_building_emulator_refactor.config import ExperimentConfig, LSTMConfig
+from neural_building_emulator_refactor.artifacts import (
+    load_artifact,
+    save_lstm_artifact,
+    save_probabilistic_lstm_artifact,
+)
+from neural_building_emulator_refactor.config import (
+    ExperimentConfig,
+    LSTMConfig,
+    ProbabilisticLSTMConfig,
+)
 from neural_building_emulator_refactor.deterministic_scaling_study import (
     MODEL_CLOSED_LOOP,
     MODEL_Q_TO_T,
@@ -32,7 +40,15 @@ from neural_building_emulator_refactor.fast_kpis import (
     raw_flexibility_metrics,
     trajectory_metrics,
 )
-from neural_building_emulator_refactor.models import AutoregressiveLSTM
+from neural_building_emulator_refactor.fair_probabilistic_lstm_comparison import (
+    DEFAULT_CONFIG as FAIR_COMPARISON_CONFIG,
+    _experiment_configs as fair_experiment_configs,
+)
+from neural_building_emulator_refactor.models import (
+    AutoregressiveLSTM,
+    ProbabilisticAutoregressiveLSTM,
+    VanillaProbabilisticAutoregressiveLSTM,
+)
 from neural_building_emulator_refactor.optuna_deterministic_study import (
     ARCHITECTURE_FAMILIES,
     BASELINE_PARAMS,
@@ -55,7 +71,7 @@ from neural_building_emulator_refactor.train import (
 
 
 class RegistryTests(unittest.TestCase):
-    def test_original_six_and_two_lstm_models_are_registered(self) -> None:
+    def test_original_six_and_lstm_models_are_registered(self) -> None:
         self.assertEqual(
             set(MODEL_REGISTRY),
             {
@@ -67,6 +83,8 @@ class RegistryTests(unittest.TestCase):
                 "closed_loop_hp_contracting_probabilistic",
                 "q_to_t_lstm",
                 "closed_loop_hp_lstm",
+                "closed_loop_hp_probabilistic_lstm",
+                "closed_loop_hp_vanilla_probabilistic_lstm",
             },
         )
 
@@ -95,6 +113,7 @@ class RegistryTests(unittest.TestCase):
                 "--contracting-temperature-scale", "8",
                 "--contracting-temperature-delta-max-c", "2",
                 "--contracting-temperature-update", "leaky_equilibrium",
+                "--contracting-temperature-feedback-gradient-scale", "0.1",
                 "--contracting-transition-conditioning", "exogenous_additive_feedback",
                 "--contracting-additive-feedback-gain-bound", "0.75",
                 "--bptt-truncate-steps", "32",
@@ -108,6 +127,7 @@ class RegistryTests(unittest.TestCase):
                 "--prob-hp-emission-mode", "bounded",
                 "--prob-hp-training-mode", "expected",
                 "--prob-hp-activation-model", "independent",
+                "--prob-qroom-activation-model", "asymmetric_markov",
                 "--prob-hp-scenario-mode", "bernoulli",
                 "--prob-softopt-weight", "2",
                 "--prob-variogram-weight", "1",
@@ -117,6 +137,8 @@ class RegistryTests(unittest.TestCase):
                 "--prob-variogram-setpoint-threshold-c", "0.05",
                 "--prob-ires-weight", "1",
                 "--hp-inactive-leakage-weight", "0",
+                "--qroom-mode-loss-weight", "0.25",
+                "--qroom-on-threshold-w-m2", "0.05",
                 "--hp-cop-cap", "8",
                 "--gradient-clip-norm", "1",
                 "--skip-grad-norm-above", "1e3",
@@ -131,6 +153,9 @@ class RegistryTests(unittest.TestCase):
                 "--contracting-q-to-t-time-constants-hours", "1", "24",
                 "--contracting-q-to-t-gain-min-c-per-w-m2", "0.01",
                 "--contracting-q-to-t-gain-max-c-per-w-m2", "2",
+                "--prob-hydronic-innovation",
+                "--prob-hydronic-innovation-cap-w-m2", "12",
+                "--prob-hydronic-innovation-time-constant-hours", "1",
                 "--log-update-diagnostics",
             ]
         )
@@ -148,8 +173,15 @@ class RegistryTests(unittest.TestCase):
             "exogenous_additive_feedback",
         )
         self.assertEqual(config.contracting_additive_feedback_gain_bound, 0.75)
+        self.assertEqual(config.contracting_temperature_feedback_gradient_scale, 0.1)
         self.assertEqual(config.contracting_q_to_t_mode, "positive_leaky")
         self.assertEqual(config.contracting_q_to_t_time_constants_hours, (1.0, 24.0))
+        self.assertEqual(config.prob_qroom_activation_model, "asymmetric_markov")
+        self.assertEqual(config.qroom_mode_loss_weight, 0.25)
+        self.assertEqual(config.qroom_on_threshold_w_m2, 0.05)
+        self.assertTrue(config.prob_hydronic_innovation)
+        self.assertEqual(config.prob_hydronic_innovation_cap_w_m2, 12.0)
+        self.assertEqual(config.prob_hydronic_innovation_time_constant_hours, 1.0)
         self.assertTrue(config.prob_variogram_constant_setpoint_only)
         self.assertTrue(config.log_update_diagnostics)
 
@@ -170,29 +202,46 @@ class RegistryTests(unittest.TestCase):
         artifact_dir = Path("output/test/artifacts/model/selected")
 
         with patch(
-            "neural_building_emulator.flexibility_event_study_kpis.run_analysis"
-        ) as run_analysis:
+            "neural_building_emulator_refactor.scoring.score_artifact",
+            return_value=Path("output/test/flexibility_event_study_scenarios_regressor"),
+        ) as score_artifact:
             output_dir = _run_post_training_flexibility(args, config, artifact_dir)
 
-        evaluation_args = run_analysis.call_args.args[0]
-        self.assertEqual(evaluation_args.artifact_dir, artifact_dir)
-        self.assertEqual(evaluation_args.profile_source, "test")
-        self.assertEqual(evaluation_args.max_profiles, 100)
-        self.assertEqual(evaluation_args.emulation_kpi_mode, "scenario_average")
-        self.assertEqual(evaluation_args.num_scenarios, 100)
-        self.assertEqual(evaluation_args.prob_hp_scenario_mode, "bernoulli")
-        self.assertEqual(evaluation_args.prob_hp_emission_mode, "artifact")
-        self.assertEqual(evaluation_args.horizons_hours, "0.5,1,2,3")
-        self.assertEqual(evaluation_args.controls, "full")
-        self.assertEqual(evaluation_args.min_setpoint_change, 0.05)
-        self.assertEqual(evaluation_args.min_events, 20)
-        self.assertEqual(evaluation_args.seed, 13)
-        self.assertEqual(evaluation_args.kpi_estimator, "regression")
-        self.assertEqual(evaluation_args.ventilation_rollout_mode, "eplus_rule")
+        self.assertEqual(score_artifact.call_args.args[0], artifact_dir)
+        evaluation_args = score_artifact.call_args.kwargs
+        self.assertEqual(evaluation_args["profile_source"], "test")
+        self.assertEqual(evaluation_args["max_profiles"], 100)
+        self.assertEqual(evaluation_args["kpi_mode"], "scenario_average")
+        self.assertEqual(evaluation_args["num_scenarios"], 100)
+        self.assertEqual(evaluation_args["hp_scenario_mode"], "bernoulli")
+        self.assertEqual(evaluation_args["horizons_hours"], (0.5, 1.0, 2.0, 3.0))
+        self.assertEqual(evaluation_args["controls"], "full")
+        self.assertEqual(evaluation_args["min_setpoint_change"], 0.05)
+        self.assertEqual(evaluation_args["min_events"], 20)
+        self.assertEqual(evaluation_args["seed"], 13)
+        self.assertEqual(evaluation_args["kpi_estimator"], "regression")
+        self.assertEqual(evaluation_args["ventilation_rollout_mode"], "eplus_rule")
+        self.assertTrue(evaluation_args["evaluate_direct_f"])
+        self.assertEqual(evaluation_args["num_profile_plots"], 5)
         self.assertEqual(
             output_dir,
             Path("output/test/flexibility_event_study_scenarios_regressor"),
         )
+
+    def test_hard_expected_gradient_mode_is_exposed_to_legacy_model(self) -> None:
+        args = parse_args(
+            [
+                "--dataset",
+                "data.parquet",
+                "--model",
+                "closed_loop_hp_contracting_probabilistic",
+                "--prob-hp-training-mode",
+                "hard_expected_grad",
+            ]
+        )
+        config = config_from_args(args)
+        legacy = build_legacy_config(config, get_model_spec(config.model_name))
+        self.assertEqual(legacy.prob_hp_training_mode, "hard_expected_grad")
 
     def test_post_training_flexibility_rejects_incompatible_model(self) -> None:
         args = parse_args(
@@ -271,6 +320,220 @@ class LSTMTests(unittest.TestCase):
             loaded = load_artifact(path)
             expected = model(jnp.zeros(3), jnp.zeros((5, 4)), jnp.zeros(1))
             actual = loaded.model(jnp.zeros(3), jnp.zeros((5, 4)), jnp.zeros(1))
+            np.testing.assert_allclose(actual, expected)
+
+    def test_fair_recipe_keeps_pre_q_markov_best_configuration(self) -> None:
+        import json
+
+        recipe = json.loads(FAIR_COMPARISON_CONFIG.read_text())
+        configs = fair_experiment_configs(
+            recipe,
+            Path("output/fair-test"),
+            max_profiles=None,
+            epochs=None,
+        )
+        structured = configs["probabilistic_structured"]
+        recurrent = configs["probabilistic_lstm"]
+        self.assertEqual(
+            recurrent.model_name,
+            "closed_loop_hp_vanilla_probabilistic_lstm",
+        )
+        self.assertEqual(structured.max_profiles, 200)
+        self.assertEqual(structured.test_fraction, 0.2)
+        self.assertEqual(structured.legacy_overrides["prob_particles"], 24)
+        self.assertEqual(
+            structured.legacy_overrides["prob_hp_activation_model"],
+            "asymmetric_markov",
+        )
+        self.assertEqual(
+            structured.legacy_overrides["prob_qroom_activation_model"],
+            "continuous",
+        )
+        self.assertEqual(recurrent.probabilistic_lstm.particles, 24)
+        self.assertEqual(recurrent.probabilistic_lstm.softopt_weight, 2.0)
+        self.assertEqual(
+            configs["deterministic_structured"].legacy_overrides[
+                "contracting_q_to_t_mode"
+            ],
+            "positive_leaky",
+        )
+        self.assertEqual(
+            configs["deterministic_lstm"].lstm.output_weights,
+            (1.0, 1.0, 1.0),
+        )
+
+    def test_probabilistic_closed_loop_shape_and_artifact_round_trip(self) -> None:
+        scalers = WindowScalers(
+            metadata=StandardScaler(
+                np.zeros(3, dtype=np.float32), np.ones(3, dtype=np.float32)
+            ),
+            inputs=StandardScaler(
+                np.zeros(4, dtype=np.float32), np.ones(4, dtype=np.float32)
+            ),
+            target=StandardScaler(
+                np.zeros(3, dtype=np.float32), np.ones(3, dtype=np.float32)
+            ),
+        )
+        model = ProbabilisticAutoregressiveLSTM(
+            metadata_dim=3,
+            input_dim=4,
+            hidden_dim=8,
+            metadata_hidden_dim=8,
+            metadata_depth=1,
+            latent_dim=2,
+            process_noise_mode="heteroscedastic",
+            process_noise_init=-4.0,
+            bptt_truncate_steps=4,
+            setpoint_input_index=0,
+            availability_input_index=-1,
+            dt_hours=0.25,
+            setpoint_shock_timescales_hours=(0.5, 1.0),
+            input_mean=(0.0,) * 4,
+            input_scale=(1.0,) * 4,
+            target_mean=(0.0,) * 3,
+            target_scale=(1.0,) * 3,
+            key=jax.random.PRNGKey(7),
+        )
+        metadata = jnp.zeros(3)
+        inputs = jnp.zeros((12, 4))
+        initial = jnp.zeros(3)
+        expected = model.sample(
+            metadata,
+            inputs,
+            initial,
+            key=jax.random.PRNGKey(11),
+            num_particles=4,
+            hp_scenario_mode="bernoulli",
+        )
+        self.assertEqual(expected.shape, (4, 12, 3))
+        self.assertTrue(bool(jnp.all(jnp.isfinite(expected))))
+
+        config = ExperimentConfig(
+            model_name="closed_loop_hp_probabilistic_lstm",
+            probabilistic_lstm=ProbabilisticLSTMConfig(
+                hidden_dim=8,
+                metadata_hidden_dim=8,
+                metadata_depth=1,
+                bptt_truncate_steps=4,
+                latent_dim=2,
+                particles=4,
+                eval_particles=4,
+                plot_particles=4,
+                setpoint_shock_timescales_hours=(0.5, 1.0),
+            ),
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary)
+            save_probabilistic_lstm_artifact(
+                path,
+                model=model,
+                scalers=scalers,
+                spec=get_model_spec("closed_loop_hp_probabilistic_lstm"),
+                experiment_config=config,
+                input_columns=["setpoint", "b", "c", "d"],
+                metadata_columns=["x", "y", "z"],
+                target_columns=["temperature", "qroom", "pel"],
+                selected_ids=[1, 2],
+                train_ids=[1],
+                test_ids=[2],
+                checkpoint_epoch=1,
+                checkpoint_metric_value=1.0,
+                train_metrics={},
+                test_metrics={},
+            )
+            loaded = load_artifact(path)
+            actual = loaded.model.sample(
+                metadata,
+                inputs,
+                initial,
+                key=jax.random.PRNGKey(11),
+                num_particles=4,
+                hp_scenario_mode="bernoulli",
+            )
+            np.testing.assert_allclose(actual, expected)
+
+    def test_vanilla_probabilistic_lstm_shape_and_artifact_round_trip(self) -> None:
+        scalers = WindowScalers(
+            metadata=StandardScaler(
+                np.zeros(3, dtype=np.float32), np.ones(3, dtype=np.float32)
+            ),
+            inputs=StandardScaler(
+                np.zeros(4, dtype=np.float32), np.ones(4, dtype=np.float32)
+            ),
+            target=StandardScaler(
+                np.zeros(3, dtype=np.float32), np.ones(3, dtype=np.float32)
+            ),
+        )
+        model = VanillaProbabilisticAutoregressiveLSTM(
+            metadata_dim=3,
+            input_dim=4,
+            hidden_dim=8,
+            metadata_hidden_dim=8,
+            metadata_depth=1,
+            latent_dim=2,
+            process_noise_mode="heteroscedastic",
+            process_noise_init=-4.0,
+            bptt_truncate_steps=4,
+            setpoint_input_index=0,
+            input_scale=(1.0,) * 4,
+            key=jax.random.PRNGKey(17),
+        )
+        metadata = jnp.zeros(3)
+        inputs = jnp.zeros((12, 4))
+        initial = jnp.zeros(3)
+        expected = model.sample(
+            metadata,
+            inputs,
+            initial,
+            key=jax.random.PRNGKey(23),
+            num_particles=4,
+        )
+        self.assertEqual(expected.shape, (4, 12, 3))
+        self.assertTrue(bool(jnp.all(jnp.isfinite(expected))))
+
+        config = ExperimentConfig(
+            model_name="closed_loop_hp_vanilla_probabilistic_lstm",
+            probabilistic_lstm=ProbabilisticLSTMConfig(
+                hidden_dim=8,
+                metadata_hidden_dim=8,
+                metadata_depth=1,
+                bptt_truncate_steps=4,
+                latent_dim=2,
+                particles=4,
+                eval_particles=4,
+                plot_particles=4,
+                setpoint_shock_timescales_hours=(),
+            ),
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary)
+            save_probabilistic_lstm_artifact(
+                path,
+                model=model,
+                scalers=scalers,
+                spec=get_model_spec(
+                    "closed_loop_hp_vanilla_probabilistic_lstm"
+                ),
+                experiment_config=config,
+                input_columns=["setpoint", "b", "c", "d"],
+                metadata_columns=["x", "y", "z"],
+                target_columns=["temperature", "qroom", "pel"],
+                selected_ids=[1, 2],
+                train_ids=[1],
+                test_ids=[2],
+                checkpoint_epoch=1,
+                checkpoint_metric_value=1.0,
+                train_metrics={},
+                test_metrics={},
+            )
+            loaded = load_artifact(path)
+            actual = loaded.model.sample(
+                metadata,
+                inputs,
+                initial,
+                key=jax.random.PRNGKey(23),
+                num_particles=4,
+            )
             np.testing.assert_allclose(actual, expected)
 
 

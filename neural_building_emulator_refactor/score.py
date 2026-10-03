@@ -58,6 +58,14 @@ def parse_args() -> argparse.Namespace:
         default="",
         help="Suffix inserted before every generated file extension, for example _f.",
     )
+    parser.add_argument(
+        "--also-evaluate-direct-f",
+        action="store_true",
+        help=(
+            "Alongside a regression KPI, compute the direct-ratio F_H KPI from the "
+            "same full-profile predictions and write outputs with suffix _f."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -83,6 +91,7 @@ def main() -> None:
         seed=args.seed,
         num_profile_plots=args.num_profile_plots,
         output_suffix=args.output_suffix,
+        evaluate_direct_f=args.also_evaluate_direct_f,
     )
 
 

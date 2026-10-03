@@ -19,8 +19,12 @@ from neural_building_emulator.model_io import (
 )
 from neural_building_emulator.scaling import StandardScaler, WindowScalers
 
-from .config import ExperimentConfig, LSTMConfig
-from .models import AutoregressiveLSTM
+from .config import ExperimentConfig, LSTMConfig, ProbabilisticLSTMConfig
+from .models import (
+    AutoregressiveLSTM,
+    ProbabilisticAutoregressiveLSTM,
+    VanillaProbabilisticAutoregressiveLSTM,
+)
 from .registry import MODEL_REGISTRY, ModelSpec, get_model_spec
 
 MANIFEST_FILENAME = "refactor_manifest.json"
@@ -40,6 +44,13 @@ class LoadedArtifact:
     scalers: WindowScalers
     metadata: dict[str, Any]
     legacy_artifact: SavedModelArtifact | None = None
+
+
+LSTMModel = (
+    AutoregressiveLSTM
+    | ProbabilisticAutoregressiveLSTM
+    | VanillaProbabilisticAutoregressiveLSTM
+)
 
 
 def json_safe(value: Any) -> Any:
@@ -159,7 +170,61 @@ def save_lstm_artifact(
         "train_ids": list(train_ids),
         "test_ids": list(test_ids),
         "checkpoint_epoch": checkpoint_epoch,
-        "checkpoint_metric": "test_temperature_rmse",
+        "checkpoint_metric": (
+            "test_total_nrmse"
+            if spec.task == "closed_loop_hp"
+            else "test_temperature_rmse"
+        ),
+        "checkpoint_metric_value": checkpoint_metric_value,
+        "train_metrics": train_metrics,
+        "test_metrics": test_metrics,
+    }
+    return _write_manifest(artifact_dir, metadata)
+
+
+def save_probabilistic_lstm_artifact(
+    artifact_dir: Path,
+    *,
+    model: ProbabilisticAutoregressiveLSTM | VanillaProbabilisticAutoregressiveLSTM,
+    scalers: WindowScalers,
+    spec: ModelSpec,
+    experiment_config: ExperimentConfig,
+    input_columns: list[str] | tuple[str, ...],
+    metadata_columns: list[str] | tuple[str, ...],
+    target_columns: list[str] | tuple[str, ...],
+    selected_ids: list[int] | tuple[int, ...],
+    train_ids: list[int] | tuple[int, ...],
+    test_ids: list[int] | tuple[int, ...],
+    checkpoint_epoch: int,
+    checkpoint_metric_value: float,
+    train_metrics: dict[str, float],
+    test_metrics: dict[str, float],
+) -> Path:
+    artifact_dir.mkdir(parents=True, exist_ok=True)
+    eqx.tree_serialise_leaves(artifact_dir / MODEL_FILENAME, model)
+    _save_scalers(artifact_dir / SCALERS_FILENAME, scalers)
+    metadata = {
+        "artifact_version": ARTIFACT_VERSION,
+        "backend": "lstm",
+        "model_name": spec.name,
+        "task": spec.task,
+        "probabilistic": True,
+        "model_file": MODEL_FILENAME,
+        "scalers_file": SCALERS_FILENAME,
+        "experiment_config": experiment_config,
+        "probabilistic_lstm_config": experiment_config.probabilistic_lstm,
+        "metadata_dim": model.metadata_dim,
+        "input_dim": model.input_dim,
+        "output_dim": model.output_dim,
+        "input_columns": list(input_columns),
+        "metadata_columns": list(metadata_columns),
+        "hp_power_area_normalization": experiment_config.hp_power_area_normalization,
+        "target_columns": list(target_columns),
+        "selected_ids": list(selected_ids),
+        "train_ids": list(train_ids),
+        "test_ids": list(test_ids),
+        "checkpoint_epoch": checkpoint_epoch,
+        "checkpoint_metric": "test_total_nrmse",
         "checkpoint_metric_value": checkpoint_metric_value,
         "train_metrics": train_metrics,
         "test_metrics": test_metrics,
@@ -216,6 +281,92 @@ def load_artifact(artifact_dir: Path) -> LoadedArtifact:
         )
     if backend != "lstm":
         raise ValueError(f"Unknown artifact backend {backend!r}")
+
+    if spec.probabilistic:
+        values = metadata["probabilistic_lstm_config"]
+        probabilistic_config = ProbabilisticLSTMConfig(
+            hidden_dim=int(values["hidden_dim"]),
+            metadata_hidden_dim=int(values["metadata_hidden_dim"]),
+            metadata_depth=int(values["metadata_depth"]),
+            bptt_truncate_steps=int(values["bptt_truncate_steps"]),
+            latent_dim=int(values["latent_dim"]),
+            particles=int(values["particles"]),
+            eval_particles=int(values["eval_particles"]),
+            plot_particles=int(values["plot_particles"]),
+            process_noise=str(values["process_noise"]),
+            process_noise_init=float(values["process_noise_init"]),
+            hp_scenario_mode=str(values["hp_scenario_mode"]),
+            hp_training_mode=str(values["hp_training_mode"]),
+            hp_mode_loss_weight=float(values["hp_mode_loss_weight"]),
+            hp_active_power_nll_weight=float(values["hp_active_power_nll_weight"]),
+            hp_inactive_leakage_weight=float(values["hp_inactive_leakage_weight"]),
+            softopt_weight=float(values["softopt_weight"]),
+            softopt_temperature=float(values["softopt_temperature"]),
+            variogram_weight=float(values["variogram_weight"]),
+            variogram_power=float(values["variogram_power"]),
+            variogram_lags=tuple(int(value) for value in values["variogram_lags"]),
+            variogram_output_weights=tuple(
+                float(value) for value in values["variogram_output_weights"]
+            ),
+            variogram_constant_setpoint_only=bool(
+                values["variogram_constant_setpoint_only"]
+            ),
+            variogram_setpoint_threshold_c=float(
+                values["variogram_setpoint_threshold_c"]
+            ),
+            setpoint_shock_timescales_hours=tuple(
+                float(value) for value in values["setpoint_shock_timescales_hours"]
+            ),
+            output_weights=tuple(float(value) for value in values["output_weights"]),
+            skip_grad_norm_above=float(values.get("skip_grad_norm_above", 1000.0)),
+        )
+        scalers = _load_scalers(artifact_dir / metadata["scalers_file"])
+        common_model_args = dict(
+            metadata_dim=int(metadata["metadata_dim"]),
+            input_dim=int(metadata["input_dim"]),
+            hidden_dim=probabilistic_config.hidden_dim,
+            metadata_hidden_dim=probabilistic_config.metadata_hidden_dim,
+            metadata_depth=probabilistic_config.metadata_depth,
+            latent_dim=probabilistic_config.latent_dim,
+            process_noise_mode=probabilistic_config.process_noise,
+            process_noise_init=probabilistic_config.process_noise_init,
+            bptt_truncate_steps=probabilistic_config.bptt_truncate_steps,
+            setpoint_input_index=0,
+            input_scale=tuple(float(value) for value in scalers.inputs.scale),
+            key=jax.random.PRNGKey(0),
+        )
+        if spec.name == "closed_loop_hp_vanilla_probabilistic_lstm":
+            skeleton: ProbabilisticAutoregressiveLSTM | VanillaProbabilisticAutoregressiveLSTM
+            skeleton = VanillaProbabilisticAutoregressiveLSTM(**common_model_args)
+        else:
+            input_columns = list(metadata["input_columns"])
+            availability_index = (
+                input_columns.index("space_heating_available")
+                if "space_heating_available" in input_columns
+                else -1
+            )
+            skeleton = ProbabilisticAutoregressiveLSTM(
+                **common_model_args,
+                availability_input_index=availability_index,
+                dt_hours=0.25,
+                setpoint_shock_timescales_hours=(
+                    probabilistic_config.setpoint_shock_timescales_hours
+                ),
+                input_mean=tuple(float(value) for value in scalers.inputs.mean),
+                target_mean=tuple(float(value) for value in scalers.target.mean),
+                target_scale=tuple(float(value) for value in scalers.target.scale),
+            )
+        model = eqx.tree_deserialise_leaves(
+            artifact_dir / metadata["model_file"], skeleton
+        )
+        return LoadedArtifact(
+            artifact_dir=artifact_dir,
+            spec=spec,
+            backend="lstm",
+            model=model,
+            scalers=scalers,
+            metadata=metadata,
+        )
 
     lstm_values = metadata["lstm_config"]
     lstm_config = LSTMConfig(

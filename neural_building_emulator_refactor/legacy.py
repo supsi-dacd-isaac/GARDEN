@@ -36,8 +36,11 @@ def build_legacy_config(config: ExperimentConfig, spec: ModelSpec) -> TrainConfi
 
     values.update(
         dataset_path=Path(config.dataset_path),
+        additional_dataset_paths=tuple(Path(path) for path in config.additional_dataset_paths),
         max_profiles=config.max_profiles,
         test_fraction=config.test_fraction,
+        fixed_test_profile_ids=config.fixed_test_profile_ids,
+        excluded_profile_ids=config.excluded_profile_ids,
         seed=config.seed,
         sequence_length=config.sequence_length,
         stride=config.stride,

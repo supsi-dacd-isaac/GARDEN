@@ -1,0 +1,6 @@
+{
+  "hp_activation_model": ["independent"],
+  "hp_training_mode": ["expected"],
+  "process_noise_mode": ["heteroscedastic"],
+  "temperature_update_mode": ["leaky_equilibrium"]
+}

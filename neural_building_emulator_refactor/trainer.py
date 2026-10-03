@@ -30,6 +30,7 @@ from neural_building_emulator.data import (
     to_closed_loop_profiles,
     to_profiles,
 )
+from neural_building_emulator.columns import HP_FORCE_OFF_REQUESTED_COLUMN
 from neural_building_emulator.scaling import (
     WindowScalers,
     fit_window_scalers,
@@ -39,6 +40,7 @@ from neural_building_emulator.scaling import (
 
 from .artifacts import save_lstm_artifact
 from .config import ExperimentConfig
+from .gradient_logging import GradientUpdateLogger
 from .legacy import train_legacy
 from .models import AutoregressiveLSTM
 from .registry import ModelSpec, get_model_spec
@@ -97,8 +99,13 @@ def _prepare_data(
 ) -> tuple[Splits, Profiles, Profiles, Windows, Windows, WindowScalers]:
     split_config = SplitConfig(
         dataset_path=Path(config.dataset_path),
+        additional_dataset_paths=tuple(
+            Path(path) for path in config.additional_dataset_paths
+        ),
         max_profiles=config.max_profiles,
         test_fraction=config.test_fraction,
+        fixed_test_profile_ids=config.fixed_test_profile_ids,
+        excluded_profile_ids=config.excluded_profile_ids,
         seed=config.seed,
         heat_input_normalization=config.heat_input_normalization,  # type: ignore[arg-type]
         hp_power_area_normalization=config.hp_power_area_normalization,  # type: ignore[arg-type]
@@ -135,11 +142,17 @@ def _prepare_data(
         splits = load_closed_loop_result_splits(split_config)
         train_profiles = to_closed_loop_profiles(
             splits.train,
+            include_hp_force_off=(
+                HP_FORCE_OFF_REQUESTED_COLUMN in splits.input_columns
+            ),
             hp_power_area_normalization=splits.hp_power_area_normalization,
             metadata_columns=splits.metadata_columns,
         )
         test_profiles = to_closed_loop_profiles(
             splits.test,
+            include_hp_force_off=(
+                HP_FORCE_OFF_REQUESTED_COLUMN in splits.input_columns
+            ),
             hp_power_area_normalization=splits.hp_power_area_normalization,
             metadata_columns=splits.metadata_columns,
         )
@@ -216,9 +229,10 @@ def _make_steps(
     @eqx.filter_jit
     def train_step(model, opt_state, metadata, inputs, initial_temperature, targets):
         loss, grads = loss_fn(model, metadata, inputs, initial_temperature, targets)
+        grad_norm = optax.global_norm(eqx.filter(grads, eqx.is_inexact_array))
         updates, opt_state = optimizer.update(grads, opt_state, model)
         model = eqx.apply_updates(model, updates)
-        return model, opt_state, loss
+        return model, opt_state, loss, grad_norm
 
     return train_step
 
@@ -267,11 +281,13 @@ def _evaluate(
         "temperature_mae_c": float(mae[0]),
     }
     if model.output_dim == 3:
+        nrmse = rmse / np.asarray(scalers.target.scale, dtype=np.float64)
         result.update(
             qroom_rmse_w_m2=float(rmse[1]),
             qroom_mae_w_m2=float(mae[1]),
             pel_rmse_w_m2=float(rmse[2]),
             pel_mae_w_m2=float(mae[2]),
+            total_nrmse=float(np.sqrt(np.mean(nrmse**2))),
         )
     return result
 
@@ -336,11 +352,8 @@ def train_lstm(config: ExperimentConfig, spec: ModelSpec) -> Path:
         config.optimizer.train_eval_max_windows,
         config.seed + 101,
     )
-    test_eval = _subset_windows(
-        test_windows,
-        config.optimizer.train_eval_max_windows,
-        config.seed + 102,
-    )
+    # Checkpoint on the complete holdout, matching the structured trainer.
+    test_eval = test_windows
     rng = np.random.default_rng(config.seed + 7)
     best_model = model
     best_epoch = 0
@@ -354,6 +367,8 @@ def train_lstm(config: ExperimentConfig, spec: ModelSpec) -> Path:
         f"train_profiles={len(splits.train_ids)} test_profiles={len(splits.test_ids)} "
         f"train_windows={train_windows.targets.shape[0]} test_windows={test_windows.targets.shape[0]}"
     )
+    gradient_log = GradientUpdateLogger(config.output_dir, spec.name)
+    print(f"gradient_update_log={gradient_log.path}")
     for epoch in range(1, config.optimizer.epochs + 1):
         epoch_start = time.perf_counter()
         epoch_train = _epoch_windows(
@@ -364,13 +379,17 @@ def train_lstm(config: ExperimentConfig, spec: ModelSpec) -> Path:
             epoch=epoch,
         )
         losses: list[float] = []
-        for metadata, inputs, initial_temperature, targets in _batches(
-            epoch_train,
-            batch_size=config.optimizer.batch_size,
-            rng=rng,
-            shuffle=True,
+        max_grad_norm = 0.0
+        for batch_index, batch in enumerate(
+            _batches(
+                epoch_train,
+                batch_size=config.optimizer.batch_size,
+                rng=rng,
+                shuffle=True,
+            )
         ):
-            model, opt_state, loss = train_step(
+            metadata, inputs, initial_temperature, targets = batch
+            model, opt_state, loss, grad_norm = train_step(
                 model,
                 opt_state,
                 jnp.asarray(metadata),
@@ -379,6 +398,18 @@ def train_lstm(config: ExperimentConfig, spec: ModelSpec) -> Path:
                 jnp.asarray(targets),
             )
             value = float(loss)
+            norm = float(grad_norm)
+            gradient_log.log(
+                epoch=epoch,
+                batch_index=batch_index,
+                loss=value,
+                grad_norm=norm,
+                gradient_clip_norm=config.optimizer.gradient_clip_norm,
+                skip_grad_norm_above=0.0,
+                accepted=True,
+                reason="accepted" if np.isfinite(norm) else "nonfinite_gradient_applied",
+            )
+            max_grad_norm = max(max_grad_norm, norm if np.isfinite(norm) else float("inf"))
             if not np.isfinite(value):
                 raise FloatingPointError(f"Non-finite LSTM loss at epoch {epoch}")
             losses.append(value)
@@ -394,7 +425,11 @@ def train_lstm(config: ExperimentConfig, spec: ModelSpec) -> Path:
             scalers,
             batch_size=config.optimizer.batch_size,
         )
-        metric = test_metrics["temperature_rmse_c"]
+        metric = (
+            test_metrics["total_nrmse"]
+            if output_dim == 3
+            else test_metrics["temperature_rmse_c"]
+        )
         improved = metric < best_metric - config.optimizer.early_stopping_min_delta
         if improved:
             best_metric = metric
@@ -407,17 +442,27 @@ def train_lstm(config: ExperimentConfig, spec: ModelSpec) -> Path:
             wait += 1
         elapsed_minutes = (time.perf_counter() - epoch_start) / 60.0
         extra = " checkpoint=best" if improved else f" checkpoint_wait={wait}"
+        closed_loop_metrics = (
+            f" train_total_nrmse={train_metrics['total_nrmse']:.4f}"
+            f" test_total_nrmse={test_metrics['total_nrmse']:.4f}"
+            f" test_qroom_rmse_w_m2={test_metrics['qroom_rmse_w_m2']:.4f}"
+            f" test_pel_rmse_w_m2={test_metrics['pel_rmse_w_m2']:.4f}"
+            if output_dim == 3
+            else ""
+        )
         print(
             f"epoch={epoch:03d} train_loss={np.mean(losses):.6f} "
             f"train_rmse_c={train_metrics['temperature_rmse_c']:.4f} "
             f"test_rmse_c={test_metrics['temperature_rmse_c']:.4f} "
-            f"elapsed_min={elapsed_minutes:.2f}{extra}"
+            f"max_grad_norm={max_grad_norm:.3f} "
+            f"elapsed_min={elapsed_minutes:.2f}{closed_loop_metrics}{extra}"
         )
         patience = config.optimizer.early_stopping_patience
         if patience is not None and wait >= patience:
             print(f"early_stopping epoch={epoch} best_epoch={best_epoch}")
             break
 
+    gradient_log.close()
     artifact_dir = Path(config.output_dir) / "artifacts" / spec.name / "selected"
     target_columns = [TARGET_COLUMN] if spec.task == "q_to_t" else CLOSED_LOOP_TARGET_COLUMNS
     return save_lstm_artifact(
@@ -445,4 +490,8 @@ def train(config: ExperimentConfig) -> Path:
     spec = get_model_spec(config.model_name)
     if spec.backend == "legacy":
         return train_legacy(config, spec)
+    if spec.probabilistic:
+        from .probabilistic_lstm_trainer import train_probabilistic_lstm
+
+        return train_probabilistic_lstm(config, spec)
     return train_lstm(config, spec)

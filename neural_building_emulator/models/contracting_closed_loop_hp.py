@@ -8,6 +8,7 @@ guarantee because the matrix and forcing depend on the recurrent trajectory.
 
 from __future__ import annotations
 
+import math
 from typing import Literal
 
 import equinox as eqx
@@ -15,9 +16,25 @@ import jax
 import jax.numpy as jnp
 
 from .emulator import MLP
-from .truncated_bptt import DEFAULT_BPTT_TRUNCATE_STEPS, detach_carry, validate_bptt_truncate_steps
+from .truncated_bptt import (
+    DEFAULT_BPTT_TRUNCATE_STEPS,
+    detach_carry,
+    scale_gradient,
+    validate_bptt_truncate_steps,
+)
+from ..ventilation import replace_with_eplus_ventilation
 
-ContractingClosedLoopAux = tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]
+ContractingClosedLoopAux = tuple[
+    jnp.ndarray,
+    jnp.ndarray,
+    jnp.ndarray,
+    jnp.ndarray,
+    jnp.ndarray,
+    jnp.ndarray,
+    jnp.ndarray,
+    jnp.ndarray,
+    jnp.ndarray,
+]
 TemperatureUpdateMode = Literal[
     "auto",
     "absolute",
@@ -26,8 +43,13 @@ TemperatureUpdateMode = Literal[
     "bounded_equilibrium",
     "alpha_bounded_equilibrium",
 ]
-ThermostatDemandMode = Literal["unconstrained", "monotone"]
+ThermostatDemandMode = Literal[
+    "unconstrained",
+    "monotone",
+    "causal_monotone",
+]
 ThermalQResponseMode = Literal["unconstrained", "positive_leaky"]
+ThermalArchitecture = Literal["bounded_mlp", "metadata_fixed_ss"]
 TransitionConditioningMode = Literal[
     "state_feedback",
     "exogenous",
@@ -57,6 +79,7 @@ class ContractingClosedLoopHPEmulator(eqx.Module):
     temperature_alpha_net: MLP | None
     q_response_net: MLP | None
     q_response_init_net: MLP | None
+    metadata_fixed_base_parameters: jax.Array
     cop_intercept: jax.Array
     cop_slope: jax.Array
     raw_energy_loss_rate: jax.Array
@@ -71,7 +94,10 @@ class ContractingClosedLoopHPEmulator(eqx.Module):
     state_bound: float = eqx.field(static=True)
     temperature_output_scale: float = eqx.field(static=True)
     temperature_delta_max_c: float = eqx.field(static=True)
+    temperature_alpha_cap: float = eqx.field(static=True)
+    temperature_fixed_alpha: float = eqx.field(static=True)
     temperature_update_mode: TemperatureUpdateMode = eqx.field(static=True)
+    temperature_feedback_gradient_scale: float = eqx.field(static=True)
     transition_conditioning: TransitionConditioningMode = eqx.field(static=True)
     additive_feedback_gain_bound: float = eqx.field(static=True)
     transition_forcing_encoded_dim: int = eqx.field(static=True)
@@ -91,6 +117,7 @@ class ContractingClosedLoopHPEmulator(eqx.Module):
     solar_input_index: int = eqx.field(static=True)
     ventilation_input_index: int = eqx.field(static=True)
     availability_input_index: int = eqx.field(static=True)
+    hp_force_off_input_index: int = eqx.field(static=True)
     temperature_target_index: int = eqx.field(static=True)
     qroom_target_index: int = eqx.field(static=True)
     pel_target_index: int = eqx.field(static=True)
@@ -106,6 +133,7 @@ class ContractingClosedLoopHPEmulator(eqx.Module):
     q_to_t_time_constants_hours: tuple[float, ...] = eqx.field(static=True)
     q_to_t_gain_min_c_per_w_m2: float = eqx.field(static=True)
     q_to_t_gain_max_c_per_w_m2: float = eqx.field(static=True)
+    thermal_architecture: ThermalArchitecture = eqx.field(static=True)
 
     def __init__(
         self,
@@ -122,7 +150,10 @@ class ContractingClosedLoopHPEmulator(eqx.Module):
         state_bound: float = 5.0,
         temperature_output_scale: float = 8.0,
         temperature_delta_max_c: float = 0.0,
+        temperature_alpha_cap: float = 1.0,
+        temperature_fixed_alpha: float = 0.0,
         temperature_update_mode: TemperatureUpdateMode = "auto",
+        temperature_feedback_gradient_scale: float = 1.0,
         transition_conditioning: TransitionConditioningMode = "state_feedback",
         additive_feedback_gain_bound: float = 1.0,
         hp_dt_hours: float = 0.25,
@@ -136,6 +167,7 @@ class ContractingClosedLoopHPEmulator(eqx.Module):
         target_mean: tuple[float, ...] = (),
         target_scale: tuple[float, ...] = (),
         availability_input_index: int = -1,
+        hp_force_off_input_index: int = -1,
         bptt_truncate_steps: int = DEFAULT_BPTT_TRUNCATE_STEPS,
         hp_controller_masked_input_indices: tuple[int, ...] = (),
         thermal_dynamics_masked_input_indices: tuple[int, ...] = (),
@@ -155,6 +187,7 @@ class ContractingClosedLoopHPEmulator(eqx.Module):
         ),
         q_to_t_gain_min_c_per_w_m2: float = 0.01,
         q_to_t_gain_max_c_per_w_m2: float = 2.0,
+        thermal_architecture: ThermalArchitecture = "bounded_mlp",
         key: jax.Array,
     ) -> None:
         if state_dim < 1:
@@ -173,6 +206,20 @@ class ContractingClosedLoopHPEmulator(eqx.Module):
             raise ValueError("temperature_output_scale must be positive")
         if temperature_delta_max_c < 0.0:
             raise ValueError("temperature_delta_max_c must be non-negative")
+        if hp_force_off_input_index >= input_dim:
+            raise ValueError("hp_force_off_input_index must be smaller than input_dim")
+        if not 0.0 < temperature_alpha_cap <= 1.0:
+            raise ValueError("temperature_alpha_cap must be in (0, 1]")
+        if not 0.0 <= temperature_fixed_alpha <= temperature_alpha_cap:
+            raise ValueError(
+                "temperature_fixed_alpha must be 0 (disabled) or lie in "
+                "(0, temperature_alpha_cap]"
+            )
+        if temperature_fixed_alpha > 0.0 and temperature_update_mode != "alpha_bounded_equilibrium":
+            raise ValueError(
+                "temperature_fixed_alpha requires temperature_update_mode="
+                "'alpha_bounded_equilibrium'"
+            )
         if temperature_update_mode not in (
             "auto",
             "absolute",
@@ -186,6 +233,8 @@ class ContractingClosedLoopHPEmulator(eqx.Module):
                 "'leaky_equilibrium', 'bounded_equilibrium', or "
                 "'alpha_bounded_equilibrium'"
             )
+        if not 0.0 <= temperature_feedback_gradient_scale <= 1.0:
+            raise ValueError("temperature_feedback_gradient_scale must be in [0, 1]")
         if transition_conditioning not in (
             "state_feedback",
             "exogenous",
@@ -209,14 +258,30 @@ class ContractingClosedLoopHPEmulator(eqx.Module):
             raise ValueError("hp_qroom_cap_w_m2 must be non-negative")
         if hp_energy_cap_wh_m2 < 0.0:
             raise ValueError("hp_energy_cap_wh_m2 must be non-negative")
-        if thermostat_demand_mode not in ("unconstrained", "monotone"):
-            raise ValueError("thermostat_demand_mode must be 'unconstrained' or 'monotone'")
+        if thermostat_demand_mode not in (
+            "unconstrained",
+            "monotone",
+            "causal_monotone",
+        ):
+            raise ValueError(
+                "thermostat_demand_mode must be 'unconstrained', 'monotone', "
+                "or 'causal_monotone'"
+            )
         if thermostat_slope_min <= 0.0 or thermostat_slope_max <= thermostat_slope_min:
             raise ValueError("thermostat slope bounds must satisfy 0 < min < max")
         if thermostat_threshold_max_c <= thermostat_threshold_min_c:
             raise ValueError("thermostat threshold bounds must satisfy min < max")
         if q_to_t_mode not in ("unconstrained", "positive_leaky"):
             raise ValueError("q_to_t_mode must be 'unconstrained' or 'positive_leaky'")
+        if thermal_architecture not in ("bounded_mlp", "metadata_fixed_ss"):
+            raise ValueError(
+                "thermal_architecture must be 'bounded_mlp' or 'metadata_fixed_ss'"
+            )
+        if thermal_architecture == "metadata_fixed_ss" and q_to_t_mode != "unconstrained":
+            raise ValueError(
+                "thermal_architecture='metadata_fixed_ss' requires "
+                "q_to_t_mode='unconstrained' so Qroom enters its forcing encoder"
+            )
         q_to_t_time_constants_hours = tuple(
             float(value) for value in q_to_t_time_constants_hours
         )
@@ -297,10 +362,20 @@ class ContractingClosedLoopHPEmulator(eqx.Module):
         transition_forcing_encoded_dim = (
             thermal_forcing_dim if input_encoder_dim is None else input_encoder_dim
         )
-        transition_input_dim = metadata_dim + thermal_forcing_dim
-        transition_output_dim = state_dim * state_dim + state_dim
-        if transition_conditioning == "exogenous_additive_feedback":
-            transition_output_dim += state_dim * transition_forcing_encoded_dim
+        if thermal_architecture == "metadata_fixed_ss":
+            transition_input_dim = metadata_dim
+            transition_output_dim = (
+                state_dim
+                + state_dim * transition_forcing_encoded_dim
+                + state_dim
+                + state_dim
+                + 1
+            )
+        else:
+            transition_input_dim = metadata_dim + thermal_forcing_dim
+            transition_output_dim = state_dim * state_dim + state_dim
+            if transition_conditioning == "exogenous_additive_feedback":
+                transition_output_dim += state_dim * transition_forcing_encoded_dim
 
         self.input_encoder = None
         if input_encoder_dim is not None:
@@ -318,8 +393,17 @@ class ContractingClosedLoopHPEmulator(eqx.Module):
             depth=depth,
             key=transition_key,
         )
+        if thermal_architecture == "metadata_fixed_ss":
+            self.transition_net = eqx.tree_at(
+                lambda net: net.layers[-1].weight,
+                self.transition_net,
+                1e-3 * self.transition_net.layers[-1].weight,
+            )
         self.transition_forcing_encoder = None
-        if transition_conditioning == "exogenous_additive_feedback":
+        if (
+            transition_conditioning == "exogenous_additive_feedback"
+            or thermal_architecture == "metadata_fixed_ss"
+        ):
             self.transition_forcing_encoder = MLP(
                 thermal_forcing_dim,
                 transition_forcing_encoded_dim,
@@ -327,6 +411,12 @@ class ContractingClosedLoopHPEmulator(eqx.Module):
                 depth=input_encoder_depth,
                 key=transition_forcing_key,
             )
+        self.metadata_fixed_base_parameters = self._metadata_fixed_base(
+            state_dim,
+            transition_forcing_encoded_dim,
+            contraction_gamma,
+            hp_dt_hours,
+        )
         self.x0_net = MLP(
             metadata_dim + 1,
             state_dim,
@@ -357,7 +447,7 @@ class ContractingClosedLoopHPEmulator(eqx.Module):
             key=temperature_key,
         )
         self.temperature_alpha_net = None
-        if temperature_update_mode in (
+        if temperature_fixed_alpha <= 0.0 and temperature_update_mode in (
             "leaky_equilibrium",
             "alpha_bounded_equilibrium",
         ):
@@ -368,6 +458,15 @@ class ContractingClosedLoopHPEmulator(eqx.Module):
                 depth=depth,
                 key=alpha_key,
             )
+            if temperature_update_mode == "alpha_bounded_equilibrium":
+                initial_alpha = min(0.1, 0.5 * temperature_alpha_cap)
+                initial_probability = initial_alpha / temperature_alpha_cap
+                initial_logit = math.log(initial_probability / (1.0 - initial_probability))
+                self.temperature_alpha_net = eqx.tree_at(
+                    lambda net: net.layers[-1].bias,
+                    self.temperature_alpha_net,
+                    jnp.asarray([initial_logit]),
+                )
         self.q_response_net = None
         self.q_response_init_net = None
         if q_to_t_mode == "positive_leaky":
@@ -401,7 +500,12 @@ class ContractingClosedLoopHPEmulator(eqx.Module):
         self.state_bound = state_bound
         self.temperature_output_scale = temperature_output_scale
         self.temperature_delta_max_c = temperature_delta_max_c
+        self.temperature_alpha_cap = temperature_alpha_cap
+        self.temperature_fixed_alpha = temperature_fixed_alpha
         self.temperature_update_mode = temperature_update_mode
+        self.temperature_feedback_gradient_scale = float(
+            temperature_feedback_gradient_scale
+        )
         self.transition_conditioning = transition_conditioning
         self.additive_feedback_gain_bound = float(additive_feedback_gain_bound)
         self.transition_forcing_encoded_dim = transition_forcing_encoded_dim
@@ -421,6 +525,7 @@ class ContractingClosedLoopHPEmulator(eqx.Module):
         self.solar_input_index = 2
         self.ventilation_input_index = 3
         self.availability_input_index = availability_input_index
+        self.hp_force_off_input_index = hp_force_off_input_index
         self.temperature_target_index = 0
         self.qroom_target_index = 1
         self.pel_target_index = 2
@@ -436,9 +541,56 @@ class ContractingClosedLoopHPEmulator(eqx.Module):
         self.q_to_t_time_constants_hours = q_to_t_time_constants_hours
         self.q_to_t_gain_min_c_per_w_m2 = float(q_to_t_gain_min_c_per_w_m2)
         self.q_to_t_gain_max_c_per_w_m2 = float(q_to_t_gain_max_c_per_w_m2)
+        self.thermal_architecture = thermal_architecture
+
+    @staticmethod
+    def _metadata_fixed_base(
+        state_dim: int,
+        encoded_dim: int,
+        gamma: float,
+        dt_hours: float,
+    ) -> jax.Array:
+        time_constants = jnp.geomspace(1.0, 24.0 * 21.0, state_dim)
+        rho = jnp.minimum(jnp.exp(-dt_hours / time_constants), gamma - 1e-4)
+        fraction = jnp.clip((rho - 0.05) / (gamma - 0.05), 1e-5, 1.0 - 1e-5)
+        rho_raw = jnp.log(fraction) - jnp.log1p(-fraction)
+        b_matrix = jnp.zeros((state_dim * encoded_dim,), dtype=jnp.float32)
+        bias = jnp.zeros((state_dim,), dtype=jnp.float32)
+        output = jnp.zeros((state_dim,), dtype=jnp.float32).at[0].set(1.0)
+        return jnp.concatenate(
+            (rho_raw.astype(jnp.float32), b_matrix, bias, output, jnp.zeros((1,)))
+        )
+
+    def metadata_fixed_parameters(
+        self, metadata: jnp.ndarray
+    ) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+        raw = self.metadata_fixed_base_parameters + self.transition_net(metadata)
+        cursor = 0
+        rho_raw = raw[cursor : cursor + self.state_dim]
+        cursor += self.state_dim
+        matrix_size = self.state_dim * self.transition_forcing_encoded_dim
+        b_matrix = raw[cursor : cursor + matrix_size].reshape(
+            self.state_dim, self.transition_forcing_encoded_dim
+        )
+        cursor += matrix_size
+        bias = raw[cursor : cursor + self.state_dim]
+        cursor += self.state_dim
+        output = raw[cursor : cursor + self.state_dim]
+        cursor += self.state_dim
+        output_bias = raw[cursor]
+        rho = 0.05 + (self.contraction_gamma - 0.05) * jax.nn.sigmoid(rho_raw)
+        return (
+            rho,
+            0.30 * jnp.tanh(b_matrix),
+            0.15 * jnp.tanh(bias),
+            jnp.tanh(output),
+            2.0 * jnp.tanh(output_bias),
+        )
 
     def encode_input(self, input_t: jnp.ndarray) -> jnp.ndarray:
-        if self.thermostat_demand_mode == "monotone":
+        if self.hp_force_off_input_index >= 0:
+            input_t = input_t.at[self.hp_force_off_input_index].set(0.0)
+        if self.thermostat_demand_mode != "unconstrained":
             input_t = input_t.at[self.setpoint_input_index].set(0.0)
         for index in self.hp_controller_masked_input_indices:
             input_t = input_t.at[index].set(0.0)
@@ -451,6 +603,13 @@ class ContractingClosedLoopHPEmulator(eqx.Module):
         metadata: jnp.ndarray,
         initial_temperature: jnp.ndarray,
     ) -> jnp.ndarray:
+        if self.thermal_architecture == "metadata_fixed_ss":
+            _, _, _, output, output_bias = self.metadata_fixed_parameters(metadata)
+            initial_value = initial_temperature[0]
+            return output * (
+                (initial_value - output_bias)
+                / (jnp.dot(output, output) + jnp.asarray(1e-5, dtype=output.dtype))
+            )
         raw = self.x0_net(jnp.concatenate([metadata, initial_temperature], axis=0))
         return jnp.asarray(self.state_bound, dtype=raw.dtype) * jnp.tanh(raw)
 
@@ -493,6 +652,16 @@ class ContractingClosedLoopHPEmulator(eqx.Module):
             jnp.asarray(0.0, dtype=input_t.dtype),
             jnp.asarray(1.0, dtype=input_t.dtype),
         )
+
+    def _hp_generation_availability(self, input_t: jnp.ndarray) -> jnp.ndarray:
+        if self.hp_force_off_input_index < 0:
+            return jnp.asarray(1.0, dtype=input_t.dtype)
+        force_off = jnp.clip(
+            self._physical_input(input_t, self.hp_force_off_input_index),
+            jnp.asarray(0.0, dtype=input_t.dtype),
+            jnp.asarray(1.0, dtype=input_t.dtype),
+        )
+        return jnp.asarray(1.0, dtype=input_t.dtype) - force_off
 
     def _nonnegative_capped(self, value: jnp.ndarray, cap: float) -> jnp.ndarray:
         value = jnp.maximum(value, jnp.asarray(0.0, dtype=value.dtype))
@@ -580,11 +749,15 @@ class ContractingClosedLoopHPEmulator(eqx.Module):
         return jnp.clip(alpha_max, jnp.asarray(1e-6, dtype=dtype), jnp.asarray(1.0, dtype=dtype))
 
     def temperature_alpha(self, metadata: jnp.ndarray) -> jnp.ndarray:
+        if self.temperature_fixed_alpha > 0.0:
+            return jnp.asarray(self.temperature_fixed_alpha, dtype=metadata.dtype)
         if self.temperature_alpha_net is None:
             return jnp.asarray(1.0, dtype=metadata.dtype)
         raw_alpha = self.temperature_alpha_net(metadata)[0]
         if self._resolved_temperature_update_mode() == "alpha_bounded_equilibrium":
-            return jax.nn.sigmoid(raw_alpha)
+            return jnp.asarray(
+                self.temperature_alpha_cap, dtype=raw_alpha.dtype
+            ) * jax.nn.sigmoid(raw_alpha)
         return self.temperature_alpha_max(raw_alpha.dtype) * jax.nn.sigmoid(raw_alpha)
 
     def _temperature_physical(self, temperature_scaled: jnp.ndarray) -> jnp.ndarray:
@@ -675,6 +848,10 @@ class ContractingClosedLoopHPEmulator(eqx.Module):
         temperature_t: jnp.ndarray,
     ) -> jnp.ndarray:
         thermal_inputs = input_t[1:]
+        if self.hp_force_off_input_index >= 1:
+            thermal_inputs = thermal_inputs.at[
+                self.hp_force_off_input_index - 1
+            ].set(0.0)
         if self.availability_input_index >= 1:
             thermal_inputs = thermal_inputs.at[self.availability_input_index - 1].set(0.0)
         for index in self.thermal_dynamics_masked_input_indices:
@@ -708,7 +885,18 @@ class ContractingClosedLoopHPEmulator(eqx.Module):
         previous_temperature_scaled: jnp.ndarray,
         alpha_t: jnp.ndarray,
         q_response_state_t: jnp.ndarray | None = None,
+        metadata: jnp.ndarray | None = None,
     ) -> jnp.ndarray:
+        if self.thermal_architecture == "metadata_fixed_ss":
+            if metadata is None:
+                raise ValueError("metadata_fixed_ss temperature decoding requires metadata")
+            _, _, _, output, output_bias = self.metadata_fixed_parameters(metadata)
+            raw_temperature = jnp.dot(output, state_t) + output_bias
+            bound = jnp.asarray(
+                self.temperature_output_scale, dtype=raw_temperature.dtype
+            )
+            free_temperature = bound * jnp.tanh(raw_temperature / bound)
+            return bound * jnp.tanh(free_temperature / bound)
         raw_temperature = self.temperature_net(
             state_t / jnp.asarray(self.state_bound, dtype=state_t.dtype)
         )[0]
@@ -848,6 +1036,9 @@ class ContractingClosedLoopHPEmulator(eqx.Module):
         metadata: jnp.ndarray,
         thermal_forcing_t: jnp.ndarray,
     ) -> tuple[jnp.ndarray, jnp.ndarray]:
+        if self.thermal_architecture == "metadata_fixed_ss":
+            rho, _, bias, _, _ = self.metadata_fixed_parameters(metadata)
+            return jnp.diag(rho), bias
         generator_forcing_t = self._transition_forcing(thermal_forcing_t)
         raw = self.transition_net(
             jnp.concatenate([metadata, generator_forcing_t], axis=0)
@@ -920,6 +1111,15 @@ class ContractingClosedLoopHPEmulator(eqx.Module):
         thermal_forcing_t: jnp.ndarray,
         state_t: jnp.ndarray,
     ) -> jnp.ndarray:
+        if self.thermal_architecture == "metadata_fixed_ss":
+            rho, input_matrix, bias, _, _ = self.metadata_fixed_parameters(metadata)
+            if self.transition_forcing_encoder is None:
+                encoded_forcing = thermal_forcing_t
+            else:
+                encoded_forcing = jnp.tanh(
+                    self.transition_forcing_encoder(thermal_forcing_t)
+                )
+            return rho * state_t + input_matrix @ encoded_forcing + bias
         matrix_t, bias_t = self.transition_matrix_and_bias(metadata, thermal_forcing_t)
         return self._apply_state_transition(matrix_t, bias_t, state_t)
 
@@ -933,13 +1133,20 @@ class ContractingClosedLoopHPEmulator(eqx.Module):
     ) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
         features = self.hp_features(metadata, encoded_input_t, input_t, energy_t, temperature_t)
         availability_t = self._space_heating_availability(input_t)
+        generation_availability_t = self._hp_generation_availability(input_t)
         output = self.output_net(features)
-        if self.thermostat_demand_mode == "monotone":
+        if self.thermostat_demand_mode != "unconstrained":
             # The emitter-demand parameters must not depend on the thermostat gap;
             # otherwise their variation could cancel the positive sigmoid slope.
             # HP mode and active power remain unrestricted functions of the gap.
             gap_feature_index = self.metadata_dim + self.encoded_input_dim + 1
-            demand_output = self.output_net(features.at[gap_feature_index].set(0.0))
+            demand_features = features.at[gap_feature_index].set(0.0)
+            if self.thermostat_demand_mode == "causal_monotone":
+                # Remove predicted Tin, Tset-Tin and buffer energy from the
+                # demand-parameter head. Tin then affects requested room heat
+                # only through the explicit monotone thermostat gate below.
+                demand_features = demand_features.at[-3:].set(0.0)
+            demand_output = self.output_net(demand_features)
             (
                 _,
                 pel_logit,
@@ -968,10 +1175,10 @@ class ContractingClosedLoopHPEmulator(eqx.Module):
                 )
                 * qroom_gate
             )
-            pi_t = availability_t * jax.nn.sigmoid(mode_logit)
+            pi_t = availability_t * generation_availability_t * jax.nn.sigmoid(mode_logit)
         else:
             qroom_logit, pel_logit, mode_logit = output
-            pi_t = availability_t * jax.nn.sigmoid(mode_logit)
+            pi_t = availability_t * generation_availability_t * jax.nn.sigmoid(mode_logit)
             requested_qroom_t = availability_t * self._positive_capped_from_logit(
                 qroom_logit,
                 self.hp_qroom_cap_w_m2,
@@ -998,6 +1205,11 @@ class ContractingClosedLoopHPEmulator(eqx.Module):
         metadata: jnp.ndarray,
         inputs: jnp.ndarray,
         initial_temperature: jnp.ndarray,
+        *,
+        ventilation_time_available: jnp.ndarray | None = None,
+        ventilation_minimum_indoor_temperature_c: jnp.ndarray | None = None,
+        ventilation_nominal_flow_m3_s: float = 0.0,
+        ventilation_minimum_indoor_outdoor_delta_c: float = 0.0,
     ) -> tuple[jnp.ndarray, ContractingClosedLoopAux]:
         state0 = self.initial_state(metadata, initial_temperature)
         energy0 = self.initial_energy(metadata, initial_temperature)
@@ -1010,19 +1222,49 @@ class ContractingClosedLoopHPEmulator(eqx.Module):
         ) -> tuple[tuple[jnp.ndarray, ...], tuple[jnp.ndarray, ...]]:
             state_t, energy_t, temperature_t, q_response_state_t = carry
             time_index, input_t = step_inputs
+            feedback_temperature_t = scale_gradient(
+                temperature_t,
+                self.temperature_feedback_gradient_scale,
+            )
+            if ventilation_time_available is not None:
+                assert ventilation_minimum_indoor_temperature_c is not None
+                input_t = replace_with_eplus_ventilation(
+                    input_t, feedback_temperature_t,
+                    time_available_t=ventilation_time_available[time_index],
+                    minimum_indoor_temperature_c_t=ventilation_minimum_indoor_temperature_c[time_index],
+                    nominal_flow_m3_s=ventilation_nominal_flow_m3_s,
+                    minimum_indoor_outdoor_delta_c=ventilation_minimum_indoor_outdoor_delta_c,
+                    ventilation_input_index=self.ventilation_input_index,
+                    outdoor_input_index=self.outdoor_input_index,
+                    input_mean=self.input_mean,
+                    input_scale=self.input_scale,
+                    temperature_mean_c=self.target_mean[self.temperature_target_index],
+                    temperature_scale_c=self.target_scale[self.temperature_target_index],
+                )
             encoded_input_t = self.encode_input(input_t)
-            pi_t, qroom_t, pel_t, energy_next, _, _ = self.decode_hp(
+            (
+                pi_t,
+                qroom_t,
+                pel_t,
+                energy_next,
+                available_power_t,
+                requested_qroom_t,
+            ) = self.decode_hp(
                 metadata,
                 encoded_input_t,
                 input_t,
                 energy_t,
-                temperature_t,
+                feedback_temperature_t,
             )
             qroom_scaled_t = self._target_scaled(qroom_t, self.qroom_target_index)
             pel_scaled_t = self._target_scaled(pel_t, self.pel_target_index)
-            thermal_forcing_t = self.thermal_forcing(input_t, qroom_scaled_t, temperature_t)
-            matrix_t, bias_t = self.transition_matrix_and_bias(metadata, thermal_forcing_t)
-            state_next = self._apply_state_transition(matrix_t, bias_t, state_t)
+            thermal_forcing_t = self.thermal_forcing(
+                input_t,
+                qroom_scaled_t,
+                feedback_temperature_t,
+            )
+            matrix_t, _ = self.transition_matrix_and_bias(metadata, thermal_forcing_t)
+            state_next = self.one_step_state(metadata, thermal_forcing_t, state_t)
             q_response_state_next = self.next_q_response_state(
                 metadata,
                 q_response_state_t,
@@ -1033,6 +1275,7 @@ class ContractingClosedLoopHPEmulator(eqx.Module):
                 temperature_t,
                 alpha,
                 q_response_state_next,
+                metadata,
             )
             prediction_t = jnp.stack([temperature_next, qroom_scaled_t, pel_scaled_t])
             return detach_carry(
@@ -1046,6 +1289,10 @@ class ContractingClosedLoopHPEmulator(eqx.Module):
                 pel_t,
                 state_next,
                 jnp.linalg.norm(matrix_t),
+                energy_t,
+                energy_next,
+                available_power_t,
+                requested_qroom_t,
             )
 
         _, outputs = jax.lax.scan(
@@ -1053,8 +1300,29 @@ class ContractingClosedLoopHPEmulator(eqx.Module):
             (state0, energy0, initial_temperature[0], q_response_state0),
             (jnp.arange(inputs.shape[0]), inputs),
         )
-        predictions, pi, qroom, pel, state, matrix_norm = outputs
-        aux = (pi, qroom, pel, state, matrix_norm)
+        (
+            predictions,
+            pi,
+            qroom,
+            pel,
+            state,
+            matrix_norm,
+            energy,
+            energy_next,
+            available_power,
+            requested_qroom,
+        ) = outputs
+        aux = (
+            pi,
+            qroom,
+            pel,
+            state,
+            matrix_norm,
+            energy,
+            energy_next,
+            available_power,
+            requested_qroom,
+        )
         return predictions, aux
 
     def __call__(

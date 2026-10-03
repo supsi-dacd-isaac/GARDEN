@@ -17,8 +17,13 @@ from .truncated_bptt import DEFAULT_BPTT_TRUNCATE_STEPS, detach_carry, validate_
 
 ProcessNoiseMode = Literal["none", "constant", "heteroscedastic"]
 HPElectricScenarioMode = Literal["expected", "bernoulli"]
-HPElectricRolloutMode = Literal["expected", "bernoulli", "straight_through"]
-HPTrainingMode = Literal["expected", "straight_through"]
+HPElectricRolloutMode = Literal[
+    "expected",
+    "bernoulli",
+    "straight_through",
+    "hard_expected_grad",
+]
+HPTrainingMode = Literal["expected", "straight_through", "hard_expected_grad"]
 ProbHpEmissionMode = Literal["bounded", "legacy_lognormal_mean"]
 HPActivationModel = Literal[
     "independent",
@@ -68,6 +73,15 @@ def straight_through_binary_concrete(
     soft_sample = jax.nn.sigmoid((mode_logit + logistic_noise) / safe_temperature)
     hard_sample = (soft_sample >= 0.5).astype(dtype)
     return soft_sample + jax.lax.stop_gradient(hard_sample - soft_sample)
+
+
+def hard_bernoulli_expected_gradient(
+    probability: jnp.ndarray,
+    uniform: jnp.ndarray,
+) -> jnp.ndarray:
+    """Use a hard Bernoulli forward draw and the probability's exact gradient."""
+    hard_sample = (uniform < probability).astype(probability.dtype)
+    return probability + jax.lax.stop_gradient(hard_sample - probability)
 
 
 class ProbabilisticClosedLoopHPEmulator(eqx.Module):
@@ -120,6 +134,7 @@ class ProbabilisticClosedLoopHPEmulator(eqx.Module):
     ventilation_input_index: int = eqx.field(static=True)
     thermal_extra_input_indices: tuple[int, ...] = eqx.field(static=True)
     availability_input_index: int = eqx.field(static=True)
+    hp_force_off_input_index: int = eqx.field(static=True)
     temperature_target_index: int = eqx.field(static=True)
     qroom_target_index: int = eqx.field(static=True)
     pel_target_index: int = eqx.field(static=True)
@@ -159,6 +174,7 @@ class ProbabilisticClosedLoopHPEmulator(eqx.Module):
         target_mean: tuple[float, ...] = (),
         target_scale: tuple[float, ...] = (),
         availability_input_index: int = -1,
+        hp_force_off_input_index: int = -1,
         thermal_extra_input_indices: tuple[int, ...] = (),
         bptt_truncate_steps: int = DEFAULT_BPTT_TRUNCATE_STEPS,
         key: jax.Array,
@@ -196,6 +212,8 @@ class ProbabilisticClosedLoopHPEmulator(eqx.Module):
             raise ValueError("closed-loop probabilistic target scalers must have exactly 3 outputs")
         if availability_input_index >= input_dim:
             raise ValueError("availability_input_index must be smaller than input_dim")
+        if hp_force_off_input_index >= input_dim:
+            raise ValueError("hp_force_off_input_index must be smaller than input_dim")
         thermal_extra_input_indices = tuple(
             int(index) for index in thermal_extra_input_indices
         )
@@ -308,6 +326,7 @@ class ProbabilisticClosedLoopHPEmulator(eqx.Module):
         self.ventilation_input_index = 3
         self.thermal_extra_input_indices = thermal_extra_input_indices
         self.availability_input_index = availability_input_index
+        self.hp_force_off_input_index = hp_force_off_input_index
         self.temperature_target_index = 0
         self.qroom_target_index = 1
         self.pel_target_index = 2
@@ -368,6 +387,21 @@ class ProbabilisticClosedLoopHPEmulator(eqx.Module):
             jnp.asarray(0.0, dtype=input_t.dtype),
             jnp.asarray(1.0, dtype=input_t.dtype),
         )
+
+    def _hp_generation_availability(self, input_t: jnp.ndarray) -> jnp.ndarray:
+        if self.hp_force_off_input_index < 0:
+            return jnp.asarray(1.0, dtype=input_t.dtype)
+        force_off = jnp.clip(
+            self._physical_input(input_t, self.hp_force_off_input_index),
+            jnp.asarray(0.0, dtype=input_t.dtype),
+            jnp.asarray(1.0, dtype=input_t.dtype),
+        )
+        return jnp.asarray(1.0, dtype=input_t.dtype) - force_off
+
+    def _learned_input(self, input_t: jnp.ndarray) -> jnp.ndarray:
+        if self.hp_force_off_input_index < 0:
+            return input_t
+        return input_t.at[self.hp_force_off_input_index].set(0.0)
 
     def _nonnegative_capped(self, value: jnp.ndarray, cap: float) -> jnp.ndarray:
         value = jnp.maximum(value, jnp.asarray(0.0, dtype=value.dtype))
@@ -669,9 +703,15 @@ class ProbabilisticClosedLoopHPEmulator(eqx.Module):
         ventilation_nominal_flow_m3_s: jnp.ndarray | float = 0.0,
         ventilation_minimum_indoor_outdoor_delta_c: jnp.ndarray | float = 2.0,
     ) -> tuple[jnp.ndarray, ProbClosedLoopAux]:
-        if hp_scenario_mode not in ("expected", "bernoulli", "straight_through"):
+        if hp_scenario_mode not in (
+            "expected",
+            "bernoulli",
+            "straight_through",
+            "hard_expected_grad",
+        ):
             raise ValueError(
-                "hp_scenario_mode must be 'expected', 'bernoulli', or 'straight_through'"
+                "hp_scenario_mode must be 'expected', 'bernoulli', "
+                "'straight_through', or 'hard_expected_grad'"
             )
         generated_ventilation = ventilation_time_available is not None
         if generated_ventilation != (ventilation_minimum_indoor_temperature_c is not None):
@@ -740,16 +780,22 @@ class ProbabilisticClosedLoopHPEmulator(eqx.Module):
                     temperature_mean_c=self.target_mean[0],
                     temperature_scale_c=self.target_scale[0],
                 )
-            features = self._controller_features(input_t, temperature_t, energy_t, w_t)
+            learned_input_t = self._learned_input(input_t)
+            features = self._controller_features(
+                learned_input_t, temperature_t, energy_t, w_t
+            )
             availability_t = self._space_heating_availability(input_t)
+            generation_availability_t = self._hp_generation_availability(input_t)
 
             mode_logit_t = self.mode_net(features)[0]
             pi_t, log_mu_t, log_sigma_t, expected_active_t, expected_pel_t = self.hp_emission(
                 features,
                 mode_logit_t,
             )
-            pi_t = availability_t * pi_t
-            expected_pel_t = availability_t * expected_pel_t
+            pi_t = availability_t * generation_availability_t * pi_t
+            expected_pel_t = (
+                availability_t * generation_availability_t * expected_pel_t
+            )
             if hp_scenario_mode == "expected":
                 hp_on_t = pi_t
                 pel_active_t = expected_active_t
@@ -758,14 +804,29 @@ class ProbabilisticClosedLoopHPEmulator(eqx.Module):
                 sampled_log_active_t = log_mu_t + log_sigma_t * power_noise_t
                 pel_active_t = self._sample_active_power_from_log(sampled_log_active_t)
                 if hp_scenario_mode == "straight_through":
-                    hp_on_t = availability_t * straight_through_binary_concrete(
-                        mode_logit_t,
+                    hp_on_t = (
+                        availability_t
+                        * generation_availability_t
+                        * straight_through_binary_concrete(
+                            mode_logit_t,
+                            mode_uniform_t,
+                            jnp.asarray(
+                                hp_concrete_temperature,
+                                dtype=input_t.dtype,
+                            ),
+                        )
+                    )
+                elif hp_scenario_mode == "hard_expected_grad":
+                    hp_on_t = hard_bernoulli_expected_gradient(
+                        pi_t,
                         mode_uniform_t,
-                        jnp.asarray(hp_concrete_temperature, dtype=input_t.dtype),
                     )
                 else:
                     hp_on_t = (mode_uniform_t < pi_t).astype(input_t.dtype)
-                pel_t = self._nonnegative_capped(hp_on_t * pel_active_t, self.hp_pel_cap_w_m2)
+                pel_t = self._nonnegative_capped(
+                    hp_on_t * pel_active_t,
+                    self.hp_pel_cap_w_m2,
+                )
 
             cop_t = self._cop(input_t, cop_intercept, cop_slope)
             qroom_raw_t = (
@@ -785,7 +846,9 @@ class ProbabilisticClosedLoopHPEmulator(eqx.Module):
             )
             qroom_scaled_t = self._target_scaled(qroom_t, self.qroom_target_index)
 
-            z_t = self._thermal_features(input_t, temperature_t, qroom_scaled_t)
+            z_t = self._thermal_features(
+                learned_input_t, temperature_t, qroom_scaled_t
+            )
             scale_t = self.process_scale(metadata, z_t, x_t)
             x_next = matrices.a @ x_t + matrices.b @ z_t + matrices.state_bias + scale_t * eps_t
             temperature_next = (matrices.c @ x_next + matrices.output_bias)[0]
@@ -870,9 +933,15 @@ class ProbabilisticClosedLoopHPEmulator(eqx.Module):
     ) -> tuple[jnp.ndarray, ProbClosedLoopAux]:
         if num_particles < 1:
             raise ValueError("num_particles must be positive")
-        if hp_scenario_mode not in ("expected", "bernoulli", "straight_through"):
+        if hp_scenario_mode not in (
+            "expected",
+            "bernoulli",
+            "straight_through",
+            "hard_expected_grad",
+        ):
             raise ValueError(
-                "hp_scenario_mode must be 'expected', 'bernoulli', or 'straight_through'"
+                "hp_scenario_mode must be 'expected', 'bernoulli', "
+                "'straight_through', or 'hard_expected_grad'"
             )
         xi_key, process_key, mode_key, power_key = jax.random.split(key, 4)
         xi = jax.random.normal(xi_key, (num_particles, self.latent_dim))

@@ -5,7 +5,12 @@ The established state-space implementations are consumed through adapters so
 that refactoring does not alter their equations or saved artifacts.
 """
 
-from .config import ExperimentConfig, LSTMConfig, OptimizerConfig
+from .config import (
+    ExperimentConfig,
+    LSTMConfig,
+    OptimizerConfig,
+    ProbabilisticLSTMConfig,
+)
 from .registry import MODEL_REGISTRY, ModelSpec, get_model_spec
 
 __all__ = [
@@ -14,5 +19,6 @@ __all__ = [
     "MODEL_REGISTRY",
     "ModelSpec",
     "OptimizerConfig",
+    "ProbabilisticLSTMConfig",
     "get_model_spec",
 ]

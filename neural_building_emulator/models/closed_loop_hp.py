@@ -10,6 +10,7 @@ from .emulator import MLP, ParameterSlices, parameter_slices
 from .schur import SchurMode, simba_schur_matrix
 from .state_space import StateSpaceMatrices
 from .truncated_bptt import DEFAULT_BPTT_TRUNCATE_STEPS, detach_carry, validate_bptt_truncate_steps
+from ..ventilation import replace_with_eplus_ventilation
 
 ClosedLoopAux = tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]
 
@@ -57,6 +58,7 @@ class ClosedLoopHPEmulator(eqx.Module):
     ventilation_input_index: int = eqx.field(static=True)
     thermal_extra_input_indices: tuple[int, ...] = eqx.field(static=True)
     availability_input_index: int = eqx.field(static=True)
+    hp_force_off_input_index: int = eqx.field(static=True)
     temperature_target_index: int = eqx.field(static=True)
     qroom_target_index: int = eqx.field(static=True)
     pel_target_index: int = eqx.field(static=True)
@@ -90,6 +92,7 @@ class ClosedLoopHPEmulator(eqx.Module):
         target_mean: tuple[float, ...] = (),
         target_scale: tuple[float, ...] = (),
         availability_input_index: int = -1,
+        hp_force_off_input_index: int = -1,
         thermal_extra_input_indices: tuple[int, ...] = (),
         bptt_truncate_steps: int = DEFAULT_BPTT_TRUNCATE_STEPS,
         key: jax.Array,
@@ -119,6 +122,8 @@ class ClosedLoopHPEmulator(eqx.Module):
             raise ValueError("closed_loop_hp target scalers must have exactly 3 outputs")
         if availability_input_index >= input_dim:
             raise ValueError("availability_input_index must be smaller than input_dim")
+        if hp_force_off_input_index >= input_dim:
+            raise ValueError("hp_force_off_input_index must be smaller than input_dim")
         thermal_extra_input_indices = tuple(
             int(index) for index in thermal_extra_input_indices
         )
@@ -205,6 +210,7 @@ class ClosedLoopHPEmulator(eqx.Module):
         self.ventilation_input_index = 3
         self.thermal_extra_input_indices = thermal_extra_input_indices
         self.availability_input_index = availability_input_index
+        self.hp_force_off_input_index = hp_force_off_input_index
         self.temperature_target_index = 0
         self.qroom_target_index = 1
         self.pel_target_index = 2
@@ -251,6 +257,21 @@ class ClosedLoopHPEmulator(eqx.Module):
             jnp.asarray(0.0, dtype=input_t.dtype),
             jnp.asarray(1.0, dtype=input_t.dtype),
         )
+
+    def _hp_generation_availability(self, input_t: jnp.ndarray) -> jnp.ndarray:
+        if self.hp_force_off_input_index < 0:
+            return jnp.asarray(1.0, dtype=input_t.dtype)
+        force_off = jnp.clip(
+            self._physical_input(input_t, self.hp_force_off_input_index),
+            jnp.asarray(0.0, dtype=input_t.dtype),
+            jnp.asarray(1.0, dtype=input_t.dtype),
+        )
+        return jnp.asarray(1.0, dtype=input_t.dtype) - force_off
+
+    def _learned_input(self, input_t: jnp.ndarray) -> jnp.ndarray:
+        if self.hp_force_off_input_index < 0:
+            return input_t
+        return input_t.at[self.hp_force_off_input_index].set(0.0)
 
     def _nonnegative_capped(self, value: jnp.ndarray, cap: float) -> jnp.ndarray:
         value = jnp.maximum(value, jnp.asarray(0.0, dtype=value.dtype))
@@ -370,6 +391,11 @@ class ClosedLoopHPEmulator(eqx.Module):
         metadata: jnp.ndarray,
         inputs: jnp.ndarray,
         initial_temperature: jnp.ndarray,
+        *,
+        ventilation_time_available: jnp.ndarray | None = None,
+        ventilation_minimum_indoor_temperature_c: jnp.ndarray | None = None,
+        ventilation_nominal_flow_m3_s: float = 0.0,
+        ventilation_minimum_indoor_outdoor_delta_c: float = 0.0,
     ) -> tuple[jnp.ndarray, ClosedLoopAux]:
         matrices = self.matrices(metadata)
         x0 = self.initial_state(metadata, initial_temperature)
@@ -384,10 +410,33 @@ class ClosedLoopHPEmulator(eqx.Module):
         ) -> tuple[tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray], tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]]:
             x_t, w_t, energy_t, temperature_t = carry
             time_index, input_t = step_inputs
-            features = self._controller_features(input_t, temperature_t, energy_t, w_t)
+            if ventilation_time_available is not None:
+                assert ventilation_minimum_indoor_temperature_c is not None
+                input_t = replace_with_eplus_ventilation(
+                    input_t, temperature_t,
+                    time_available_t=ventilation_time_available[time_index],
+                    minimum_indoor_temperature_c_t=ventilation_minimum_indoor_temperature_c[time_index],
+                    nominal_flow_m3_s=ventilation_nominal_flow_m3_s,
+                    minimum_indoor_outdoor_delta_c=ventilation_minimum_indoor_outdoor_delta_c,
+                    ventilation_input_index=self.ventilation_input_index,
+                    outdoor_input_index=self.outdoor_input_index,
+                    input_mean=self.input_mean,
+                    input_scale=self.input_scale,
+                    temperature_mean_c=self.target_mean[self.temperature_target_index],
+                    temperature_scale_c=self.target_scale[self.temperature_target_index],
+                )
+            learned_input_t = self._learned_input(input_t)
+            features = self._controller_features(
+                learned_input_t, temperature_t, energy_t, w_t
+            )
             availability_t = self._space_heating_availability(input_t)
+            generation_availability_t = self._hp_generation_availability(input_t)
 
-            pi_t = availability_t * jax.nn.sigmoid(self.mode_net(features)[0])
+            pi_t = (
+                availability_t
+                * generation_availability_t
+                * jax.nn.sigmoid(self.mode_net(features)[0])
+            )
             pel_base = (
                 jax.nn.softplus(self.pel_net(features)[0])
                 * jnp.asarray(self.target_scale[self.pel_target_index], dtype=input_t.dtype)
@@ -412,7 +461,9 @@ class ClosedLoopHPEmulator(eqx.Module):
             )
             qroom_scaled_t = self._target_scaled(qroom_t, self.qroom_target_index)
 
-            z_t = self._thermal_features(input_t, temperature_t, qroom_scaled_t)
+            z_t = self._thermal_features(
+                learned_input_t, temperature_t, qroom_scaled_t
+            )
             x_next = matrices.a @ x_t + matrices.b @ z_t + matrices.state_bias
             temperature_next = (matrices.c @ x_next + matrices.output_bias)[0]
 

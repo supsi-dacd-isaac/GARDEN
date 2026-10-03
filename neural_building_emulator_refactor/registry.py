@@ -84,6 +84,28 @@ MODEL_REGISTRY: dict[str, ModelSpec] = {
         legacy_model_kind=None,
         description="Unstructured autoregressive LSTM predicting Tin, Qroom and Pel from Tset.",
     ),
+    "closed_loop_hp_probabilistic_lstm": ModelSpec(
+        name="closed_loop_hp_probabilistic_lstm",
+        task="closed_loop_hp",
+        backend="lstm",
+        probabilistic=True,
+        legacy_model_kind=None,
+        description=(
+            "Semi-structured stochastic LSTM with HP switching and bounded "
+            "positive power emissions, retained for reproducibility."
+        ),
+    ),
+    "closed_loop_hp_vanilla_probabilistic_lstm": ModelSpec(
+        name="closed_loop_hp_vanilla_probabilistic_lstm",
+        task="closed_loop_hp",
+        backend="lstm",
+        probabilistic=True,
+        legacy_model_kind=None,
+        description=(
+            "Unstructured stochastic autoregressive LSTM with a generic linear "
+            "Tin/Qroom/Pel readout and no physical or HP-specific constraints."
+        ),
+    ),
 }
 
 

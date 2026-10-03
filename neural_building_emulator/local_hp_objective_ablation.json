@@ -1,0 +1,29 @@
+{
+  "hp_activation_model": [
+    "power_history"
+  ],
+  "hp_history_representation": [
+    "multiscale"
+  ],
+  "hp_history_feedback": [
+    "teacher_forced",
+    "scheduled"
+  ],
+  "hp_temperature_feedback": [
+    "teacher_forced",
+    "scheduled"
+  ],
+  "training_objective": [
+    "joint",
+    "hp_only"
+  ],
+  "hp_training_mode": [
+    "expected"
+  ],
+  "process_noise_mode": [
+    "none"
+  ],
+  "temperature_update_mode": [
+    "leaky_equilibrium"
+  ]
+}

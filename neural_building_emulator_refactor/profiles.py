@@ -10,6 +10,7 @@ import pandas as pd
 from neural_building_emulator.columns import (
     DHW_MIXED_WATER_PER_HEATED_AREA_COLUMN,
     INTERNAL_GAIN_PER_FLOOR_AREA_COLUMN,
+    HP_FORCE_OFF_REQUESTED_COLUMN,
     PROFILE_ID_COLUMN,
     closed_loop_required_columns,
     required_columns,
@@ -99,12 +100,14 @@ def load_profiles(
             INTERNAL_GAIN_PER_FLOOR_AREA_COLUMN in input_columns
         )
         include_dhw_request = DHW_MIXED_WATER_PER_HEATED_AREA_COLUMN in input_columns
+        include_hp_force_off = HP_FORCE_OFF_REQUESTED_COLUMN in input_columns
         frame = _read_profiles(
             path,
             columns=closed_loop_required_columns(
                 metadata_columns or None,
                 include_internal_gains=include_internal_gains,
                 include_dhw_request=include_dhw_request,
+                include_hp_force_off=include_hp_force_off,
             ),
             profile_ids=ids,
         )
@@ -114,6 +117,7 @@ def load_profiles(
             include_space_heating_availability=include_availability,
             include_internal_gains=include_internal_gains,
             include_dhw_request=include_dhw_request,
+            include_hp_force_off=include_hp_force_off,
             hp_power_area_normalization=str(
                 artifact_value(
                     artifact,

@@ -1100,12 +1100,43 @@ Tin[t+1] = clip(
 ```
 
 For deterministic models, `alpha(c)` is fixed for a building and the entire
-rollout. For probabilistic models, `alpha(c, xi)` is fixed within a particle but
-can differ across particles. Near equilibrium the update is approximately
+rollout. Probabilistic models default to `alpha(c, xi)`, fixed within a particle
+but potentially different across particles. Particle-level alpha variation can
+be removed while retaining building-specific alpha with:
+
+```bash
+--contracting-temperature-alpha-conditioning metadata
+```
+
+This uses `alpha(c)` for every particle of a building; the default
+`metadata_xi` preserves `alpha(c, xi)`. Other system parameters and states
+remain particle-conditioned. Near equilibrium the update is approximately
 `alpha * (T_eq - Tin)`, so alpha controls the local response speed. The outer
 `tanh` independently retains the hard physical step cap, allowing alpha to use
 the full `(0,1)` range instead of the much smaller `alpha_max` required by the
 linear `leaky_equilibrium` update.
+
+For long closed-loop training, recursive predicted-temperature feedback can be
+gradient-damped without changing any forward trajectory:
+
+```bash
+--contracting-temperature-feedback-gradient-scale 0.05
+```
+
+If `T_fb` denotes the temperature supplied to the HP/Q controller and thermal
+transition forcing, training uses
+
+```text
+T_fb = stop_gradient(Tin)
+     + lambda_fb * (Tin - stop_gradient(Tin))
+```
+
+Thus `T_fb == Tin` numerically for every `lambda_fb`. Its derivative with
+respect to `Tin` is `lambda_fb`: `1` preserves the original gradient and `0`
+fully detaches these outgoing feedback paths. The direct temperature recurrence
+and all local HP, Qroom, and thermal losses remain differentiable. This controls
+backpropagation amplification only; it does not alter inference or certify the
+Jacobian of the physical forward map.
 
 Main controls:
 
@@ -1246,6 +1277,26 @@ see linked sampled `Pel -> E -> Qroom -> Tin` trajectories. The BCE and active
 power NLL remain explicit auxiliary losses. The default
 `--prob-hp-training-mode expected` preserves the previous training behavior.
 
+An alternative hard-forward estimator is available with:
+
+```bash
+--prob-hp-training-mode hard_expected_grad
+```
+
+It draws a hard Bernoulli activation in the forward rollout, but defines its
+backward derivative as the derivative of the activation probability itself:
+
+```text
+m_hard = 1[uniform < pi]
+m_train = pi + stop_gradient(m_hard - pi)
+```
+
+Unlike `straight_through`, this mode has no Binary Concrete relaxation or
+temperature. It still samples active HP power, so every training particle sees
+a linked hard `Pel -> E -> Qroom -> Tin` trajectory. This remains a biased
+straight-through estimator of the discrete expected loss: only the surrogate
+mode derivative `dm_train / dpi = 1` is exact.
+
 ### Flexibility-KPI CRPS
 
 An optional trajectory-level score targets the upward and downward flexibility
@@ -1378,6 +1429,43 @@ trajectory and conditions both transition heads. This mode is intended to
 represent asymmetric startup and shutdown persistence without the extra
 latent recurrent state used by `persistent_markov`.
 
+The contracting probabilistic model also supports a separate hydronic-demand
+state:
+
+```bash
+--hp-thermostat-demand-mode monotone \
+--prob-qroom-activation-model asymmetric_markov \
+--qroom-mode-loss-weight 0.1 \
+--qroom-on-threshold-w-m2 0.05
+```
+
+This state is distinct from the compressor state. It gates the positive
+monotone requested-heat magnitude before the existing buffer-energy
+projection. For each trajectory particle,
+
+```text
+pQ_start[t] = Pr(qmode[t]=1 | qmode[t-1]=0, context[t])
+pQ_stop[t]  = Pr(qmode[t]=0 | qmode[t-1]=1, context[t])
+qpi[t]      = (1-qmode[t-1]) pQ_start[t]
+              + qmode[t-1] (1-pQ_stop[t])
+Qrequest[t] = qmode[t] Qmonotone[t]
+```
+
+Both starting and remaining on are structurally nondecreasing in
+`Tset-Tin`. The learned stay-on threshold cannot exceed the start threshold,
+which creates a thermostat hysteresis band. Expected-mode training propagates
+the occupancy probability, while Bernoulli scenario rollout samples a hard
+two-state hydronic chain using randomness separate from HP activation. The
+delivered heat still passes through the buffer constraint, so this option does
+not bypass energy conservation. A balanced start/stop cross-entropy is fitted
+against `Qroom > --qroom-on-threshold-w-m2` and appears in logs as
+`train_loss_qroom_bce`.
+
+The default `continuous` mode omits the extra network/state and preserves old
+artifacts and numerical behavior. The Markov option currently applies only to
+`closed_loop_hp_contracting_probabilistic` and requires monotone thermostat
+demand.
+
 The contracting probabilistic HP controller can additionally receive causal
 setpoint-shock traces:
 
@@ -1447,7 +1535,7 @@ sampled closed-loop stability penalty
 The training HP path is selected independently from plot generation:
 
 ```text
---prob-hp-training-mode expected|straight_through
+--prob-hp-training-mode expected|straight_through|hard_expected_grad
 --prob-hp-scenario-mode expected|bernoulli
 --prob-hp-activation-model independent|persistent_markov|power_history|asymmetric_markov
 ```

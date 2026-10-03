@@ -3,7 +3,7 @@
 This package is a parallel comparison pipeline. It does not replace or modify
 `neural_building_emulator`; the established state-space equations and trainer
 remain available there. The refactor adds a small registry, common artifacts,
-two recurrent baselines, and one reload-and-score interface.
+recurrent baselines, and one reload-and-score interface.
 
 ## Models
 
@@ -17,11 +17,27 @@ two recurrent baselines, and one reload-and-score interface.
 | `closed_loop_hp_contracting_probabilistic` | `Tset`, weather -> `Tin,Qroom,Pel` | existing bounded/contracting closed-loop model |
 | `q_to_t_lstm` | known `Qroom`, weather -> `Tin` | new unconstrained autoregressive LSTM |
 | `closed_loop_hp_lstm` | `Tset`, weather -> `Tin,Qroom,Pel` | new unconstrained autoregressive LSTM |
+| `closed_loop_hp_vanilla_probabilistic_lstm` | `Tset`, weather -> distributions of `Tin,Qroom,Pel` | unstructured stochastic autoregressive LSTM comparison baseline |
+| `closed_loop_hp_probabilistic_lstm` | `Tset`, weather -> distributions of `Tin,Qroom,Pel` | older semi-structured stochastic LSTM retained for reproducibility |
 
-The LSTMs are intentionally unstructured controls. Static metadata initializes
+The two deterministic LSTMs are intentionally unstructured controls. Static metadata initializes
 their hidden and cell states. During autonomous rollout, the previous predicted
 output is fed back: `Tin` for Q-to-T and `[Tin,Qroom,Pel]` for closed loop. They
 have no stability, positivity, energy-conservation, or monotonicity constraints.
+The vanilla probabilistic LSTM uses the same autoregressive inputs and a generic
+linear three-output readout. Its scenarios come from trajectory-persistent
+latent noise and time-varying recurrent process noise. It has no engineered
+setpoint-shock traces, availability gate, positivity transform, HP switching
+state, active-power distribution, buffer, COP, thermal state-space,
+contraction, or monotone thermostat equation. It is trained only with the
+shared multivariate energy score, optional variogram score, and optional
+trajectory Best-of-K term. This is the intended control for testing whether
+the structured emulator is necessary.
+
+The older `closed_loop_hp_probabilistic_lstm` is deliberately kept loadable so
+existing results remain reproducible. It is not a vanilla baseline: it includes
+positive bounded `Qroom`, setpoint-shock traces, and an asymmetric-Markov,
+bounded-active-power model for `Pel`.
 
 Contracting closed-loop state-space models also support the optional simplified
 temperature readout:
@@ -40,6 +56,19 @@ rollout-constant `alpha` inside the bounded update. In probabilistic models it
 is additionally conditioned on persistent `xi`, and is therefore constant only
 within each sampled trajectory.
 
+Contracting models can damp only the backward derivative of recursive predicted
+temperature feedback with:
+
+```bash
+--contracting-temperature-feedback-gradient-scale 0.05
+```
+
+The predicted `Tin` values supplied to the HP/Q controller and thermal
+transition are unchanged in the forward pass and at inference. A value of `1`
+preserves ordinary gradients, while `0` detaches those feedback paths. The
+direct temperature recurrence remains differentiable. This is a training
+stabilizer, not a forward-dynamics contraction certificate.
+
 All models use the original profile-level split and preprocessing code.
 Q-to-T is aligned as `u[t] -> Tin[t+1]`. For timestamped EnergyPlus interval
 reports, closed loop is aligned as
@@ -51,6 +80,13 @@ uses the same HP-only filter and DHW masking as the established trainer.
 normalization by default. Pass `--hp-power-area-normalization zone_floor_area`
 only when reproducing a legacy run. Saved artifacts preserve the choice, and
 old artifacts without this metadata field are treated as legacy artifacts.
+The contracting probabilistic model can optionally add a separate hysteretic
+hydronic-demand state with
+`--prob-qroom-activation-model asymmetric_markov`; this also requires
+`--hp-thermostat-demand-mode monotone`. Its start/stop loss is controlled by
+`--qroom-mode-loss-weight` and the observed on threshold by
+`--qroom-on-threshold-w-m2`. The default `continuous` value preserves the
+existing architecture.
 Closed-loop state-space models also receive HP capacity, SH design capacity and
 SH buffer volume normalized by that heated area, together with reference COP
 and a one-hot HP model identifier. Their default structural Q-to-T filter bank
@@ -211,6 +247,12 @@ quantile-coverage HTML plot for probabilistic artifacts. With
 `scenario_average`, it is fitted separately to linked `Tin,Qroom,Pel` scenarios
 and averaged afterward.
 
+When regression-based flexibility is the primary estimator, add
+`--also-evaluate-direct-f` to compute the direct-ratio annual
+upward/downward `F_H` KPIs from the same trajectories. These secondary outputs
+use the `_f` suffix, including `flexibility_kpis_f.csv` and
+`flexibility_kpi_coverage_f.html`; no additional emulator rollout is required.
+
 The scorer also writes common full-profile HTML plots (`Tin` for Q-to-T and
 three stacked `Tin/Qroom/Pel` panels for closed loop). Probabilistic plots show
 the scenario mean and pointwise 95% interval. Control their count with
@@ -241,9 +283,18 @@ profile cap, estimator, or destination with
 The scenario-average evaluation also writes
 `temporal_trace_calibration.html`, a three-signal reliability and ensemble-rank
 dashboard for `Tin`, `Qroom`, and `Pel_SH`, plus the corresponding calibration
-and rank-histogram CSV files. Temperature uses all timestamps; the two heating
+and rank-histogram CSV files. It also writes
+`temporal_trace_probabilistic_scores.csv` with exact empirical ensemble CRPS
+and mean 50/80/90/95% interval widths for each signal. Temperature uses all timestamps; the two heating
 signals use only timestamps when space heating is available so the diagnostic
 is not dominated by structurally zero off-season predictions.
+
+The same standard post-training evaluation uses the shared benchmark scorer.
+It additionally writes `pel_dynamics_calibration.html` with HP start/stay
+reliability, conditional power calibration, active-run durations, mode
+autocorrelation, and annual electrical-energy calibration. It also writes five
+full-year profile plots and, when regression flexibility is selected, the
+direct-ratio F comparison and coverage plots with the `_f` suffix.
 
 ### Metadata-only flexibility benchmark
 
@@ -254,20 +305,40 @@ same 15 static metadata fields to EnergyPlus event-study KPIs:
 ```bash
 .venv/bin/python -m neural_building_emulator_refactor.metadata_flexibility_lightgbm \
   --artifact-dir output/.../artifacts/closed_loop_hp_contracting_probabilistic/selected \
-  --dataset neural_building_emulator/tessin_results.parquet/all_hp \
   --output-dir output/neural_building_emulator_refactor/metadata_flexibility_lightgbm \
-  --emulator-kpi-csv output/.../flexibility_event_study_profile_kpis.csv \
+  --kpis f regression_based \
+  --additional-emulator-artifact vanilla_lstm=output/.../artifacts/closed_loop_hp_vanilla_probabilistic_lstm/selected \
   --horizons-hours 0.5 1 2 3 \
   --controls full
 ```
 
-The artifact supplies the exact building-level train/test split. KPI targets
+The artifact supplies its training dataset path, exact building-level
+train/test split, metadata columns, and power-normalization convention. Pass
+`--dataset` only to intentionally override the saved dataset. KPI targets
 are calculated from EnergyPlus only; LightGBM receives no time-series inputs,
 weather, or emulator predictions. Separate models are fitted for upward and
-downward flexibility at each horizon. Outputs include reloadable LightGBM text
-models, per-building predictions, metrics, paired bootstrap comparisons with
-the emulator, feature importance, and interactive held-out scatter/score
-dashboards.
+downward flexibility at each horizon and for each requested KPI definition.
+`f` selects the direct-ratio energy-flexibility KPI, while `regression_based`
+selects the event-study coefficient. Their artifacts are written under `f/`
+and `regression_based/`; combined metrics and a cross-KPI dashboard are written
+at the output root. The older single-KPI `--kpi-estimator` interface remains
+supported. Outputs include reloadable LightGBM text models, per-building
+predictions, metrics, paired bootstrap comparisons with the emulator, feature
+importance, and interactive held-out scatter/score dashboards.
+
+When no `--emulator-kpi-csv` is supplied, the benchmark reloads the artifact,
+runs its complete test profiles once, and reuses those trajectories for every
+requested KPI. Probabilistic artifacts use 100 linked scenarios, Bernoulli HP
+emissions, and recorded ventilation by default. These can be changed with
+`--emulator-num-scenarios`, `--emulator-hp-scenario-mode`, and
+`--emulator-ventilation-rollout-mode`. Generated scoring files are stored in
+`emulator_scoring/`. Supplying explicit `f=PATH` and
+`regression_based=PATH` CSVs skips this potentially expensive rollout.
+Repeat `--additional-emulator-artifact NAME=PATH` to include other trained
+closed-loop models. Each additional model is rolled out once and appears as a
+separate method in the predictions, metrics, scatter dashboard, and paired
+LightGBM comparison. The command rejects artifacts with a different test split
+or power-area normalization.
 
 ## Compare
 
@@ -284,6 +355,52 @@ dashboards.
 This writes one `model_comparison.csv`. Compare models within the same task;
 the Q-to-T and closed-loop problems expose different information and are not a
 fair head-to-head measure of the same predictive problem.
+
+### Fair structured-versus-LSTM comparison
+
+The frozen comparison recipe is
+[`configs/fair_structured_vs_probabilistic_lstm.json`](configs/fair_structured_vs_probabilistic_lstm.json).
+It evaluates four arms: deterministic structured, deterministic vanilla LSTM,
+probabilistic structured, and probabilistic vanilla LSTM. The probabilistic structured
+arm reproduces the best setup immediately before the experimental Markov
+`Qroom` gate: continuous `Qroom`, asymmetric-Markov `Pel`, setpoint-shock
+traces, positive-leaky thermal response, 24 training particles, and the same
+energy/variogram/soft-Best-of-K and HP-emission losses. Every arm receives the
+same inputs, metadata, split, windows, target normalization, optimizer budget,
+and annual scoring protocol. The vanilla arms predict all outputs through an
+unconstrained linear readout and receive no HP-specific engineered features or
+losses. Deterministic models are checkpointed using joint
+normalized `Tin/Qroom/Pel` error over every test window.
+
+Reuse the already trained probabilistic structured model and train the other
+three arms:
+
+```bash
+caffeinate .venv/bin/python -m neural_building_emulator_refactor.fair_probabilistic_lstm_comparison \
+  --structured-artifact-dir output/neural_building_emulator_refactor/setpoint_shock_independent_new_dataset_markov/artifacts/closed_loop_hp_contracting_probabilistic/selected \
+  --output-dir output/neural_building_emulator_refactor/fair_structured_vs_probabilistic_lstm
+```
+
+Omit `--structured-artifact-dir` to retrain all four arms. Each arm also has a
+specific `--*-artifact-dir` option for resuming a partial comparison. The runner
+refuses both mismatched model types and artifacts with different ordered test
+splits, then evaluates complete
+autonomous annual rollouts. Probabilistic arms use 100 linked scenarios;
+deterministic arms contribute point predictions and deterministic flexibility
+metrics. The comparison table includes annual `Tin/Qroom/Pel` RMSE and bias,
+plus upward/downward regression and direct-ratio `F_H` RMSE. Both flexibility
+estimators are computed from the same trajectories. Outputs include per-arm
+traces, `model_comparison.csv`, `flexibility_coverage_comparison.csv`,
+`temporal_trace_calibration_comparison.csv`, and
+`fair_comparison_dashboard.html`.
+Probabilistic arms additionally report HP start/stay-on reliability, active-run
+duration distributions, mode autocorrelation, annual-electric-energy rank
+calibration, and Pel rank calibration conditioned on setpoint-shock age and
+direction, previous observed HP mode, and thermostat deficit. These are shown
+in `pel_dynamics_comparison.html` and summarized in `model_comparison.csv`.
+Recorded ventilation is used throughout so all models receive exactly the same
+exogenous trajectory; no architecture-specific EnergyPlus ventilation feedback
+is used.
 
 ## Fast Ablation KPIs
 
@@ -407,7 +524,77 @@ directory. The large stride intentionally gives one 96-step window per
 building: all 100 selected buildings participate while the purpose remains
 behavioral parity rather than model-quality benchmarking.
 
+## Force-Off Policy Transfer
+
+Closed-loop models can also be trained jointly on thermostat-identification and
+force-off policies:
+
+```bash
+.venv/bin/python -m neural_building_emulator_refactor.train \
+  --model closed_loop_hp_contracting_probabilistic \
+  --dataset data/control=setpoint_identification_dhw_fixed \
+  --additional-dataset data/control=force_off \
+  --output-dir output/neural_building_emulator_refactor/mixed_policy
+```
+
+`--additional-dataset` may be repeated. The split remains building-level: every
+policy trajectory for an EGID is assigned to the same train or test side. If a
+source contains `hp_force_off_requested`, that signal is included in the saved
+input schema and is zero-filled for sources that omit it.
+
+For structured models, force-off is a causal generation gate:
+`Pel_SH = (1 - force_off) * Pel_SH_unrestricted`. The signal is hidden from the
+learned HP-demand and thermal networks, and it does not directly suppress
+`Qreq`, buffer discharge, `Qroom`, or temperature. For deterministic and
+probabilistic LSTM models it is passed as an ordinary exogenous input, allowing
+the unstructured baseline to learn its own response.
+
+### Optional Hydronic Delivery Innovation
+
+For the probabilistic contracting model, `--prob-hydronic-innovation` adds a
+per-step, zero-mean innovation to the latent room-heat request before the
+buffer draw. Its learned scale is bounded by
+`--prob-hydronic-innovation-cap-w-m2` (default `20 W/m2`) and shares the
+existing process-noise scale parameter. A positive-leaky delivery-request
+state with fixed `--prob-hydronic-innovation-time-constant-hours` (default
+`0.5 h`) represents hydronic transport. The actual delivery remains
+nonnegative and energy-limited:
+
+`Qroom_t = buffer_draw(E_t, COP_t * Pel_t, max(Qrequest_t + epsilon_Q,t, 0))`.
+
+Consequently, the innovation can express unobserved hydronic timing and
+delivery variation, but cannot discharge an empty buffer or create energy.
+The option is disabled by default and does not change older artifacts.
+
+Evaluate a probabilistic contracting model trained under thermostat excitation
+on the out-of-policy HP force-off simulations with:
+
+```bash
+.venv/bin/python -m neural_building_emulator_refactor.force_off_policy_evaluation \
+  --artifact-dir output/my_run/artifacts/closed_loop_hp_contracting_probabilistic/selected \
+  --dataset data/control=force_off \
+  --output-dir output/my_run/force_off_policy \
+  --profile-source test \
+  --num-eval-particles 16 \
+  --ventilation-rollout-mode eplus_rule
+```
+
+The intervention is applied at the HP generation boundary: forced-off steps
+set predicted `Pel_SH` to zero before the buffer update, while room-heat demand
+and downstream thermal states remain active. The report compares this causal
+rollout with the same structured model ignoring the policy and writes annual
+profiles, force-off onset responses, and metrics split between forced-off and
+unrestricted periods. `--unstructured-artifact-dir` optionally adds an LSTM
+artifact as an OOD baseline. Older LSTM artifacts do not receive the command;
+mixed-policy artifacts whose saved schema contains `hp_force_off_requested` do.
+
 ## Migration Boundary
+
+The complete structured-versus-vanilla, deterministic-versus-probabilistic,
+LightGBM, and held-out calibration protocol is documented in
+[CALIBRATED_MODEL_BENCHMARK.md](CALIBRATED_MODEL_BENCHMARK.md). It provides one
+resumable command and one consolidated HTML report while preserving all raw
+per-building and reliability tables.
 
 The six state-space registry entries deliberately delegate training and
 sampling to `neural_building_emulator`. This avoids silently changing equations

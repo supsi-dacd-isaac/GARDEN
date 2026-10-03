@@ -1,0 +1,15 @@
+{
+  "thermal_matrix_mode": [
+    "fixed"
+  ],
+  "stability_weight": [
+    1.0,
+    10.0
+  ],
+  "temperature_update_mode": [
+    "leaky_equilibrium"
+  ],
+  "process_noise_mode": [
+    "none"
+  ]
+}

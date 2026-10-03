@@ -12,6 +12,12 @@ Carry = TypeVar("Carry")
 DEFAULT_BPTT_TRUNCATE_STEPS = 16
 
 
+def scale_gradient(value: jnp.ndarray, scale: float) -> jnp.ndarray:
+    """Preserve ``value`` while scaling its reverse-mode derivative."""
+    detached = jax.lax.stop_gradient(value)
+    return detached + jnp.asarray(scale, dtype=value.dtype) * (value - detached)
+
+
 def validate_bptt_truncate_steps(truncate_steps: int) -> int:
     if int(truncate_steps) != truncate_steps:
         raise ValueError("bptt_truncate_steps must be an integer")

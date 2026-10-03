@@ -38,6 +38,7 @@ from .columns import (
     HEATING_INPUT_COLUMNS,
     HPPowerAreaNormalization,
     HP_MODE_IS_DHW_COLUMN,
+    HP_FORCE_OFF_REQUESTED_COLUMN,
     HP_SIZE_BINDING_COLUMN,
     INTERNAL_GAIN_COLUMN,
     InputFeatureMode,
@@ -50,6 +51,7 @@ from .columns import (
     TARGET_COLUMN,
     ZONE_THERMAL_HEATING_POWER_COLUMN,
     closed_loop_required_columns,
+    closed_loop_input_columns,
     input_columns,
     normalize_heating_mode,
     required_columns,
@@ -73,6 +75,7 @@ WindowTargetAlignment = Literal["same_time", "next_step"]
 @dataclass(frozen=True)
 class SplitConfig:
     dataset_path: Path = field(default_factory=lambda: DEFAULT_DATASET_PATH)
+    additional_dataset_paths: tuple[Path, ...] = ()
     max_profiles: int | None = 10
     test_fraction: float = 0.2
     seed: int = 13
@@ -170,10 +173,16 @@ class ClosedLoopWindowedArrays:
 
 
 LEGACY_ZERO_FORCING_COLUMNS = frozenset(
-    (INTERNAL_GAIN_COLUMN, OCCUPANTS_PRESENT_COLUMN, DHW_MIXED_WATER_COLUMN)
+    (
+        INTERNAL_GAIN_COLUMN,
+        OCCUPANTS_PRESENT_COLUMN,
+        DHW_MIXED_WATER_COLUMN,
+        HP_FORCE_OFF_REQUESTED_COLUMN,
+    )
 )
 LEGACY_SYNTHESIZED_COLUMNS = frozenset((SPACE_HEATING_AVAILABILITY_COLUMN,))
 LEGACY_OPTIONAL_COLUMNS = LEGACY_ZERO_FORCING_COLUMNS | LEGACY_SYNTHESIZED_COLUMNS
+POLICY_TRAJECTORY_COLUMN = "__policy_trajectory"
 
 
 def _profile_ids_from_filters(filters) -> tuple[int, ...] | None:
@@ -281,6 +290,16 @@ def read_parquet_columns(path: Path) -> tuple[str, ...]:
         return read_entity_dataset_columns(path)
     files = _parquet_files(path)
     return tuple(pq.read_schema(files[0]).names)
+
+
+def dataset_physically_has_column(path: Path, column: str) -> bool:
+    """Check the stored schema without counting adapter-synthesized columns."""
+    path = Path(path)
+    if is_entity_profile_dataset(path):
+        files = sorted(path.glob("egid=*/timeseries.parquet"))
+        return bool(files) and column in pq.read_schema(files[0]).names
+    files = _parquet_files(path)
+    return column in pq.read_schema(files[0]).names
 
 
 def read_profile_ids(dataset_path: Path, profile_id_column: str = PROFILE_ID_COLUMN) -> tuple[int, ...]:
@@ -470,12 +489,21 @@ def _check_required_columns(
 def load_closed_loop_result_splits(config: SplitConfig) -> ClosedLoopDatasetSplits:
     """Load the profile split required by the closed-loop HP emulator."""
     dataset_path = Path(config.dataset_path)
-    columns = closed_loop_required_columns(CLOSED_LOOP_METADATA_COLUMNS)
-    _check_required_columns(
-        dataset_path,
-        columns,
-        context="--model-kind closed_loop_hp",
+    dataset_paths = (dataset_path, *(Path(path) for path in config.additional_dataset_paths))
+    include_hp_force_off = any(
+        dataset_physically_has_column(path, HP_FORCE_OFF_REQUESTED_COLUMN)
+        for path in dataset_paths
     )
+    columns = closed_loop_required_columns(
+        CLOSED_LOOP_METADATA_COLUMNS,
+        include_hp_force_off=include_hp_force_off,
+    )
+    for path in dataset_paths:
+        _check_required_columns(
+            path,
+            columns,
+            context="--model-kind closed_loop_hp",
+        )
 
     hp_filter_columns = [config.profile_id_column, "hp_ref_capacity_W", HP_SIZE_BINDING_COLUMN]
     hp_filter_df = _read_parquet(dataset_path, columns=hp_filter_columns)
@@ -522,16 +550,34 @@ def load_closed_loop_result_splits(config: SplitConfig) -> ClosedLoopDatasetSpli
         excluded_profile_ids=config.excluded_profile_ids,
     )
 
-    filters = [(config.profile_id_column, "in", list(selected_ids))]
-    try:
-        df = _read_parquet(dataset_path, columns=columns, filters=filters)
-    except (ValueError, NotImplementedError):
-        df = _read_parquet(dataset_path, columns=columns)
-        df = df[df[config.profile_id_column].isin(selected_ids)]
-
-    df = df[df[config.profile_id_column].isin(selected_ids)].copy()
+    policy_frames: list[pd.DataFrame] = []
+    for policy_index, path in enumerate(dataset_paths):
+        available_policy_ids = set(read_profile_ids(path, config.profile_id_column))
+        policy_ids = tuple(
+            profile_id for profile_id in selected_ids if profile_id in available_policy_ids
+        )
+        if not policy_ids:
+            continue
+        filters = [(config.profile_id_column, "in", list(policy_ids))]
+        try:
+            policy_frame = _read_parquet(path, columns=columns, filters=filters)
+        except (ValueError, NotImplementedError):
+            policy_frame = _read_parquet(path, columns=columns)
+            policy_frame = policy_frame[
+                policy_frame[config.profile_id_column].isin(policy_ids)
+            ]
+        policy_frame = policy_frame[
+            policy_frame[config.profile_id_column].isin(policy_ids)
+        ].copy()
+        policy_frame[POLICY_TRAJECTORY_COLUMN] = np.int32(policy_index)
+        policy_frames.append(policy_frame)
+    if not policy_frames:
+        raise ValueError("No selected closed-loop profiles were found in the policy datasets")
+    df = pd.concat(policy_frames, ignore_index=True)
     df[config.profile_id_column] = df[config.profile_id_column].astype(int)
-    df = df.sort_values([config.profile_id_column, DATETIME_COLUMN]).reset_index(drop=True)
+    df = df.sort_values(
+        [config.profile_id_column, POLICY_TRAJECTORY_COLUMN, DATETIME_COLUMN]
+    ).reset_index(drop=True)
 
     train = df[df[config.profile_id_column].isin(train_ids)].reset_index(drop=True)
     test = df[df[config.profile_id_column].isin(test_ids)].reset_index(drop=True)
@@ -546,7 +592,9 @@ def load_closed_loop_result_splits(config: SplitConfig) -> ClosedLoopDatasetSpli
         dropped_ids=dropped_ids,
         dropped_non_hp_ids=dropped_non_hp_ids,
         dropped_non_sh_hp_ids=dropped_non_sh_hp_ids,
-        input_columns=tuple(CLOSED_LOOP_INPUT_COLUMNS),
+        input_columns=tuple(
+            closed_loop_input_columns(include_hp_force_off=include_hp_force_off)
+        ),
         target_columns=tuple(CLOSED_LOOP_TARGET_COLUMNS),
         metadata_columns=tuple(CLOSED_LOOP_METADATA_COLUMNS),
         hp_power_area_normalization=config.hp_power_area_normalization,
@@ -693,6 +741,7 @@ def to_closed_loop_profiles(
     include_space_heating_availability: bool = True,
     include_internal_gains: bool = True,
     include_dhw_request: bool = True,
+    include_hp_force_off: bool = False,
     hp_power_area_normalization: HPPowerAreaNormalization = "building_heated_area",
     metadata_columns: Sequence[str] | None = None,
 ) -> list[ClosedLoopProfile]:
@@ -707,7 +756,12 @@ def to_closed_loop_profiles(
         METADATA_COLUMNS if metadata_columns is None else metadata_columns
     )
     profiles: list[ClosedLoopProfile] = []
-    for profile_id, group in df.groupby(PROFILE_ID_COLUMN, sort=True):
+    group_columns = [PROFILE_ID_COLUMN]
+    if POLICY_TRAJECTORY_COLUMN in df:
+        group_columns.append(POLICY_TRAJECTORY_COLUMN)
+    grouped = df.groupby(group_columns, sort=True)
+    for profile_key, group in grouped:
+        profile_id = profile_key[0] if isinstance(profile_key, tuple) else profile_key
         group = group.sort_values(DATETIME_COLUMN).reset_index(drop=True)
         if len(group) < 2:
             continue
@@ -814,6 +868,20 @@ def to_closed_loop_profiles(
             else:
                 dhw_l = np.zeros(len(group), dtype=np.float32)
             dhw_request = dhw_l / np.float32(timestep_hours * heated_area)
+        if include_hp_force_off:
+            force_off = group.loc[:, HP_FORCE_OFF_REQUESTED_COLUMN].to_numpy(
+                dtype=np.float32
+            )
+            if not bool(np.all(np.isfinite(force_off))):
+                raise ValueError(
+                    f"Profile {profile_id} has non-finite "
+                    f"{HP_FORCE_OFF_REQUESTED_COLUMN!r} values"
+                )
+            if bool(np.any((force_off < 0.0) | (force_off > 1.0))):
+                raise ValueError(
+                    f"Profile {profile_id} has {HP_FORCE_OFF_REQUESTED_COLUMN!r} "
+                    "values outside [0, 1]"
+                )
 
         q_room = group.loc[:, ZONE_THERMAL_HEATING_POWER_COLUMN].to_numpy(dtype=np.float32)
         p_el = group.loc[:, HEAT_PUMP_ELECTRIC_POWER_COLUMN].to_numpy(dtype=np.float32)
@@ -839,6 +907,8 @@ def to_closed_loop_profiles(
         input_parts: list[np.ndarray] = [setpoint, disturbances]
         if include_dhw_request:
             input_parts.append(dhw_request)
+        if include_hp_force_off:
+            input_parts.append(force_off)
         if include_space_heating_availability:
             input_parts.append(availability)
         input_parts.append(calendar)

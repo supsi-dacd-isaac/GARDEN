@@ -1118,7 +1118,7 @@ def _write_coverage_html(path: Path, coverage_df: pd.DataFrame, *, title: str) -
 
 
 class TemporalTraceCalibrationAccumulator:
-    """Online tie-aware ensemble-rank calibration for Tin, Qroom, and Pel."""
+    """Online calibration, sharpness, and CRPS for closed-loop trace ensembles."""
 
     signal_names = ("Tin", "Qroom", "Pel_SH")
     signal_units = ("degC", "W/m2", "W/m2")
@@ -1127,6 +1127,12 @@ class TemporalTraceCalibrationAccumulator:
         "space-heating available",
         "space-heating available",
     )
+    # Qroom and Pel have a physical point mass at zero. Scaling and inverse
+    # scaling can reconstruct a sampled zero as a tiny positive float, so
+    # canonicalize the same threshold used by the on/off diagnostics before
+    # computing exact, tie-aware ranks.
+    zero_atom_thresholds = (0.0, 0.05, 0.05)
+    central_interval_levels = (0.50, 0.80, 0.90, 0.95)
 
     def __init__(
         self,
@@ -1142,6 +1148,10 @@ class TemporalTraceCalibrationAccumulator:
         self.histogram_edges = np.linspace(0.0, 1.0, histogram_bins + 1)
         self.cdf_sums = np.zeros((len(quantiles), 3), dtype=np.float64)
         self.histogram_sums = np.zeros((histogram_bins, 3), dtype=np.float64)
+        self.crps_sums = np.zeros(3, dtype=np.float64)
+        self.interval_width_sums = np.zeros(
+            (len(self.central_interval_levels), 3), dtype=np.float64
+        )
         self.observation_counts = np.zeros(3, dtype=np.int64)
         self.profile_count = 0
         self.min_scenarios: int | None = None
@@ -1189,6 +1199,34 @@ class TemporalTraceCalibrationAccumulator:
                 continue
             observed = truth[valid, channel]
             samples = channel_scenarios[:, valid]
+            zero_threshold = self.zero_atom_thresholds[channel]
+            if zero_threshold > 0.0:
+                observed = np.where(np.abs(observed) <= zero_threshold, 0.0, observed)
+                samples = np.where(np.abs(samples) <= zero_threshold, 0.0, samples)
+
+            # Exact empirical CRPS, evaluated independently at each timestamp:
+            # E|X-y| - 1/2 E|X-X'|. Sorting makes the pairwise component O(K log K).
+            ordered = np.sort(samples, axis=0)
+            coefficients = (
+                2.0 * np.arange(1, scenario_count + 1, dtype=np.float64)
+                - float(scenario_count)
+                - 1.0
+            )
+            half_pairwise = np.sum(
+                coefficients[:, np.newaxis] * ordered,
+                axis=0,
+            ) / float(scenario_count * scenario_count)
+            crps = np.mean(np.abs(samples - observed[np.newaxis, :]), axis=0) - half_pairwise
+            self.crps_sums[channel] += float(np.sum(crps))
+            for level_index, level in enumerate(self.central_interval_levels):
+                lower_quantile = 0.5 * (1.0 - level)
+                upper_quantile = 1.0 - lower_quantile
+                widths = np.quantile(samples, upper_quantile, axis=0) - np.quantile(
+                    samples,
+                    lower_quantile,
+                    axis=0,
+                )
+                self.interval_width_sums[level_index, channel] += float(np.sum(widths))
             less = np.sum(samples < observed[np.newaxis, :], axis=0)
             equal = np.sum(samples == observed[np.newaxis, :], axis=0)
 
@@ -1219,6 +1257,31 @@ class TemporalTraceCalibrationAccumulator:
                 overlap / width[np.newaxis, :], axis=1
             )
             self.observation_counts[channel] += int(np.sum(valid))
+
+    def probabilistic_score_rows(self) -> list[dict[str, Any]]:
+        """Return proper-score and sharpness summaries without retaining traces."""
+        rows: list[dict[str, Any]] = []
+        for channel, signal in enumerate(self.signal_names):
+            count = int(self.observation_counts[channel])
+            if count == 0:
+                continue
+            row: dict[str, Any] = {
+                "signal": signal,
+                "unit": self.signal_units[channel],
+                "scope": self.signal_scopes[channel],
+                "mean_crps": float(self.crps_sums[channel] / float(count)),
+                "observation_count": count,
+                "profile_count": int(self.profile_count),
+                "min_scenarios_per_profile": int(self.min_scenarios or 0),
+                "max_scenarios_per_profile": int(self.max_scenarios),
+                "method": "empirical_ensemble_crps",
+            }
+            for level_index, level in enumerate(self.central_interval_levels):
+                row[f"mean_central_{int(level * 100)}_width"] = float(
+                    self.interval_width_sums[level_index, channel] / float(count)
+                )
+            rows.append(row)
+        return rows
 
     def reliability_rows(self) -> list[dict[str, Any]]:
         rows: list[dict[str, Any]] = []

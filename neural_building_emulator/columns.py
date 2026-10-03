@@ -14,6 +14,8 @@ PROFILE_ID_COLUMN = "egid"
 TARGET_COLUMN = "FL0_THZ0, Zone Air Temperature"
 SETPOINT_TIMESERIES_COLUMN = "FL0_THZ0, Zone Thermostat Heating Setpoint Temperature"
 SPACE_HEATING_AVAILABILITY_COLUMN = "space_heating_available"
+HP_FORCE_OFF_REQUESTED_COLUMN = "hp_force_off_requested"
+HP_FORCE_OFF_EFFECTIVE_COLUMN = "hp_force_off_effective"
 HP_MODE_IS_DHW_COLUMN = "hp_mode_is_dhw"
 DHW_MIXED_WATER_COLUMN = "input_dhw_mixed_water_l"
 HP_SIZE_BINDING_COLUMN = "hp_size_binding"
@@ -74,6 +76,15 @@ CLOSED_LOOP_INPUT_COLUMNS = [
     SPACE_HEATING_AVAILABILITY_COLUMN,
     *CLOSED_LOOP_CALENDAR_COLUMNS,
 ]
+
+
+def closed_loop_input_columns(*, include_hp_force_off: bool = False) -> list[str]:
+    """Return the closed-loop input schema for a particular dataset mix."""
+    columns = list(CLOSED_LOOP_INPUT_COLUMNS)
+    if include_hp_force_off:
+        availability_index = columns.index(SPACE_HEATING_AVAILABILITY_COLUMN)
+        columns.insert(availability_index, HP_FORCE_OFF_REQUESTED_COLUMN)
+    return columns
 
 CLOSED_LOOP_TARGET_COLUMNS = [
     "indoor_temperature_c",
@@ -215,6 +226,7 @@ def closed_loop_required_columns(
     *,
     include_internal_gains: bool = True,
     include_dhw_request: bool = True,
+    include_hp_force_off: bool = False,
 ) -> list[str]:
     """Return the parquet columns needed by the closed-loop HP emulator."""
     resolved_metadata = METADATA_COLUMNS if metadata_columns is None else metadata_columns
@@ -232,6 +244,7 @@ def closed_loop_required_columns(
             else DISTURBANCE_COLUMNS[:3]
         ),
         *([DHW_MIXED_WATER_COLUMN] if include_dhw_request else ()),
+        *([HP_FORCE_OFF_REQUESTED_COLUMN] if include_hp_force_off else ()),
         ZONE_THERMAL_HEATING_POWER_COLUMN,
         HEAT_PUMP_ELECTRIC_POWER_COLUMN,
         HP_MODE_IS_DHW_COLUMN,
