@@ -92,6 +92,14 @@ CLOSED_LOOP_TARGET_COLUMNS = [
     "heat_pump_electric_power_sh_w_m2",
 ]
 
+SH_STORAGE_CHARGE_COLUMN = "thermal_storage_charge_sh_kw"
+BUILDING_THERMAL_HEATING_POWER_COLUMN = "building_thermal_heating_power_w"
+PLANT_TARGET_SOURCE_COLUMNS = [SH_STORAGE_CHARGE_COLUMN, BUILDING_THERMAL_HEATING_POWER_COLUMN]
+DHW_VOLUME_PER_HEATED_AREA_COLUMN = "dhw_volume_m3_per_m2_heated_area"
+DHW_RECOVERY_PER_HEATED_AREA_COLUMN = "dhw_recovery_w_per_m2_heated_area"
+SH_DESIGN_SUPPLY_COLUMN = "sh_design_supply_c"
+PLANT_METADATA_COLUMNS = [DHW_VOLUME_PER_HEATED_AREA_COLUMN, DHW_RECOVERY_PER_HEATED_AREA_COLUMN, SH_DESIGN_SUPPLY_COLUMN]
+
 METADATA_COLUMNS = [
     "buildingType",
     "totalFloors",
@@ -251,4 +259,6 @@ def closed_loop_required_columns(
         SPACE_HEATING_AVAILABILITY_COLUMN,
         *METADATA_COLUMNS,
         *(CLOSED_LOOP_HP_METADATA_SOURCE_COLUMNS if requires_hp_metadata else ()),
+        *(["dhwVolume_m3", "DHW_recovery_W", SH_DESIGN_SUPPLY_COLUMN]
+          if any(column in PLANT_METADATA_COLUMNS for column in resolved_metadata) else ()),
     ]

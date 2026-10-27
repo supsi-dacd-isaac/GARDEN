@@ -18,6 +18,9 @@ import pandas as pd
 import pyarrow.parquet as pq
 
 from .columns import (
+    BUILDING_THERMAL_HEATING_POWER_COLUMN,
+    SH_STORAGE_CHARGE_COLUMN,
+    SH_DESIGN_SUPPLY_COLUMN,
     DATETIME_COLUMN,
     DHW_MIXED_WATER_COLUMN,
     HEAT_PUMP_ELECTRIC_POWER_COLUMN,
@@ -51,6 +54,8 @@ HP_EFFECTIVE_MODE_COLUMN = "hp_effective_mode"
 
 # canonical column -> (preferred entity, source column)
 _DYNAMIC_SOURCES: dict[str, tuple[str, str]] = {
+    SH_STORAGE_CHARGE_COLUMN: (TECHNICAL_ROOM_ENTITY, SH_STORAGE_CHARGE_COLUMN),
+    BUILDING_THERMAL_HEATING_POWER_COLUMN: ("*", ZONE_THERMAL_HEATING_POWER_COLUMN),
     TARGET_COLUMN: (MODELED_ZONE, "Zone Air Temperature"),
     SETPOINT_TIMESERIES_COLUMN: (
         MODELED_ZONE,
@@ -145,6 +150,10 @@ def _metadata_values(profile_dir: Path) -> dict[str, object]:
         ) from exc
     if not isinstance(values, dict):
         raise ValueError(f"{metadata_path} gardenCompatibility.values must be an object")
+    values = dict(values)
+    supply = metadata.get("sizing", {}).get("sh_supply_C")
+    if supply is not None:
+        values[SH_DESIGN_SUPPLY_COLUMN] = float(supply)
     return values
 
 
@@ -234,6 +243,24 @@ def _read_dynamic_profile(
                 f"{parquet_path} has no source column {source_column!r} for "
                 f"{canonical_column!r}"
             )
+        if canonical_column == BUILDING_THERMAL_HEATING_POWER_COLUMN:
+            values = raw.loc[raw["zone"].str.match(r"^fl\d+_thz\d+$"),
+                             [DATETIME_COLUMN, "zone", source_column]]
+            if values.empty or values.duplicated([DATETIME_COLUMN, "zone"]).any():
+                raise ValueError(f"Invalid whole-building zone heat rows in {parquet_path}")
+            floors = values["zone"].str.extract(r"^fl(\d+)_", expand=False).astype(int).unique()
+            expected_floors = int(_metadata_values(profile_dir)["totalFloors"])
+            if set(floors) != set(range(expected_floors)):
+                raise ValueError(f"Missing or unexpected heated floors in {parquet_path}")
+            counts = values.groupby(DATETIME_COLUMN)[source_column].count()
+            expected = values["zone"].nunique()
+            if not bool((counts == expected).all()):
+                raise ValueError(f"Incomplete zone heat observations in {parquet_path}")
+            series = values.groupby(DATETIME_COLUMN)[source_column].sum(min_count=expected).reindex(timestamp_index)
+            if series.isna().any():
+                raise ValueError(f"Unaligned whole-building heat in {parquet_path}")
+            frame[canonical_column] = series.to_numpy()
+            continue
         if canonical_column == DHW_MIXED_WATER_COLUMN:
             values = raw.loc[
                 raw["zone"].ne(BUILDING_ENTITY)

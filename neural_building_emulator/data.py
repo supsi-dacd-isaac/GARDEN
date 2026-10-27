@@ -17,6 +17,12 @@ import pandas as pd
 import pyarrow.parquet as pq
 
 from .columns import (
+    BUILDING_THERMAL_HEATING_POWER_COLUMN,
+    SH_STORAGE_CHARGE_COLUMN,
+    PLANT_TARGET_SOURCE_COLUMNS,
+    PLANT_METADATA_COLUMNS,
+    DHW_VOLUME_PER_HEATED_AREA_COLUMN,
+    DHW_RECOVERY_PER_HEATED_AREA_COLUMN,
     CLOSED_LOOP_METADATA_COLUMNS,
     CLOSED_LOOP_INPUT_COLUMNS,
     CLOSED_LOOP_TARGET_COLUMNS,
@@ -87,6 +93,8 @@ class SplitConfig:
     hp_power_area_normalization: HPPowerAreaNormalization = "building_heated_area"
     input_feature_mode: InputFeatureMode = "base"
     heating_regime_window_steps: int = 96 * 7
+    include_plant_targets: bool = False
+    include_plant_metadata: bool = False
 
 
 @dataclass(frozen=True)
@@ -160,6 +168,7 @@ class ClosedLoopProfile:
     inputs: np.ndarray
     targets: np.ndarray
     initial_temperature: np.ndarray
+    plant_targets: np.ndarray | None = None
 
 
 @dataclass(frozen=True)
@@ -170,6 +179,7 @@ class ClosedLoopWindowedArrays:
     inputs: np.ndarray
     targets: np.ndarray
     initial_temperature: np.ndarray
+    plant_targets: np.ndarray | None = None
 
 
 LEGACY_ZERO_FORCING_COLUMNS = frozenset(
@@ -494,10 +504,15 @@ def load_closed_loop_result_splits(config: SplitConfig) -> ClosedLoopDatasetSpli
         dataset_physically_has_column(path, HP_FORCE_OFF_REQUESTED_COLUMN)
         for path in dataset_paths
     )
+    metadata_columns = [*CLOSED_LOOP_METADATA_COLUMNS, *(PLANT_METADATA_COLUMNS if config.include_plant_metadata else ())]
     columns = closed_loop_required_columns(
-        CLOSED_LOOP_METADATA_COLUMNS,
+        metadata_columns,
         include_hp_force_off=include_hp_force_off,
     )
+    if config.include_plant_targets:
+        if config.hp_power_area_normalization != "building_heated_area":
+            raise ValueError("Plant supervision requires whole-building HP power normalization")
+        columns.extend(PLANT_TARGET_SOURCE_COLUMNS)
     for path in dataset_paths:
         _check_required_columns(
             path,
@@ -596,7 +611,7 @@ def load_closed_loop_result_splits(config: SplitConfig) -> ClosedLoopDatasetSpli
             closed_loop_input_columns(include_hp_force_off=include_hp_force_off)
         ),
         target_columns=tuple(CLOSED_LOOP_TARGET_COLUMNS),
-        metadata_columns=tuple(CLOSED_LOOP_METADATA_COLUMNS),
+        metadata_columns=tuple(metadata_columns),
         hp_power_area_normalization=config.hp_power_area_normalization,
     )
 
@@ -819,6 +834,10 @@ def to_closed_loop_profiles(
                     )
                 },
             }
+        if DHW_VOLUME_PER_HEATED_AREA_COLUMN in metadata_columns:
+            derived_metadata[DHW_VOLUME_PER_HEATED_AREA_COLUMN] = float(row["dhwVolume_m3"]) / heated_area
+        if DHW_RECOVERY_PER_HEATED_AREA_COLUMN in metadata_columns:
+            derived_metadata[DHW_RECOVERY_PER_HEATED_AREA_COLUMN] = float(row["DHW_recovery_W"]) / heated_area
         metadata_values = [
             derived_metadata[column] if column in derived_metadata else row[column]
             for column in metadata_columns
@@ -886,6 +905,8 @@ def to_closed_loop_profiles(
         q_room = group.loc[:, ZONE_THERMAL_HEATING_POWER_COLUMN].to_numpy(dtype=np.float32)
         p_el = group.loc[:, HEAT_PUMP_ELECTRIC_POWER_COLUMN].to_numpy(dtype=np.float32)
         dhw_mode = group.loc[:, HP_MODE_IS_DHW_COLUMN].to_numpy(dtype=np.float32) > np.float32(0.5)
+        # The mode flag remains latched during forced-off periods in these exports.
+        active_dhw = dhw_mode & (p_el > np.float32(10.0))
         # Availability is a model input/output gate, not a license to rewrite
         # simulator observations. Preserve measured Qroom and remove only the
         # explicitly identified DHW share from whole-HP electric power.
@@ -914,6 +935,17 @@ def to_closed_loop_profiles(
         input_parts.append(calendar)
         inputs = np.column_stack(input_parts).astype(np.float32)
         targets = np.column_stack([temperature[1:], q_room[1:], p_el[1:]]).astype(np.float32)
+        plant_targets = None
+        if any(column in group for column in PLANT_TARGET_SOURCE_COLUMNS):
+            if not all(column in group for column in PLANT_TARGET_SOURCE_COLUMNS):
+                raise ValueError("Plant supervision requires both charging and total room heat")
+            plant_targets = np.column_stack([
+                group[SH_STORAGE_CHARGE_COLUMN].to_numpy() * 1000 / heated_area,
+                group[BUILDING_THERMAL_HEATING_POWER_COLUMN].to_numpy() / heated_area,
+                active_dhw.astype(np.float32),
+            ])[1:].astype(np.float32)
+            if not np.isfinite(plant_targets).all():
+                raise ValueError(f"Nonfinite plant targets for profile {profile_id}")
         profiles.append(
             ClosedLoopProfile(
                 profile_id=int(profile_id),
@@ -922,6 +954,7 @@ def to_closed_loop_profiles(
                 inputs=inputs[1:],
                 targets=targets,
                 initial_temperature=temperature[:-1, np.newaxis].astype(np.float32),
+                plant_targets=plant_targets,
             )
         )
     return profiles
@@ -1087,8 +1120,14 @@ def make_closed_loop_windows(
     inputs: list[np.ndarray] = []
     targets: list[np.ndarray] = []
     initial_temperature: list[np.ndarray] = []
+    plant_targets: list[np.ndarray] = []
+    has_plant_targets: bool | None = None
 
     for profile in profiles:
+        available = profile.plant_targets is not None
+        if has_plant_targets is not None and available != has_plant_targets:
+            raise ValueError("Cannot mix profiles with and without plant supervision")
+        has_plant_targets = available
         n_steps = profile.targets.shape[0]
         last_start = n_steps - config.sequence_length
         if last_start < 0:
@@ -1101,6 +1140,8 @@ def make_closed_loop_windows(
             inputs.append(profile.inputs[start:end])
             targets.append(profile.targets[start:end])
             initial_temperature.append(profile.initial_temperature[start])
+            if profile.plant_targets is not None:
+                plant_targets.append(profile.plant_targets[start:end])
 
     if not inputs:
         raise ValueError("No windows were created; reduce sequence_length or load longer profiles")
@@ -1112,6 +1153,7 @@ def make_closed_loop_windows(
         inputs=np.stack(inputs).astype(np.float32),
         targets=np.stack(targets).astype(np.float32),
         initial_temperature=np.stack(initial_temperature).astype(np.float32),
+        plant_targets=np.stack(plant_targets).astype(np.float32) if plant_targets else None,
     )
 
 

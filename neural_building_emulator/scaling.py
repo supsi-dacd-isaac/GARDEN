@@ -70,6 +70,7 @@ def transform_closed_loop_windows(
         inputs=scalers.inputs.transform(windows.inputs),
         targets=scalers.target.transform(windows.targets),
         initial_temperature=initial_temperature,
+        plant_targets=windows.plant_targets,
     )
 
 
@@ -107,6 +108,7 @@ def transform_closed_loop_profiles(
             initial_temperature=(
                 (profile.initial_temperature - target_mean[:1]) / target_scale[:1]
             ).astype(np.float32),
+            plant_targets=profile.plant_targets,
         )
         for profile in profiles
     ]
