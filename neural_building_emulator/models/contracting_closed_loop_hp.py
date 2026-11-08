@@ -50,6 +50,9 @@ ThermostatDemandMode = Literal[
 ]
 ThermalQResponseMode = Literal["unconstrained", "positive_leaky"]
 ThermalArchitecture = Literal["bounded_mlp", "metadata_fixed_ss"]
+MetadataFixedStateUpdate = Literal["linear", "bounded_tanh"]
+MetadataFixedPoleParameterization = Literal["rho", "time_constant"]
+CausalVentilationModel = Literal["learned_gain", "physical_air_mixing"]
 TransitionConditioningMode = Literal[
     "state_feedback",
     "exogenous",
@@ -77,6 +80,7 @@ class ContractingClosedLoopHPEmulator(eqx.Module):
     output_net: MLP
     temperature_net: MLP
     temperature_alpha_net: MLP | None
+    ventilation_gain_net: MLP | None
     q_response_net: MLP | None
     q_response_init_net: MLP | None
     metadata_fixed_base_parameters: jax.Array
@@ -112,6 +116,8 @@ class ContractingClosedLoopHPEmulator(eqx.Module):
     input_scale: tuple[float, ...] = eqx.field(static=True)
     target_mean: tuple[float, ...] = eqx.field(static=True)
     target_scale: tuple[float, ...] = eqx.field(static=True)
+    metadata_mean: tuple[float, ...] = eqx.field(static=True)
+    metadata_scale: tuple[float, ...] = eqx.field(static=True)
     setpoint_input_index: int = eqx.field(static=True)
     outdoor_input_index: int = eqx.field(static=True)
     solar_input_index: int = eqx.field(static=True)
@@ -134,6 +140,18 @@ class ContractingClosedLoopHPEmulator(eqx.Module):
     q_to_t_gain_min_c_per_w_m2: float = eqx.field(static=True)
     q_to_t_gain_max_c_per_w_m2: float = eqx.field(static=True)
     thermal_architecture: ThermalArchitecture = eqx.field(static=True)
+    metadata_fixed_state_update: MetadataFixedStateUpdate = eqx.field(static=True)
+    metadata_fixed_pole_parameterization: MetadataFixedPoleParameterization = eqx.field(static=True)
+    metadata_fixed_time_constant_min_hours: float = eqx.field(static=True)
+    metadata_fixed_time_constant_max_hours: float = eqx.field(static=True)
+    causal_ventilation: bool = eqx.field(static=True)
+    ventilation_model: CausalVentilationModel = eqx.field(static=True)
+    ventilation_gain_max_per_hour_m3_s: float = eqx.field(static=True)
+    ventilation_delta_max_c: float = eqx.field(static=True)
+    ventilation_capacity_factor_min: float = eqx.field(static=True)
+    ventilation_capacity_factor_max: float = eqx.field(static=True)
+    ventilation_volume_metadata_index: int = eqx.field(static=True)
+    ventilation_capacity_metadata_index: int = eqx.field(static=True)
 
     def __init__(
         self,
@@ -166,6 +184,8 @@ class ContractingClosedLoopHPEmulator(eqx.Module):
         input_scale: tuple[float, ...] = (),
         target_mean: tuple[float, ...] = (),
         target_scale: tuple[float, ...] = (),
+        metadata_mean: tuple[float, ...] = (),
+        metadata_scale: tuple[float, ...] = (),
         availability_input_index: int = -1,
         hp_force_off_input_index: int = -1,
         bptt_truncate_steps: int = DEFAULT_BPTT_TRUNCATE_STEPS,
@@ -188,6 +208,19 @@ class ContractingClosedLoopHPEmulator(eqx.Module):
         q_to_t_gain_min_c_per_w_m2: float = 0.01,
         q_to_t_gain_max_c_per_w_m2: float = 2.0,
         thermal_architecture: ThermalArchitecture = "bounded_mlp",
+        metadata_fixed_state_update: MetadataFixedStateUpdate = "linear",
+        metadata_fixed_pole_parameterization: MetadataFixedPoleParameterization = "rho",
+        metadata_fixed_time_constant_min_hours: float = 0.1,
+        metadata_fixed_time_constant_max_hours: float = 24.0 * 21.0,
+        causal_ventilation: bool = False,
+        ventilation_model: CausalVentilationModel = "learned_gain",
+        ventilation_gain_max_per_hour_m3_s: float = 4.0,
+        ventilation_gain_initial_per_hour_m3_s: float = 1.0,
+        ventilation_delta_max_c: float = 2.0,
+        ventilation_capacity_factor_min: float = 0.25,
+        ventilation_capacity_factor_max: float = 4.0,
+        ventilation_volume_metadata_index: int = -1,
+        ventilation_capacity_metadata_index: int = -1,
         key: jax.Array,
     ) -> None:
         if state_dim < 1:
@@ -277,6 +310,48 @@ class ContractingClosedLoopHPEmulator(eqx.Module):
             raise ValueError(
                 "thermal_architecture must be 'bounded_mlp' or 'metadata_fixed_ss'"
             )
+        if metadata_fixed_state_update not in ("linear", "bounded_tanh"):
+            raise ValueError(
+                "metadata_fixed_state_update must be 'linear' or 'bounded_tanh'"
+            )
+        if metadata_fixed_pole_parameterization not in ("rho", "time_constant"):
+            raise ValueError(
+                "metadata_fixed_pole_parameterization must be 'rho' or 'time_constant'"
+            )
+        if metadata_fixed_time_constant_min_hours <= 0.0:
+            raise ValueError("metadata_fixed_time_constant_min_hours must be positive")
+        if (
+            metadata_fixed_time_constant_max_hours
+            <= metadata_fixed_time_constant_min_hours
+        ):
+            raise ValueError(
+                "metadata-fixed time-constant bounds must satisfy 0 < min < max"
+            )
+        if ventilation_model not in ("learned_gain", "physical_air_mixing"):
+            raise ValueError(
+                "ventilation_model must be 'learned_gain' or 'physical_air_mixing'"
+            )
+        if ventilation_gain_max_per_hour_m3_s <= 0.0:
+            raise ValueError("ventilation gain maximum must be positive")
+        if not 0.0 < ventilation_gain_initial_per_hour_m3_s < ventilation_gain_max_per_hour_m3_s:
+            raise ValueError("initial ventilation gain must lie strictly between zero and its maximum")
+        if ventilation_delta_max_c <= 0.0:
+            raise ValueError("ventilation delta maximum must be positive")
+        if not 0.0 < ventilation_capacity_factor_min < ventilation_capacity_factor_max:
+            raise ValueError("ventilation capacity-factor bounds must satisfy 0 < min < max")
+        if causal_ventilation and ventilation_model == "physical_air_mixing":
+            if len(metadata_mean) != metadata_dim or len(metadata_scale) != metadata_dim:
+                raise ValueError(
+                    "physical_air_mixing requires metadata_mean and metadata_scale"
+                )
+            for index in (
+                ventilation_volume_metadata_index,
+                ventilation_capacity_metadata_index,
+            ):
+                if index < 0 or index >= metadata_dim:
+                    raise ValueError(
+                        "physical_air_mixing requires valid volume and capacity metadata indices"
+                    )
         if thermal_architecture == "metadata_fixed_ss" and q_to_t_mode != "unconstrained":
             raise ValueError(
                 "thermal_architecture='metadata_fixed_ss' requires "
@@ -416,6 +491,9 @@ class ContractingClosedLoopHPEmulator(eqx.Module):
             transition_forcing_encoded_dim,
             contraction_gamma,
             hp_dt_hours,
+            metadata_fixed_pole_parameterization,
+            metadata_fixed_time_constant_min_hours,
+            metadata_fixed_time_constant_max_hours,
         )
         self.x0_net = MLP(
             metadata_dim + 1,
@@ -467,6 +545,36 @@ class ContractingClosedLoopHPEmulator(eqx.Module):
                     self.temperature_alpha_net,
                     jnp.asarray([initial_logit]),
                 )
+        self.ventilation_gain_net = None
+        if causal_ventilation:
+            ventilation_key = jax.random.fold_in(temperature_key, 17)
+            self.ventilation_gain_net = MLP(
+                metadata_dim,
+                1,
+                hidden_dim=hidden_dim,
+                depth=depth,
+                key=ventilation_key,
+            )
+            if ventilation_model == "physical_air_mixing":
+                log_min = math.log(ventilation_capacity_factor_min)
+                log_max = math.log(ventilation_capacity_factor_max)
+                initial_fraction = (0.0 - log_min) / (log_max - log_min)
+            else:
+                initial_fraction = (
+                    ventilation_gain_initial_per_hour_m3_s
+                    / ventilation_gain_max_per_hour_m3_s
+                )
+            initial_logit = math.log(initial_fraction / (1.0 - initial_fraction))
+            self.ventilation_gain_net = eqx.tree_at(
+                lambda net: net.layers[-1].weight,
+                self.ventilation_gain_net,
+                jnp.zeros_like(self.ventilation_gain_net.layers[-1].weight),
+            )
+            self.ventilation_gain_net = eqx.tree_at(
+                lambda net: net.layers[-1].bias,
+                self.ventilation_gain_net,
+                jnp.asarray([initial_logit]),
+            )
         self.q_response_net = None
         self.q_response_init_net = None
         if q_to_t_mode == "positive_leaky":
@@ -519,6 +627,8 @@ class ContractingClosedLoopHPEmulator(eqx.Module):
         self.input_scale = tuple(float(value) for value in input_scale)
         self.target_mean = tuple(float(value) for value in target_mean)
         self.target_scale = tuple(float(value) for value in target_scale)
+        self.metadata_mean = tuple(float(value) for value in metadata_mean)
+        self.metadata_scale = tuple(float(value) for value in metadata_scale)
         self.energy_scale = max(float(target_scale[1]) * 24.0, 1.0)
         self.setpoint_input_index = 0
         self.outdoor_input_index = 1
@@ -542,6 +652,28 @@ class ContractingClosedLoopHPEmulator(eqx.Module):
         self.q_to_t_gain_min_c_per_w_m2 = float(q_to_t_gain_min_c_per_w_m2)
         self.q_to_t_gain_max_c_per_w_m2 = float(q_to_t_gain_max_c_per_w_m2)
         self.thermal_architecture = thermal_architecture
+        self.metadata_fixed_state_update = metadata_fixed_state_update
+        self.metadata_fixed_pole_parameterization = metadata_fixed_pole_parameterization
+        self.metadata_fixed_time_constant_min_hours = float(
+            metadata_fixed_time_constant_min_hours
+        )
+        self.metadata_fixed_time_constant_max_hours = float(
+            metadata_fixed_time_constant_max_hours
+        )
+        self.causal_ventilation = bool(causal_ventilation)
+        self.ventilation_model = ventilation_model
+        self.ventilation_gain_max_per_hour_m3_s = float(
+            ventilation_gain_max_per_hour_m3_s
+        )
+        self.ventilation_delta_max_c = float(ventilation_delta_max_c)
+        self.ventilation_capacity_factor_min = float(ventilation_capacity_factor_min)
+        self.ventilation_capacity_factor_max = float(ventilation_capacity_factor_max)
+        self.ventilation_volume_metadata_index = int(
+            ventilation_volume_metadata_index
+        )
+        self.ventilation_capacity_metadata_index = int(
+            ventilation_capacity_metadata_index
+        )
 
     @staticmethod
     def _metadata_fixed_base(
@@ -549,24 +681,40 @@ class ContractingClosedLoopHPEmulator(eqx.Module):
         encoded_dim: int,
         gamma: float,
         dt_hours: float,
+        pole_parameterization: MetadataFixedPoleParameterization = "rho",
+        time_constant_min_hours: float = 0.1,
+        time_constant_max_hours: float = 24.0 * 21.0,
     ) -> jax.Array:
-        time_constants = jnp.geomspace(1.0, 24.0 * 21.0, state_dim)
-        rho = jnp.minimum(jnp.exp(-dt_hours / time_constants), gamma - 1e-4)
-        fraction = jnp.clip((rho - 0.05) / (gamma - 0.05), 1e-5, 1.0 - 1e-5)
-        rho_raw = jnp.log(fraction) - jnp.log1p(-fraction)
+        if pole_parameterization == "time_constant":
+            fractions = (jnp.arange(state_dim, dtype=jnp.float32) + 0.5) / state_dim
+            pole_raw = jnp.log(fractions) - jnp.log1p(-fractions)
+        else:
+            time_constants = jnp.geomspace(1.0, 24.0 * 21.0, state_dim)
+            rho = jnp.minimum(jnp.exp(-dt_hours / time_constants), gamma - 1e-4)
+            fraction = jnp.clip((rho - 0.05) / (gamma - 0.05), 1e-5, 1.0 - 1e-5)
+            pole_raw = jnp.log(fraction) - jnp.log1p(-fraction)
         b_matrix = jnp.zeros((state_dim * encoded_dim,), dtype=jnp.float32)
         bias = jnp.zeros((state_dim,), dtype=jnp.float32)
         output = jnp.zeros((state_dim,), dtype=jnp.float32).at[0].set(1.0)
         return jnp.concatenate(
-            (rho_raw.astype(jnp.float32), b_matrix, bias, output, jnp.zeros((1,)))
+            (pole_raw.astype(jnp.float32), b_matrix, bias, output, jnp.zeros((1,)))
         )
+
+    def _metadata_fixed_rho(self, pole_raw: jnp.ndarray) -> jnp.ndarray:
+        fraction = jax.nn.sigmoid(pole_raw)
+        if self.metadata_fixed_pole_parameterization == "time_constant":
+            log_min = math.log(self.metadata_fixed_time_constant_min_hours)
+            log_max = math.log(self.metadata_fixed_time_constant_max_hours)
+            time_constants = jnp.exp(log_min + (log_max - log_min) * fraction)
+            return jnp.exp(-self.hp_dt_hours / time_constants)
+        return 0.05 + (self.contraction_gamma - 0.05) * fraction
 
     def metadata_fixed_parameters(
         self, metadata: jnp.ndarray
     ) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
         raw = self.metadata_fixed_base_parameters + self.transition_net(metadata)
         cursor = 0
-        rho_raw = raw[cursor : cursor + self.state_dim]
+        pole_raw = raw[cursor : cursor + self.state_dim]
         cursor += self.state_dim
         matrix_size = self.state_dim * self.transition_forcing_encoded_dim
         b_matrix = raw[cursor : cursor + matrix_size].reshape(
@@ -578,7 +726,7 @@ class ContractingClosedLoopHPEmulator(eqx.Module):
         output = raw[cursor : cursor + self.state_dim]
         cursor += self.state_dim
         output_bias = raw[cursor]
-        rho = 0.05 + (self.contraction_gamma - 0.05) * jax.nn.sigmoid(rho_raw)
+        rho = self._metadata_fixed_rho(pole_raw)
         return (
             rho,
             0.30 * jnp.tanh(b_matrix),
@@ -588,6 +736,8 @@ class ContractingClosedLoopHPEmulator(eqx.Module):
         )
 
     def encode_input(self, input_t: jnp.ndarray) -> jnp.ndarray:
+        if self.causal_ventilation:
+            input_t = input_t.at[self.ventilation_input_index].set(0.0)
         if self.hp_force_off_input_index >= 0:
             input_t = input_t.at[self.hp_force_off_input_index].set(0.0)
         if self.thermostat_demand_mode != "unconstrained":
@@ -848,6 +998,10 @@ class ContractingClosedLoopHPEmulator(eqx.Module):
         temperature_t: jnp.ndarray,
     ) -> jnp.ndarray:
         thermal_inputs = input_t[1:]
+        if self.causal_ventilation and self.ventilation_input_index >= 1:
+            thermal_inputs = thermal_inputs.at[
+                self.ventilation_input_index - 1
+            ].set(0.0)
         if self.hp_force_off_input_index >= 1:
             thermal_inputs = thermal_inputs.at[
                 self.hp_force_off_input_index - 1
@@ -877,6 +1031,88 @@ class ContractingClosedLoopHPEmulator(eqx.Module):
                 jnp.asarray([self._outdoor_gap_scaled(input_t, temperature_t)], dtype=input_t.dtype),
             ],
             axis=0,
+        )
+
+    def apply_causal_ventilation(
+        self,
+        metadata: jnp.ndarray,
+        input_t: jnp.ndarray,
+        previous_temperature_scaled: jnp.ndarray,
+        predicted_temperature_scaled: jnp.ndarray,
+    ) -> jnp.ndarray:
+        """Apply a sign-constrained air-exchange increment to Tin."""
+        if self.ventilation_gain_net is None:
+            return predicted_temperature_scaled
+        raw_gain = self.ventilation_gain_net(metadata)[0]
+        flow_m3_s = jnp.maximum(
+            self._physical_input(input_t, self.ventilation_input_index), 0.0
+        )
+        outdoor_c = self._physical_input(input_t, self.outdoor_input_index)
+        if self.ventilation_model == "physical_air_mixing":
+            volume_m3 = self._physical_metadata(
+                metadata, self.ventilation_volume_metadata_index
+            )
+            base_capacity_multiplier = self._physical_metadata(
+                metadata, self.ventilation_capacity_metadata_index
+            )
+            log_min = jnp.log(
+                jnp.asarray(self.ventilation_capacity_factor_min, dtype=raw_gain.dtype)
+            )
+            log_max = jnp.log(
+                jnp.asarray(self.ventilation_capacity_factor_max, dtype=raw_gain.dtype)
+            )
+            capacity_factor = jnp.exp(
+                log_min + (log_max - log_min) * jax.nn.sigmoid(raw_gain)
+            )
+            effective_capacity_multiplier = jnp.maximum(
+                base_capacity_multiplier * capacity_factor,
+                jnp.asarray(1e-3, dtype=raw_gain.dtype),
+            )
+            air_changes_per_hour = (
+                jnp.asarray(3600.0, dtype=raw_gain.dtype)
+                * flow_m3_s
+                / jnp.maximum(volume_m3, jnp.asarray(1e-3, dtype=raw_gain.dtype))
+            )
+            retention = jnp.exp(
+                -jnp.asarray(self.hp_dt_hours, dtype=raw_gain.dtype)
+                * air_changes_per_hour
+                / effective_capacity_multiplier
+            )
+            predicted_c = self._temperature_physical(predicted_temperature_scaled)
+            mixed_c = outdoor_c + retention * (predicted_c - outdoor_c)
+            return self._target_scaled(mixed_c, self.temperature_target_index)
+        gain = jnp.asarray(
+            self.ventilation_gain_max_per_hour_m3_s, dtype=raw_gain.dtype
+        ) * jax.nn.sigmoid(raw_gain)
+        indoor_c = self._temperature_physical(previous_temperature_scaled)
+        raw_delta_c = (
+            jnp.asarray(self.hp_dt_hours, dtype=raw_gain.dtype)
+            * gain
+            * flow_m3_s
+            * (outdoor_c - indoor_c)
+        )
+        delta_bound = jnp.asarray(self.ventilation_delta_max_c, dtype=raw_gain.dtype)
+        delta_c = delta_bound * jnp.tanh(raw_delta_c / delta_bound)
+        temperature_scale = jnp.maximum(
+            jnp.abs(
+                jnp.asarray(
+                    self.target_scale[self.temperature_target_index],
+                    dtype=raw_gain.dtype,
+                )
+            ),
+            jnp.asarray(1e-6, dtype=raw_gain.dtype),
+        )
+        return predicted_temperature_scaled + delta_c / temperature_scale
+
+    def _physical_metadata(
+        self,
+        metadata: jnp.ndarray,
+        index: int,
+    ) -> jnp.ndarray:
+        return (
+            metadata[index]
+            * jnp.asarray(self.metadata_scale[index], dtype=metadata.dtype)
+            + jnp.asarray(self.metadata_mean[index], dtype=metadata.dtype)
         )
 
     def decode_temperature(
@@ -1119,7 +1355,11 @@ class ContractingClosedLoopHPEmulator(eqx.Module):
                 encoded_forcing = jnp.tanh(
                     self.transition_forcing_encoder(thermal_forcing_t)
                 )
-            return rho * state_t + input_matrix @ encoded_forcing + bias
+            raw_next = rho * state_t + input_matrix @ encoded_forcing + bias
+            if self.metadata_fixed_state_update == "bounded_tanh":
+                bound = jnp.asarray(self.state_bound, dtype=raw_next.dtype)
+                return bound * jnp.tanh(raw_next / bound)
+            return raw_next
         matrix_t, bias_t = self.transition_matrix_and_bias(metadata, thermal_forcing_t)
         return self._apply_state_transition(matrix_t, bias_t, state_t)
 
@@ -1276,6 +1516,12 @@ class ContractingClosedLoopHPEmulator(eqx.Module):
                 alpha,
                 q_response_state_next,
                 metadata,
+            )
+            temperature_next = self.apply_causal_ventilation(
+                metadata,
+                input_t,
+                feedback_temperature_t,
+                temperature_next,
             )
             prediction_t = jnp.stack([temperature_next, qroom_scaled_t, pel_scaled_t])
             return detach_carry(

@@ -95,6 +95,7 @@ CLOSED_LOOP_TARGET_COLUMNS = [
 SH_STORAGE_CHARGE_COLUMN = "thermal_storage_charge_sh_kw"
 BUILDING_THERMAL_HEATING_POWER_COLUMN = "building_thermal_heating_power_w"
 PLANT_TARGET_SOURCE_COLUMNS = [SH_STORAGE_CHARGE_COLUMN, BUILDING_THERMAL_HEATING_POWER_COLUMN]
+TANK_TEMPERATURE_COLUMNS = ["sh_tank_mean_temperature_c", "dhw_tank_mean_temperature_c"]
 DHW_VOLUME_PER_HEATED_AREA_COLUMN = "dhw_volume_m3_per_m2_heated_area"
 DHW_RECOVERY_PER_HEATED_AREA_COLUMN = "dhw_recovery_w_per_m2_heated_area"
 SH_DESIGN_SUPPLY_COLUMN = "sh_design_supply_c"

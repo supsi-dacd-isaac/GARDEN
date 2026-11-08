@@ -5,9 +5,11 @@ from __future__ import annotations
 import equinox as eqx
 import jax
 import jax.numpy as jnp
+from typing import Literal
 
 from neural_building_emulator.models.probabilistic_closed_loop_hp import (
     bounded_lognormal_expm1_mean,
+    hard_bernoulli_expected_gradient,
 )
 from neural_building_emulator.ventilation import EPlusVentilationRollout
 
@@ -307,12 +309,16 @@ class VanillaProbabilisticAutoregressiveLSTM(eqx.Module):
         sample_process_noise: bool,
         hp_scenario_mode: str,
         ventilation_rollout: EPlusVentilationRollout | None = None,
+        persistent_xi: jnp.ndarray | None = None,
     ) -> tuple[jnp.ndarray, tuple[jnp.ndarray, ...]]:
         del hp_scenario_mode
         if num_particles < 1:
             raise ValueError("num_particles must be positive")
         xi_key, process_key = jax.random.split(key)
-        xi = jax.random.normal(xi_key, (num_particles, self.latent_dim))
+        xi = (jax.random.normal(xi_key, (num_particles, self.latent_dim))
+              if persistent_xi is None else persistent_xi)
+        if xi.shape != (num_particles, self.latent_dim):
+            raise ValueError("persistent_xi must have shape (particles, latent_dim)")
         process_noise = jax.random.normal(
             process_key,
             (num_particles, inputs.shape[0], self.hidden_dim),
@@ -330,6 +336,364 @@ class VanillaProbabilisticAutoregressiveLSTM(eqx.Module):
             )
         )(xi, process_noise)
         return predictions, ()
+
+    def sample(
+        self,
+        metadata: jnp.ndarray,
+        inputs: jnp.ndarray,
+        initial_output: jnp.ndarray,
+        *,
+        key: jax.Array,
+        num_particles: int,
+        sample_process_noise: bool = True,
+        hp_scenario_mode: str = "bernoulli",
+        ventilation_rollout: EPlusVentilationRollout | None = None,
+    ) -> jnp.ndarray:
+        predictions, _ = self.sample_with_aux(
+            metadata,
+            inputs,
+            initial_output,
+            key=key,
+            num_particles=num_particles,
+            sample_process_noise=sample_process_noise,
+            hp_scenario_mode=hp_scenario_mode,
+            ventilation_rollout=ventilation_rollout,
+        )
+        return predictions
+
+
+class HurdleProbabilisticAutoregressiveLSTM(eqx.Module):
+    """Vanilla stochastic LSTM with an HP-specific hurdle ``Pel`` head.
+
+    Indoor temperature and room heat retain the vanilla model's unconstrained
+    linear readouts. Only electric HP power is changed: compressor activity is
+    Bernoulli and active power follows a bounded positive lognormal emission.
+    The activation can be conditionally IID or use separate start/stop
+    probabilities. This isolates the HP-emission inductive bias from the
+    structured model's thermal and hydronic equations.
+    """
+
+    initial_hidden: eqx.nn.MLP
+    initial_cell: eqx.nn.MLP
+    cell: eqx.nn.LSTMCell
+    readout: eqx.nn.Linear
+    process_noise_net: eqx.nn.MLP | None
+    raw_process_scale: jnp.ndarray
+    metadata_dim: int = eqx.field(static=True)
+    input_dim: int = eqx.field(static=True)
+    output_dim: int = eqx.field(static=True)
+    hidden_dim: int = eqx.field(static=True)
+    latent_dim: int = eqx.field(static=True)
+    process_noise_mode: str = eqx.field(static=True)
+    process_noise_init: float = eqx.field(static=True)
+    process_noise_floor: float = eqx.field(static=True)
+    process_noise_cap: float = eqx.field(static=True)
+    bptt_truncate_steps: int = eqx.field(static=True)
+    activation_model: Literal["iid", "asymmetric_markov"] = eqx.field(static=True)
+    availability_input_index: int = eqx.field(static=True)
+    force_off_input_index: int = eqx.field(static=True)
+    input_mean: tuple[float, ...] = eqx.field(static=True)
+    input_scale: tuple[float, ...] = eqx.field(static=True)
+    target_mean: tuple[float, ...] = eqx.field(static=True)
+    target_scale: tuple[float, ...] = eqx.field(static=True)
+    setpoint_input_index: int = eqx.field(static=True)
+
+    def __init__(
+        self,
+        *,
+        metadata_dim: int,
+        input_dim: int,
+        hidden_dim: int,
+        metadata_hidden_dim: int,
+        metadata_depth: int,
+        latent_dim: int,
+        process_noise_mode: str,
+        process_noise_init: float,
+        bptt_truncate_steps: int,
+        activation_model: Literal["iid", "asymmetric_markov"],
+        availability_input_index: int,
+        force_off_input_index: int,
+        input_mean: tuple[float, ...],
+        input_scale: tuple[float, ...],
+        target_mean: tuple[float, ...],
+        target_scale: tuple[float, ...],
+        setpoint_input_index: int,
+        key: jax.Array,
+        process_noise_floor: float = 1e-5,
+        process_noise_cap: float = 0.25,
+    ) -> None:
+        if metadata_dim < 1 or input_dim < 1 or hidden_dim < 1 or latent_dim < 1:
+            raise ValueError("model dimensions must be positive")
+        if process_noise_mode not in ("none", "constant", "heteroscedastic"):
+            raise ValueError(
+                "process_noise_mode must be 'none', 'constant', or 'heteroscedastic'"
+            )
+        if activation_model not in ("iid", "asymmetric_markov"):
+            raise ValueError("activation_model must be 'iid' or 'asymmetric_markov'")
+        if bptt_truncate_steps < 0:
+            raise ValueError("bptt_truncate_steps must be non-negative")
+        if len(input_mean) != input_dim or len(input_scale) != input_dim:
+            raise ValueError("input statistics must match input_dim")
+        if len(target_mean) != 3 or len(target_scale) != 3:
+            raise ValueError("hurdle LSTM requires three target statistics")
+
+        keys = jax.random.split(key, 5)
+        initial_input_dim = metadata_dim + latent_dim
+        recurrent_input_dim = input_dim + 3 + metadata_dim + latent_dim
+        self.initial_hidden = eqx.nn.MLP(
+            in_size=initial_input_dim,
+            out_size=hidden_dim,
+            width_size=metadata_hidden_dim,
+            depth=metadata_depth,
+            activation=jax.nn.tanh,
+            key=keys[0],
+        )
+        self.initial_cell = eqx.nn.MLP(
+            in_size=initial_input_dim,
+            out_size=hidden_dim,
+            width_size=metadata_hidden_dim,
+            depth=metadata_depth,
+            activation=jax.nn.tanh,
+            key=keys[1],
+        )
+        self.cell = eqx.nn.LSTMCell(
+            input_size=recurrent_input_dim,
+            hidden_size=hidden_dim,
+            key=keys[2],
+        )
+        # Tin, Qroom, activation logits, active-power location and scale.
+        readout_dim = 5 if activation_model == "iid" else 6
+        self.readout = eqx.nn.Linear(hidden_dim, readout_dim, key=keys[3])
+        if process_noise_mode == "heteroscedastic":
+            self.process_noise_net = eqx.nn.MLP(
+                in_size=hidden_dim + metadata_dim + latent_dim + input_dim,
+                out_size=hidden_dim,
+                width_size=hidden_dim,
+                depth=1,
+                activation=jax.nn.tanh,
+                key=keys[4],
+            )
+        else:
+            self.process_noise_net = None
+        self.raw_process_scale = jnp.full((hidden_dim,), process_noise_init)
+        self.metadata_dim = metadata_dim
+        self.input_dim = input_dim
+        self.output_dim = 3
+        self.hidden_dim = hidden_dim
+        self.latent_dim = latent_dim
+        self.process_noise_mode = process_noise_mode
+        self.process_noise_init = process_noise_init
+        self.process_noise_floor = process_noise_floor
+        self.process_noise_cap = process_noise_cap
+        self.bptt_truncate_steps = bptt_truncate_steps
+        self.activation_model = activation_model
+        self.availability_input_index = availability_input_index
+        self.force_off_input_index = force_off_input_index
+        self.input_mean = tuple(float(value) for value in input_mean)
+        self.input_scale = tuple(float(value) for value in input_scale)
+        self.target_mean = tuple(float(value) for value in target_mean)
+        self.target_scale = tuple(float(value) for value in target_scale)
+        self.setpoint_input_index = setpoint_input_index
+
+    def _physical_input(self, input_t: jnp.ndarray, index: int) -> jnp.ndarray:
+        return (
+            input_t[index] * jnp.asarray(self.input_scale[index], dtype=input_t.dtype)
+            + jnp.asarray(self.input_mean[index], dtype=input_t.dtype)
+        )
+
+    def _availability(self, input_t: jnp.ndarray) -> jnp.ndarray:
+        available = jnp.asarray(1.0, dtype=input_t.dtype)
+        if self.availability_input_index >= 0:
+            available = (
+                self._physical_input(input_t, self.availability_input_index) > 0.5
+            ).astype(input_t.dtype)
+        if self.force_off_input_index >= 0:
+            force_off = (
+                self._physical_input(input_t, self.force_off_input_index) > 0.5
+            ).astype(input_t.dtype)
+            available = available * (1.0 - force_off)
+        return available
+
+    def _pel_cap(self, dtype: jnp.dtype) -> jnp.ndarray:
+        mean = jnp.asarray(self.target_mean[2], dtype=dtype)
+        scale = jnp.asarray(self.target_scale[2], dtype=dtype)
+        return jnp.maximum(
+            jnp.maximum(mean + 8.0 * scale, 2.0 * scale),
+            jnp.asarray(1e-3, dtype=dtype),
+        )
+
+    def _normalize_pel(self, value: jnp.ndarray) -> jnp.ndarray:
+        return (
+            value - jnp.asarray(self.target_mean[2], dtype=value.dtype)
+        ) / jnp.asarray(self.target_scale[2], dtype=value.dtype)
+
+    def process_scale(
+        self,
+        hidden_t: jnp.ndarray,
+        metadata: jnp.ndarray,
+        xi: jnp.ndarray,
+        input_t: jnp.ndarray,
+    ) -> jnp.ndarray:
+        if self.process_noise_mode == "none":
+            return jnp.zeros_like(hidden_t)
+        raw = self.raw_process_scale
+        if self.process_noise_mode == "heteroscedastic":
+            assert self.process_noise_net is not None
+            features = jnp.concatenate([hidden_t, metadata, xi, input_t], axis=0)
+            raw = raw + 0.1 * self.process_noise_net(features)
+        return self.process_noise_floor + self.process_noise_cap * jax.nn.sigmoid(raw)
+
+    def rollout_particle(
+        self,
+        metadata: jnp.ndarray,
+        inputs: jnp.ndarray,
+        initial_output: jnp.ndarray,
+        xi: jnp.ndarray,
+        process_noise: jnp.ndarray,
+        mode_uniform: jnp.ndarray,
+        active_power_noise: jnp.ndarray,
+        *,
+        hp_scenario_mode: str,
+        ventilation_rollout: EPlusVentilationRollout | None = None,
+    ) -> tuple[jnp.ndarray, tuple[jnp.ndarray, ...]]:
+        initial_features = jnp.concatenate([metadata, xi])
+        hidden = jnp.tanh(self.initial_hidden(initial_features))
+        cell_state = jnp.tanh(self.initial_cell(initial_features))
+        previous_mode = jnp.asarray(0.0, dtype=inputs.dtype)
+        indices = jnp.arange(inputs.shape[0], dtype=jnp.int32)
+
+        def step(carry, item):
+            hidden_t, cell_t, previous_output, previous_mode_t = carry
+            input_t, eps_t, uniform_t, power_eps_t, time_index = item
+            if ventilation_rollout is not None:
+                input_t = ventilation_rollout.apply(
+                    input_t, previous_output[0], time_index
+                )
+            recurrent_input = jnp.concatenate(
+                [input_t, previous_output, metadata, xi], axis=0
+            )
+            hidden_next, cell_next = self.cell(
+                recurrent_input, (hidden_t, cell_t)
+            )
+            scale_t = self.process_scale(hidden_next, metadata, xi, input_t)
+            hidden_next = jnp.tanh(hidden_next + scale_t * eps_t)
+            raw = self.readout(hidden_next)
+
+            temperature_t = raw[0]
+            qroom_t = raw[1]
+            if self.activation_model == "iid":
+                p_start_t = jax.nn.sigmoid(raw[2])
+                p_stop_t = 1.0 - p_start_t
+                pi_unavailable_t = p_start_t
+                power_offset = 3
+            else:
+                p_start_t = jax.nn.sigmoid(raw[2])
+                p_stop_t = jax.nn.sigmoid(raw[3])
+                pi_unavailable_t = (
+                    (1.0 - previous_mode_t) * p_start_t
+                    + previous_mode_t * (1.0 - p_stop_t)
+                )
+                power_offset = 4
+            availability_t = self._availability(input_t)
+            pi_t = availability_t * pi_unavailable_t
+
+            pel_cap = self._pel_cap(raw.dtype)
+            max_log_active = jnp.log1p(pel_cap)
+            log_mu_t = max_log_active * jax.nn.sigmoid(raw[power_offset])
+            log_sigma_t = 0.05 + 0.45 * jax.nn.sigmoid(raw[power_offset + 1])
+            expected_active_t = bounded_lognormal_expm1_mean(
+                log_mu_t, log_sigma_t, max_log_active
+            )
+            if hp_scenario_mode == "expected":
+                hp_mode_t = pi_t
+                pel_physical = pi_t * expected_active_t
+            elif hp_scenario_mode in ("bernoulli", "hard_expected_grad"):
+                hp_mode_t = (hard_bernoulli_expected_gradient(pi_t, uniform_t)
+                             if hp_scenario_mode == "hard_expected_grad"
+                             else (uniform_t < pi_t).astype(raw.dtype))
+                sampled_log = jnp.clip(
+                    log_mu_t + log_sigma_t * power_eps_t,
+                    0.0,
+                    max_log_active,
+                )
+                pel_physical = hp_mode_t * jnp.expm1(sampled_log)
+            else:
+                raise ValueError("Unknown hurdle HP scenario mode")
+            pel_t = self._normalize_pel(pel_physical)
+            prediction_t = jnp.stack([temperature_t, qroom_t, pel_t])
+            next_carry = _detach_carry(
+                (hidden_next, cell_next, prediction_t, hp_mode_t),
+                time_index,
+                self.bptt_truncate_steps,
+            )
+            aux_t = (
+                pi_t,
+                log_mu_t,
+                log_sigma_t,
+                p_start_t,
+                p_stop_t,
+                expected_active_t,
+            )
+            return next_carry, (prediction_t, aux_t)
+
+        _, outputs = jax.lax.scan(
+            step,
+            (hidden, cell_state, initial_output, previous_mode),
+            (
+                inputs,
+                process_noise,
+                mode_uniform,
+                active_power_noise,
+                indices,
+            ),
+        )
+        return outputs
+
+    def sample_with_aux(
+        self,
+        metadata: jnp.ndarray,
+        inputs: jnp.ndarray,
+        initial_output: jnp.ndarray,
+        *,
+        key: jax.Array,
+        num_particles: int,
+        sample_process_noise: bool,
+        hp_scenario_mode: str,
+        ventilation_rollout: EPlusVentilationRollout | None = None,
+        persistent_xi: jnp.ndarray | None = None,
+    ) -> tuple[jnp.ndarray, tuple[jnp.ndarray, ...]]:
+        if num_particles < 1:
+            raise ValueError("num_particles must be positive")
+        xi_key, process_key, mode_key, power_key = jax.random.split(key, 4)
+        xi = (jax.random.normal(xi_key, (num_particles, self.latent_dim))
+              if persistent_xi is None else persistent_xi)
+        if xi.shape != (num_particles, self.latent_dim):
+            raise ValueError("persistent_xi must have shape (particles, latent_dim)")
+        process_noise = jax.random.normal(
+            process_key,
+            (num_particles, inputs.shape[0], self.hidden_dim),
+        )
+        if not sample_process_noise:
+            process_noise = jnp.zeros_like(process_noise)
+        mode_uniform = jax.random.uniform(
+            mode_key, (num_particles, inputs.shape[0])
+        )
+        active_power_noise = jax.random.normal(
+            power_key, (num_particles, inputs.shape[0])
+        )
+        return jax.vmap(
+            lambda row_xi, row_process, row_uniform, row_power: self.rollout_particle(
+                metadata,
+                inputs,
+                initial_output,
+                row_xi,
+                row_process,
+                row_uniform,
+                row_power,
+                hp_scenario_mode=hp_scenario_mode,
+                ventilation_rollout=ventilation_rollout,
+            )
+        )(xi, process_noise, mode_uniform, active_power_noise)
 
     def sample(
         self,

@@ -33,6 +33,8 @@ def build_legacy_config(config: ExperimentConfig, spec: ModelSpec) -> TrainConfi
         raise ValueError(f"Unknown legacy config fields: {', '.join(unknown)}")
     for name, value in config.legacy_overrides.items():
         values[name] = _coerce_like_default(value, getattr(defaults, name))
+    if config.hp_dhw_metadata:
+        values["hp_dhw_metadata"] = True
 
     values.update(
         dataset_path=Path(config.dataset_path),

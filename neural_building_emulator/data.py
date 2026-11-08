@@ -8,7 +8,7 @@ building appearing in both training and evaluation.
 from __future__ import annotations
 
 import argparse
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Iterable, Literal, Sequence
 
@@ -55,6 +55,7 @@ from .columns import (
     SPACE_HEATING_AVAILABILITY_COLUMN,
     SPACE_HEATING_HP_SIZE_BINDING,
     TARGET_COLUMN,
+    TANK_TEMPERATURE_COLUMNS,
     ZONE_THERMAL_HEATING_POWER_COLUMN,
     closed_loop_required_columns,
     closed_loop_input_columns,
@@ -95,6 +96,8 @@ class SplitConfig:
     heating_regime_window_steps: int = 96 * 7
     include_plant_targets: bool = False
     include_plant_metadata: bool = False
+    include_dhw_metadata: bool = False
+    include_tank_targets: bool = False
 
 
 @dataclass(frozen=True)
@@ -496,7 +499,9 @@ def _check_required_columns(
         )
 
 
-def load_closed_loop_result_splits(config: SplitConfig) -> ClosedLoopDatasetSplits:
+def load_closed_loop_result_splits(
+    config: SplitConfig, *, materialize: bool = True,
+) -> ClosedLoopDatasetSplits:
     """Load the profile split required by the closed-loop HP emulator."""
     dataset_path = Path(config.dataset_path)
     dataset_paths = (dataset_path, *(Path(path) for path in config.additional_dataset_paths))
@@ -505,6 +510,9 @@ def load_closed_loop_result_splits(config: SplitConfig) -> ClosedLoopDatasetSpli
         for path in dataset_paths
     )
     metadata_columns = [*CLOSED_LOOP_METADATA_COLUMNS, *(PLANT_METADATA_COLUMNS if config.include_plant_metadata else ())]
+    if config.include_dhw_metadata:
+        metadata_columns = list(dict.fromkeys([*metadata_columns, DHW_VOLUME_PER_HEATED_AREA_COLUMN,
+                                               DHW_RECOVERY_PER_HEATED_AREA_COLUMN]))
     columns = closed_loop_required_columns(
         metadata_columns,
         include_hp_force_off=include_hp_force_off,
@@ -513,6 +521,10 @@ def load_closed_loop_result_splits(config: SplitConfig) -> ClosedLoopDatasetSpli
         if config.hp_power_area_normalization != "building_heated_area":
             raise ValueError("Plant supervision requires whole-building HP power normalization")
         columns.extend(PLANT_TARGET_SOURCE_COLUMNS)
+    if config.include_tank_targets:
+        if not config.include_plant_targets:
+            raise ValueError("Tank targets require the separate plant-label array")
+        columns.extend(TANK_TEMPERATURE_COLUMNS)
     for path in dataset_paths:
         _check_required_columns(
             path,
@@ -565,6 +577,16 @@ def load_closed_loop_result_splits(config: SplitConfig) -> ClosedLoopDatasetSpli
         excluded_profile_ids=config.excluded_profile_ids,
     )
 
+    split = ClosedLoopDatasetSplits(
+        train=pd.DataFrame(), test=pd.DataFrame(), train_ids=train_ids, test_ids=test_ids,
+        selected_ids=selected_ids, candidate_ids=hp_ids, dropped_ids=dropped_ids,
+        dropped_non_hp_ids=dropped_non_hp_ids, dropped_non_sh_hp_ids=dropped_non_sh_hp_ids,
+        input_columns=tuple(closed_loop_input_columns(include_hp_force_off=include_hp_force_off)),
+        target_columns=tuple(CLOSED_LOOP_TARGET_COLUMNS), metadata_columns=tuple(metadata_columns),
+        hp_power_area_normalization=config.hp_power_area_normalization,
+    )
+    if not materialize:
+        return split
     policy_frames: list[pd.DataFrame] = []
     for policy_index, path in enumerate(dataset_paths):
         available_policy_ids = set(read_profile_ids(path, config.profile_id_column))
@@ -597,23 +619,51 @@ def load_closed_loop_result_splits(config: SplitConfig) -> ClosedLoopDatasetSpli
     train = df[df[config.profile_id_column].isin(train_ids)].reset_index(drop=True)
     test = df[df[config.profile_id_column].isin(test_ids)].reset_index(drop=True)
 
-    return ClosedLoopDatasetSplits(
-        train=train,
-        test=test,
-        train_ids=train_ids,
-        test_ids=test_ids,
-        selected_ids=selected_ids,
-        candidate_ids=hp_ids,
-        dropped_ids=dropped_ids,
-        dropped_non_hp_ids=dropped_non_hp_ids,
-        dropped_non_sh_hp_ids=dropped_non_sh_hp_ids,
-        input_columns=tuple(
-            closed_loop_input_columns(include_hp_force_off=include_hp_force_off)
-        ),
-        target_columns=tuple(CLOSED_LOOP_TARGET_COLUMNS),
-        metadata_columns=tuple(metadata_columns),
-        hp_power_area_normalization=config.hp_power_area_normalization,
-    )
+    return replace(split, train=train, test=test)
+
+
+def load_closed_loop_training_profiles(config: SplitConfig, *, batch_size: int = 16):
+    """Load identical ordered profiles without retaining annual wide dataframes.
+
+    Entity datasets are read in building batches. The returned split contains
+    fold/column metadata only; its train/test dataframe fields are empty.
+    """
+    if batch_size < 1:
+        raise ValueError("batch_size must be positive")
+    paths = (Path(config.dataset_path), *(Path(p) for p in config.additional_dataset_paths))
+    streaming = all(is_entity_profile_dataset(path) for path in paths)
+    split = load_closed_loop_result_splits(config, materialize=not streaming)
+    include_off = HP_FORCE_OFF_REQUESTED_COLUMN in split.input_columns
+    kwargs = dict(include_hp_force_off=include_off,
+                  hp_power_area_normalization=split.hp_power_area_normalization,
+                  metadata_columns=split.metadata_columns)
+    if not streaming:
+        train = to_closed_loop_profiles(split.train, **kwargs)
+        test = to_closed_loop_profiles(split.test, **kwargs) if split.test_ids else []
+    else:
+        columns = closed_loop_required_columns(split.metadata_columns, include_hp_force_off=include_off)
+        if config.include_plant_targets:
+            columns.extend(PLANT_TARGET_SOURCE_COLUMNS)
+        if config.include_tank_targets:
+            columns.extend(TANK_TEMPERATURE_COLUMNS)
+        available = [set(read_profile_ids(path, config.profile_id_column)) for path in paths]
+        train, test = [], []
+        train_ids = set(split.train_ids)
+        for start in range(0, len(split.selected_ids), batch_size):
+            batch = split.selected_ids[start:start + batch_size]
+            frames = []
+            for policy_index, path in enumerate(paths):
+                ids = [value for value in batch if value in available[policy_index]]
+                if not ids:
+                    continue
+                frame = read_dataset_frame(path, columns=columns, profile_ids=ids)
+                frame[POLICY_TRAJECTORY_COLUMN] = np.int32(policy_index)
+                frames.append(frame)
+            for profile in to_closed_loop_profiles(pd.concat(frames, ignore_index=True), **kwargs):
+                (train if profile.profile_id in train_ids else test).append(profile)
+            print(f"closed_loop_profiles_loaded={min(start + batch_size, len(split.selected_ids))}"
+                  f"/{len(split.selected_ids)} annual_traces={len(train) + len(test)}", flush=True)
+    return replace(split, train=pd.DataFrame(), test=pd.DataFrame()), train, test
 
 
 def _validate_heat_input_normalization(heat_input_normalization: str) -> HeatInputNormalization:
@@ -946,6 +996,14 @@ def to_closed_loop_profiles(
             ])[1:].astype(np.float32)
             if not np.isfinite(plant_targets).all():
                 raise ValueError(f"Nonfinite plant targets for profile {profile_id}")
+        if any(column in group for column in TANK_TEMPERATURE_COLUMNS):
+            if plant_targets is None or not all(column in group for column in TANK_TEMPERATURE_COLUMNS):
+                raise ValueError("Tank supervision requires both temperatures and the plant-label array")
+            tank_targets = group[TANK_TEMPERATURE_COLUMNS].to_numpy(dtype=np.float32)[1:]
+            if not np.isfinite(tank_targets).all():
+                raise ValueError(f"Nonfinite tank temperatures for profile {profile_id}")
+            # Interval-mean labels, not recurrent inputs or endpoint observations.
+            plant_targets = np.column_stack([plant_targets, tank_targets])
         profiles.append(
             ClosedLoopProfile(
                 profile_id=int(profile_id),

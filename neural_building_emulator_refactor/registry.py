@@ -106,6 +106,28 @@ MODEL_REGISTRY: dict[str, ModelSpec] = {
             "Tin/Qroom/Pel readout and no physical or HP-specific constraints."
         ),
     ),
+    "closed_loop_hp_hurdle_iid_probabilistic_lstm": ModelSpec(
+        name="closed_loop_hp_hurdle_iid_probabilistic_lstm",
+        task="closed_loop_hp",
+        backend="lstm",
+        probabilistic=True,
+        legacy_model_kind=None,
+        description=(
+            "Unstructured stochastic autoregressive LSTM with linear Tin/Qroom "
+            "readouts and an IID Bernoulli-positive hurdle Pel emission."
+        ),
+    ),
+    "closed_loop_hp_hurdle_markov_probabilistic_lstm": ModelSpec(
+        name="closed_loop_hp_hurdle_markov_probabilistic_lstm",
+        task="closed_loop_hp",
+        backend="lstm",
+        probabilistic=True,
+        legacy_model_kind=None,
+        description=(
+            "Unstructured stochastic autoregressive LSTM with linear Tin/Qroom "
+            "readouts and an asymmetric Markov Bernoulli-positive Pel emission."
+        ),
+    ),
 }
 
 

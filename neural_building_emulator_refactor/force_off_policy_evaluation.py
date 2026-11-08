@@ -484,7 +484,7 @@ def _write_force_off_comparison_plot(
     profile: ClosedLoopProfile,
     force_off: np.ndarray,
     gated: PredictionResult,
-    ungated: PredictionResult,
+    ungated: PredictionResult | None,
     unstructured: PredictionResult | None,
     *,
     setpoint_index: int,
@@ -511,11 +511,12 @@ def _write_force_off_comparison_plot(
             row=row,
             col=1,
         )
-        figure.add_trace(
-            go.Scatter(x=datetime, y=ungated.mean[:, channel], name="Structured, policy ignored", legendgroup="structured_ungated", line={"color": COLORS["structured_ungated"], "width": 1.1}),
-            row=row,
-            col=1,
-        )
+        if ungated is not None:
+            figure.add_trace(
+                go.Scatter(x=datetime, y=ungated.mean[:, channel], name="Structured, policy ignored", legendgroup="structured_ungated", line={"color": COLORS["structured_ungated"], "width": 1.1}),
+                row=row,
+                col=1,
+            )
         if unstructured is not None:
             figure.add_trace(
                 go.Scatter(x=datetime, y=unstructured.mean[:, channel], name="Unstructured LSTM", legendgroup="unstructured", line={"color": COLORS["unstructured"], "width": 1.0}),
@@ -636,11 +637,13 @@ def evaluate_force_off_policy(
     seed: int = 13,
 ) -> Path:
     artifact = load_artifact(artifact_dir)
-    if artifact.spec.name != "closed_loop_hp_contracting_probabilistic":
+    if artifact.spec.task != "closed_loop_hp" or not artifact.spec.probabilistic:
         raise ValueError(
-            "Force-off structural gating currently requires "
-            "closed_loop_hp_contracting_probabilistic"
+            "Force-off evaluation requires a probabilistic closed-loop HP artifact"
         )
+    uses_external_generation_gate = (
+        artifact.spec.name == "closed_loop_hp_contracting_probabilistic"
+    )
     profiles = load_profiles(
         artifact,
         dataset_path=dataset_path,
@@ -661,6 +664,10 @@ def evaluate_force_off_policy(
         if HP_FORCE_OFF_REQUESTED_COLUMN in input_columns
         else -1
     )
+    if not uses_external_generation_gate and structured_force_off_index < 0:
+        raise ValueError(
+            "An LSTM force-off evaluation requires hp_force_off_requested in its inputs"
+        )
     force_off_by_id = _policy_traces(dataset_path, closed_loop_profiles, policy_column)
 
     unstructured_artifact = None
@@ -728,16 +735,16 @@ def evaluate_force_off_policy(
             & _post_release_mask(force_off_active, 96),
         }
         generation_available = np.float32(1.0) - force_off
-        gated = predict_profile(
-            artifact,
-            profile,
+        prediction_kwargs = dict(
             key=profile_key,
             num_scenarios=scenario_count,
             num_eval_particles=num_eval_particles,
             hp_scenario_mode=hp_scenario_mode,
             ventilation_rollout_mode=ventilation_rollout_mode,
-            hp_generation_availability=generation_available,
         )
+        if uses_external_generation_gate:
+            prediction_kwargs["hp_generation_availability"] = generation_available
+        gated = predict_profile(artifact, profile, **prediction_kwargs)
         predictions: dict[str, PredictionResult] = {
             "structured_gated": gated,
         }
@@ -837,7 +844,7 @@ def evaluate_force_off_policy(
             if selected_plot_ids is None
             else profile.profile_id in selected_plot_ids
         )
-        if should_plot and plotted_profiles < num_profile_plots and ungated is not None:
+        if should_plot and plotted_profiles < num_profile_plots:
             plotted_profiles += 1
             _write_force_off_comparison_plot(
                 output_dir / f"force_off_profile_{plotted_profiles:02d}_{profile.profile_id}.html",

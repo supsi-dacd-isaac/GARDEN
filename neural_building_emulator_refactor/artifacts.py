@@ -22,6 +22,7 @@ from neural_building_emulator.scaling import StandardScaler, WindowScalers
 from .config import ExperimentConfig, LSTMConfig, ProbabilisticLSTMConfig
 from .models import (
     AutoregressiveLSTM,
+    HurdleProbabilisticAutoregressiveLSTM,
     ProbabilisticAutoregressiveLSTM,
     VanillaProbabilisticAutoregressiveLSTM,
 )
@@ -50,6 +51,7 @@ LSTMModel = (
     AutoregressiveLSTM
     | ProbabilisticAutoregressiveLSTM
     | VanillaProbabilisticAutoregressiveLSTM
+    | HurdleProbabilisticAutoregressiveLSTM
 )
 
 
@@ -185,7 +187,11 @@ def save_lstm_artifact(
 def save_probabilistic_lstm_artifact(
     artifact_dir: Path,
     *,
-    model: ProbabilisticAutoregressiveLSTM | VanillaProbabilisticAutoregressiveLSTM,
+    model: (
+        ProbabilisticAutoregressiveLSTM
+        | VanillaProbabilisticAutoregressiveLSTM
+        | HurdleProbabilisticAutoregressiveLSTM
+    ),
     scalers: WindowScalers,
     spec: ModelSpec,
     experiment_config: ExperimentConfig,
@@ -302,6 +308,45 @@ def load_artifact(artifact_dir: Path) -> LoadedArtifact:
             hp_inactive_leakage_weight=float(values["hp_inactive_leakage_weight"]),
             softopt_weight=float(values["softopt_weight"]),
             softopt_temperature=float(values["softopt_temperature"]),
+            increment_energy_weight=float(values.get("increment_energy_weight", 0.0)),
+            increment_energy_lags=tuple(
+                int(value)
+                for value in values.get("increment_energy_lags", (1, 2, 4, 8))
+            ),
+            increment_energy_lags_per_batch=int(
+                values.get("increment_energy_lags_per_batch", 1)
+            ),
+            increment_energy_output_weights=tuple(
+                float(value)
+                for value in values.get(
+                    "increment_energy_output_weights", (1.0, 1.0, 1.0)
+                )
+            ),
+            increment_energy_constant_setpoint_only=bool(
+                values.get("increment_energy_constant_setpoint_only", True)
+            ),
+            increment_energy_setpoint_threshold_c=float(
+                values.get("increment_energy_setpoint_threshold_c", 0.05)
+            ),
+            event_energy_weight=float(values.get("event_energy_weight", 0.0)),
+            event_energy_horizons_hours=tuple(
+                float(value)
+                for value in values.get(
+                    "event_energy_horizons_hours", (0.5, 1.0, 2.0, 3.0)
+                )
+            ),
+            event_energy_events_per_profile=int(
+                values.get("event_energy_events_per_profile", 4)
+            ),
+            event_energy_output_weights=tuple(
+                float(value)
+                for value in values.get(
+                    "event_energy_output_weights", (1.0, 1.0, 1.0)
+                )
+            ),
+            event_energy_setpoint_threshold_c=float(
+                values.get("event_energy_setpoint_threshold_c", 0.05)
+            ),
             variogram_weight=float(values["variogram_weight"]),
             variogram_power=float(values["variogram_power"]),
             variogram_lags=tuple(int(value) for value in values["variogram_lags"]),
@@ -336,8 +381,40 @@ def load_artifact(artifact_dir: Path) -> LoadedArtifact:
             key=jax.random.PRNGKey(0),
         )
         if spec.name == "closed_loop_hp_vanilla_probabilistic_lstm":
-            skeleton: ProbabilisticAutoregressiveLSTM | VanillaProbabilisticAutoregressiveLSTM
+            skeleton: (
+                ProbabilisticAutoregressiveLSTM
+                | VanillaProbabilisticAutoregressiveLSTM
+                | HurdleProbabilisticAutoregressiveLSTM
+            )
             skeleton = VanillaProbabilisticAutoregressiveLSTM(**common_model_args)
+        elif spec.name in (
+            "closed_loop_hp_hurdle_iid_probabilistic_lstm",
+            "closed_loop_hp_hurdle_markov_probabilistic_lstm",
+        ):
+            input_columns = list(metadata["input_columns"])
+            availability_index = (
+                input_columns.index("space_heating_available")
+                if "space_heating_available" in input_columns
+                else -1
+            )
+            force_off_index = (
+                input_columns.index("hp_force_off_requested")
+                if "hp_force_off_requested" in input_columns
+                else -1
+            )
+            skeleton = HurdleProbabilisticAutoregressiveLSTM(
+                **common_model_args,
+                activation_model=(
+                    "iid"
+                    if spec.name == "closed_loop_hp_hurdle_iid_probabilistic_lstm"
+                    else "asymmetric_markov"
+                ),
+                availability_input_index=availability_index,
+                force_off_input_index=force_off_index,
+                input_mean=tuple(float(value) for value in scalers.inputs.mean),
+                target_mean=tuple(float(value) for value in scalers.target.mean),
+                target_scale=tuple(float(value) for value in scalers.target.scale),
+            )
         else:
             input_columns = list(metadata["input_columns"])
             availability_index = (

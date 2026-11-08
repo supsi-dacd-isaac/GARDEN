@@ -138,6 +138,21 @@
     "min_setpoint_change": 0.05,
     "min_events": 20
   },
+  "variance_decomposition": {
+    "enabled": false,
+    "output_subdir": "diagnostics/kpi_variance_decomposition",
+    "xi_draws": 32,
+    "fast_rollouts": 8,
+    "common_random_numbers": true,
+    "write_samples": true
+  },
+  "poor_excitation_evaluation": {
+    "enabled": true,
+    "dataset_path": "data/control=setpoint",
+    "output_subdir": "poor_excitation_policy",
+    "num_scenarios": 100,
+    "num_profile_plots": 3
+  },
   "lightgbm": {
     "quantiles": [0.16, 0.5, 0.84],
     "learning_rate": 0.03,

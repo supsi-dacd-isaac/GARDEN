@@ -11,6 +11,8 @@ import jax.numpy as jnp
 
 from ..ventilation import replace_with_eplus_ventilation
 from .emulator import MLP
+from .dhw_recovery import DHWRecovery
+from .tank_temperatures import TankTemperatures
 from .probabilistic_closed_loop_hp import (
     HPActivationModel,
     HPElectricRolloutMode,
@@ -22,6 +24,9 @@ from .probabilistic_closed_loop_hp import (
     straight_through_binary_concrete,
 )
 from .contracting_closed_loop_hp import (
+    CausalVentilationModel,
+    MetadataFixedPoleParameterization,
+    MetadataFixedStateUpdate,
     ThermalArchitecture,
     TemperatureUpdateMode,
     ThermalQResponseMode,
@@ -38,6 +43,8 @@ from .truncated_bptt import (
 
 QroomActivationModel = Literal["continuous", "asymmetric_markov"]
 TemperatureAlphaConditioning = Literal["metadata_xi", "metadata"]
+PersistentXiRouting = Literal["shared", "physical", "soft_physical"]
+HPBufferCapacityMode = Literal["global", "physical_volume"]
 
 
 class ProbabilisticContractingClosedLoopHPEmulator(eqx.Module):
@@ -59,9 +66,13 @@ class ProbabilisticContractingClosedLoopHPEmulator(eqx.Module):
     output_net: MLP
     temperature_net: MLP
     temperature_alpha_net: MLP | None
+    ventilation_gain_net: MLP | None
+    operation_ventilation_net: MLP | None
     q_response_net: MLP | None
     q_response_init_net: MLP | None
     metadata_fixed_base_parameters: jax.Array
+    xi_prior_net: MLP | None
+    colored_latent_net: MLP | None
     process_noise_net: MLP | None
     hp_controller_init_net: MLP | None
     hp_controller_transition_net: MLP | None
@@ -69,6 +80,14 @@ class ProbabilisticContractingClosedLoopHPEmulator(eqx.Module):
     hp_mode0_net: MLP | None
     qroom_transition_net: MLP | None
     raw_process_scale: jnp.ndarray
+    raw_buffer_delta_t_usable: jax.Array | None
+    zone_heat_ratio_net: MLP | None
+    dhw_recovery: DHWRecovery | None
+    tank_temperatures: TankTemperatures | None
+    dhw_request_input_index: int = eqx.field(static=True)
+    dhw_volume_metadata_index: int = eqx.field(static=True)
+    dhw_recovery_metadata_index: int = eqx.field(static=True)
+    persistent_xi_route_logits: jax.Array | None
     metadata_dim: int = eqx.field(static=True)
     input_dim: int = eqx.field(static=True)
     state_dim: int = eqx.field(static=True)
@@ -77,6 +96,14 @@ class ProbabilisticContractingClosedLoopHPEmulator(eqx.Module):
     controller_state_dim: int = eqx.field(static=True)
     latent_dim: int = eqx.field(static=True)
     persistent_xi_pathways: tuple[str, ...] = eqx.field(static=True)
+    persistent_xi_routing: PersistentXiRouting = eqx.field(static=True)
+    metadata_conditioned_xi: bool = eqx.field(static=True)
+    metadata_xi_mean_cap: float = eqx.field(static=True)
+    metadata_xi_scale_cap: float = eqx.field(static=True)
+    colored_latent_timescales_hours: tuple[float, ...] = eqx.field(static=True)
+    colored_latent_pathways: tuple[str, ...] = eqx.field(static=True)
+    colored_latent_state_scale_cap: float = eqx.field(static=True)
+    colored_latent_xi_scale_cap: float = eqx.field(static=True)
     process_noise_mode: ProcessNoiseMode = eqx.field(static=True)
     process_noise_init: float = eqx.field(static=True)
     process_noise_floor: float = eqx.field(static=True)
@@ -106,10 +133,17 @@ class ProbabilisticContractingClosedLoopHPEmulator(eqx.Module):
     hp_pel_cap_w_m2: float = eqx.field(static=True)
     hp_qroom_cap_w_m2: float = eqx.field(static=True)
     hp_energy_cap_wh_m2: float = eqx.field(static=True)
+    hp_buffer_capacity_mode: HPBufferCapacityMode = eqx.field(static=True)
+    hp_buffer_delta_t_min_k: float = eqx.field(static=True)
+    hp_buffer_delta_t_max_k: float = eqx.field(static=True)
+    hp_buffer_water_heat_capacity_wh_m3_k: float = eqx.field(static=True)
+    hp_buffer_volume_metadata_index: int = eqx.field(static=True)
     input_mean: tuple[float, ...] = eqx.field(static=True)
     input_scale: tuple[float, ...] = eqx.field(static=True)
     target_mean: tuple[float, ...] = eqx.field(static=True)
     target_scale: tuple[float, ...] = eqx.field(static=True)
+    metadata_mean: tuple[float, ...] = eqx.field(static=True)
+    metadata_scale: tuple[float, ...] = eqx.field(static=True)
     energy_scale: float = eqx.field(static=True)
     setpoint_input_index: int = eqx.field(static=True)
     outdoor_input_index: int = eqx.field(static=True)
@@ -140,6 +174,19 @@ class ProbabilisticContractingClosedLoopHPEmulator(eqx.Module):
     hydronic_innovation_cap_w_m2: float = eqx.field(static=True)
     hydronic_innovation_time_constant_hours: float = eqx.field(static=True)
     thermal_architecture: ThermalArchitecture = eqx.field(static=True)
+    metadata_fixed_state_update: MetadataFixedStateUpdate = eqx.field(static=True)
+    metadata_fixed_pole_parameterization: MetadataFixedPoleParameterization = eqx.field(static=True)
+    metadata_fixed_time_constant_min_hours: float = eqx.field(static=True)
+    metadata_fixed_time_constant_max_hours: float = eqx.field(static=True)
+    causal_ventilation: bool = eqx.field(static=True)
+    ventilation_model: CausalVentilationModel = eqx.field(static=True)
+    ventilation_gain_max_per_hour_m3_s: float = eqx.field(static=True)
+    ventilation_delta_max_c: float = eqx.field(static=True)
+    ventilation_capacity_factor_min: float = eqx.field(static=True)
+    ventilation_capacity_factor_max: float = eqx.field(static=True)
+    operation_ventilation_gain_cap: float = eqx.field(static=True)
+    ventilation_volume_metadata_index: int = eqx.field(static=True)
+    ventilation_capacity_metadata_index: int = eqx.field(static=True)
 
     def __init__(
         self,
@@ -155,6 +202,14 @@ class ProbabilisticContractingClosedLoopHPEmulator(eqx.Module):
             "q_to_t",
             "hp",
         ),
+        persistent_xi_routing: PersistentXiRouting = "shared",
+        metadata_conditioned_xi: bool = False,
+        metadata_xi_mean_cap: float = 1.0,
+        metadata_xi_scale_cap: float = 2.0,
+        colored_latent_timescales_hours: tuple[float, ...] = (),
+        colored_latent_pathways: tuple[str, ...] = ("thermal", "q_to_t", "hp"),
+        colored_latent_state_scale_cap: float = 0.02,
+        colored_latent_xi_scale_cap: float = 0.5,
         hidden_dim: int = 64,
         depth: int = 3,
         input_encoder_dim: int | None = None,
@@ -189,10 +244,24 @@ class ProbabilisticContractingClosedLoopHPEmulator(eqx.Module):
         hp_pel_cap_w_m2: float = 0.0,
         hp_qroom_cap_w_m2: float = 0.0,
         hp_energy_cap_wh_m2: float = 0.0,
+        hp_buffer_capacity_mode: HPBufferCapacityMode = "global",
+        hp_buffer_delta_t_usable_init_k: float = 5.0,
+        hp_buffer_delta_t_min_k: float = 1.0,
+        hp_buffer_delta_t_max_k: float = 15.0,
+        hp_buffer_water_heat_capacity_wh_m3_k: float = 1163.0,
+        hp_buffer_volume_metadata_index: int = -1,
+        hp_whole_building_accounting: bool = False,
+        dhw_recovery_enabled: bool = False,
+        tank_temperatures_enabled: bool = False,
+        dhw_request_input_index: int = -1,
+        dhw_volume_metadata_index: int = -1,
+        dhw_recovery_metadata_index: int = -1,
         input_mean: tuple[float, ...] = (),
         input_scale: tuple[float, ...] = (),
         target_mean: tuple[float, ...] = (),
         target_scale: tuple[float, ...] = (),
+        metadata_mean: tuple[float, ...] = (),
+        metadata_scale: tuple[float, ...] = (),
         availability_input_index: int = -1,
         hp_force_off_input_index: int = -1,
         bptt_truncate_steps: int = DEFAULT_BPTT_TRUNCATE_STEPS,
@@ -221,6 +290,20 @@ class ProbabilisticContractingClosedLoopHPEmulator(eqx.Module):
         hydronic_innovation_cap_w_m2: float = 20.0,
         hydronic_innovation_time_constant_hours: float = 0.5,
         thermal_architecture: ThermalArchitecture = "bounded_mlp",
+        metadata_fixed_state_update: MetadataFixedStateUpdate = "linear",
+        metadata_fixed_pole_parameterization: MetadataFixedPoleParameterization = "rho",
+        metadata_fixed_time_constant_min_hours: float = 0.1,
+        metadata_fixed_time_constant_max_hours: float = 24.0 * 21.0,
+        causal_ventilation: bool = False,
+        ventilation_model: CausalVentilationModel = "learned_gain",
+        ventilation_gain_max_per_hour_m3_s: float = 4.0,
+        ventilation_gain_initial_per_hour_m3_s: float = 1.0,
+        ventilation_delta_max_c: float = 2.0,
+        ventilation_capacity_factor_min: float = 0.25,
+        ventilation_capacity_factor_max: float = 4.0,
+        operation_ventilation_gain_cap: float = 4.0,
+        ventilation_volume_metadata_index: int = -1,
+        ventilation_capacity_metadata_index: int = -1,
         key: jax.Array,
     ) -> None:
         if state_dim < 1:
@@ -241,6 +324,76 @@ class ProbabilisticContractingClosedLoopHPEmulator(eqx.Module):
             )
         if len(set(persistent_xi_pathways)) != len(persistent_xi_pathways):
             raise ValueError("persistent_xi_pathways values must be unique")
+        if persistent_xi_routing not in ("shared", "physical", "soft_physical"):
+            raise ValueError(
+                "persistent_xi_routing must be 'shared', 'physical', or "
+                "'soft_physical'"
+            )
+        if persistent_xi_routing in ("physical", "soft_physical") and latent_dim != 4:
+            raise ValueError(
+                "physical and soft_physical persistent-xi routing require latent_dim=4"
+            )
+        if operation_ventilation_gain_cap <= 1.0:
+            raise ValueError("operation_ventilation_gain_cap must exceed 1")
+        if metadata_xi_mean_cap < 0.0:
+            raise ValueError("metadata_xi_mean_cap must be non-negative")
+        if metadata_xi_scale_cap <= 0.0:
+            raise ValueError("metadata_xi_scale_cap must be positive")
+        if hp_buffer_capacity_mode not in ("global", "physical_volume"):
+            raise ValueError(
+                "hp_buffer_capacity_mode must be 'global' or 'physical_volume'"
+            )
+        if hp_buffer_capacity_mode == "physical_volume":
+            if len(metadata_mean) != metadata_dim or len(metadata_scale) != metadata_dim:
+                raise ValueError(
+                    "physical-volume buffer capacity requires metadata_mean and "
+                    "metadata_scale"
+                )
+            if not 0 <= hp_buffer_volume_metadata_index < metadata_dim:
+                raise ValueError(
+                    "physical-volume buffer capacity requires a valid SH-volume "
+                    "metadata index"
+                )
+            if hp_buffer_water_heat_capacity_wh_m3_k <= 0.0:
+                raise ValueError(
+                    "hp_buffer_water_heat_capacity_wh_m3_k must be positive"
+                )
+            if not 0.0 < hp_buffer_delta_t_min_k < hp_buffer_delta_t_max_k:
+                raise ValueError(
+                    "buffer delta-T bounds must satisfy 0 < min < max"
+                )
+            if not (
+                hp_buffer_delta_t_min_k
+                < hp_buffer_delta_t_usable_init_k
+                < hp_buffer_delta_t_max_k
+            ):
+                raise ValueError(
+                    "initial usable buffer delta-T must lie strictly within its "
+                    "bounds"
+                )
+        colored_latent_timescales_hours = tuple(
+            float(value) for value in colored_latent_timescales_hours
+        )
+        if any(value <= 0.0 for value in colored_latent_timescales_hours):
+            raise ValueError("colored_latent_timescales_hours values must be positive")
+        if len(set(colored_latent_timescales_hours)) != len(
+            colored_latent_timescales_hours
+        ):
+            raise ValueError("colored_latent_timescales_hours values must be unique")
+        colored_latent_pathways = tuple(colored_latent_pathways)
+        allowed_colored_pathways = {"thermal", "q_to_t", "hp"}
+        unknown_colored_pathways = set(colored_latent_pathways) - allowed_colored_pathways
+        if unknown_colored_pathways:
+            raise ValueError(
+                "colored_latent_pathways contains unknown values: "
+                f"{sorted(unknown_colored_pathways)}"
+            )
+        if len(set(colored_latent_pathways)) != len(colored_latent_pathways):
+            raise ValueError("colored_latent_pathways values must be unique")
+        if colored_latent_state_scale_cap <= 0.0:
+            raise ValueError("colored_latent_state_scale_cap must be positive")
+        if colored_latent_xi_scale_cap <= 0.0:
+            raise ValueError("colored_latent_xi_scale_cap must be positive")
         if depth < 1:
             raise ValueError("depth must be at least 1")
         if input_encoder_dim is not None and input_encoder_dim < 1:
@@ -385,6 +538,48 @@ class ProbabilisticContractingClosedLoopHPEmulator(eqx.Module):
             raise ValueError(
                 "thermal_architecture must be 'bounded_mlp' or 'metadata_fixed_ss'"
             )
+        if metadata_fixed_state_update not in ("linear", "bounded_tanh"):
+            raise ValueError(
+                "metadata_fixed_state_update must be 'linear' or 'bounded_tanh'"
+            )
+        if metadata_fixed_pole_parameterization not in ("rho", "time_constant"):
+            raise ValueError(
+                "metadata_fixed_pole_parameterization must be 'rho' or 'time_constant'"
+            )
+        if metadata_fixed_time_constant_min_hours <= 0.0:
+            raise ValueError("metadata_fixed_time_constant_min_hours must be positive")
+        if (
+            metadata_fixed_time_constant_max_hours
+            <= metadata_fixed_time_constant_min_hours
+        ):
+            raise ValueError(
+                "metadata-fixed time-constant bounds must satisfy 0 < min < max"
+            )
+        if ventilation_model not in ("learned_gain", "physical_air_mixing"):
+            raise ValueError(
+                "ventilation_model must be 'learned_gain' or 'physical_air_mixing'"
+            )
+        if ventilation_gain_max_per_hour_m3_s <= 0.0:
+            raise ValueError("ventilation gain maximum must be positive")
+        if not 0.0 < ventilation_gain_initial_per_hour_m3_s < ventilation_gain_max_per_hour_m3_s:
+            raise ValueError("initial ventilation gain must lie strictly between zero and its maximum")
+        if ventilation_delta_max_c <= 0.0:
+            raise ValueError("ventilation delta maximum must be positive")
+        if not 0.0 < ventilation_capacity_factor_min < ventilation_capacity_factor_max:
+            raise ValueError("ventilation capacity-factor bounds must satisfy 0 < min < max")
+        if causal_ventilation and ventilation_model == "physical_air_mixing":
+            if len(metadata_mean) != metadata_dim or len(metadata_scale) != metadata_dim:
+                raise ValueError(
+                    "physical_air_mixing requires metadata_mean and metadata_scale"
+                )
+            for index in (
+                ventilation_volume_metadata_index,
+                ventilation_capacity_metadata_index,
+            ):
+                if index < 0 or index >= metadata_dim:
+                    raise ValueError(
+                        "physical_air_mixing requires valid volume and capacity metadata indices"
+                    )
         if thermal_architecture == "metadata_fixed_ss" and q_to_t_mode != "unconstrained":
             raise ValueError(
                 "thermal_architecture='metadata_fixed_ss' requires "
@@ -470,6 +665,9 @@ class ProbabilisticContractingClosedLoopHPEmulator(eqx.Module):
         alpha_key = jax.random.fold_in(temperature_key, 1)
         q_response_key = jax.random.fold_in(temperature_key, 2)
         q_response_init_key = jax.random.fold_in(temperature_key, 3)
+        xi_prior_key = jax.random.fold_in(process_key, 23)
+        colored_latent_key = jax.random.fold_in(process_key, 29)
+        operation_ventilation_key = jax.random.fold_in(process_key, 37)
         transition_forcing_key = jax.random.fold_in(transition_key, 1)
         encoded_input_dim = input_dim if input_encoder_dim is None else input_encoder_dim
         thermal_forcing_dim = input_dim + (1 if q_to_t_mode == "positive_leaky" else 2)
@@ -514,6 +712,7 @@ class ProbabilisticContractingClosedLoopHPEmulator(eqx.Module):
             + (2 * hp_history_feature_dim if uses_power_history else 0)
             + hp_setpoint_shock_feature_dim
             + hp_force_off_debt_feature_dim
+            + (2 if tank_temperatures_enabled else 0)
         )
 
         self.input_encoder = None
@@ -555,7 +754,52 @@ class ProbabilisticContractingClosedLoopHPEmulator(eqx.Module):
             transition_forcing_encoded_dim,
             contraction_gamma,
             hp_dt_hours,
+            metadata_fixed_pole_parameterization,
+            metadata_fixed_time_constant_min_hours,
+            metadata_fixed_time_constant_max_hours,
         )
+        self.xi_prior_net = None
+        if metadata_conditioned_xi:
+            self.xi_prior_net = MLP(
+                metadata_dim,
+                2 * latent_dim,
+                hidden_dim=hidden_dim,
+                depth=depth,
+                key=xi_prior_key,
+            )
+            self.xi_prior_net = eqx.tree_at(
+                lambda net: net.layers[-1].weight,
+                self.xi_prior_net,
+                jnp.zeros_like(self.xi_prior_net.layers[-1].weight),
+            )
+            self.xi_prior_net = eqx.tree_at(
+                lambda net: net.layers[-1].bias,
+                self.xi_prior_net,
+                jnp.zeros_like(self.xi_prior_net.layers[-1].bias),
+            )
+        self.colored_latent_net = None
+        colored_latent_dim = len(colored_latent_timescales_hours)
+        if colored_latent_dim:
+            colored_loading_dim = colored_latent_dim * (
+                state_dim + 2 * latent_dim
+            )
+            self.colored_latent_net = MLP(
+                metadata_dim,
+                colored_loading_dim,
+                hidden_dim=hidden_dim,
+                depth=depth,
+                key=colored_latent_key,
+            )
+            self.colored_latent_net = eqx.tree_at(
+                lambda net: net.layers[-1].weight,
+                self.colored_latent_net,
+                0.05 * self.colored_latent_net.layers[-1].weight,
+            )
+            self.colored_latent_net = eqx.tree_at(
+                lambda net: net.layers[-1].bias,
+                self.colored_latent_net,
+                jnp.zeros_like(self.colored_latent_net.layers[-1].bias),
+            )
         self.x0_net = MLP(metadata_dim + 1 + latent_dim, state_dim, hidden_dim=hidden_dim, depth=depth, key=x0_key)
         self.e0_net = MLP(metadata_dim + 1 + latent_dim, 1, hidden_dim=hidden_dim, depth=depth, key=e0_key)
         self.hp_param_net = MLP(
@@ -604,6 +848,63 @@ class ProbabilisticContractingClosedLoopHPEmulator(eqx.Module):
                     self.temperature_alpha_net,
                     jnp.asarray([initial_logit]),
                 )
+        self.ventilation_gain_net = None
+        if causal_ventilation:
+            ventilation_key = jax.random.fold_in(temperature_key, 17)
+            self.ventilation_gain_net = MLP(
+                generator_input_dim,
+                1,
+                hidden_dim=hidden_dim,
+                depth=depth,
+                key=ventilation_key,
+            )
+            if ventilation_model == "physical_air_mixing":
+                log_min = math.log(ventilation_capacity_factor_min)
+                log_max = math.log(ventilation_capacity_factor_max)
+                initial_fraction = (0.0 - log_min) / (log_max - log_min)
+            else:
+                initial_fraction = (
+                    ventilation_gain_initial_per_hour_m3_s
+                    / ventilation_gain_max_per_hour_m3_s
+                )
+            initial_logit = math.log(initial_fraction / (1.0 - initial_fraction))
+            self.ventilation_gain_net = eqx.tree_at(
+                lambda net: net.layers[-1].weight,
+                self.ventilation_gain_net,
+                jnp.zeros_like(self.ventilation_gain_net.layers[-1].weight),
+            )
+            self.ventilation_gain_net = eqx.tree_at(
+                lambda net: net.layers[-1].bias,
+                self.ventilation_gain_net,
+                jnp.asarray([initial_logit]),
+            )
+        self.operation_ventilation_net = None
+        if persistent_xi_routing in ("physical", "soft_physical"):
+            self.operation_ventilation_net = MLP(
+                generator_input_dim,
+                1,
+                hidden_dim=hidden_dim,
+                depth=depth,
+                key=operation_ventilation_key,
+            )
+            self.operation_ventilation_net = eqx.tree_at(
+                lambda net: net.layers[-1].weight,
+                self.operation_ventilation_net,
+                jnp.zeros_like(self.operation_ventilation_net.layers[-1].weight),
+            )
+            self.operation_ventilation_net = eqx.tree_at(
+                lambda net: net.layers[-1].bias,
+                self.operation_ventilation_net,
+                jnp.zeros_like(self.operation_ventilation_net.layers[-1].bias),
+            )
+        self.persistent_xi_route_logits = None
+        if persistent_xi_routing == "soft_physical":
+            off_diagonal = jnp.asarray(jnp.log(0.1 / 0.9), dtype=jnp.float32)
+            diagonal = jnp.asarray(jnp.log(0.9 / 0.1), dtype=jnp.float32)
+            route_logits = jnp.full((4, latent_dim), off_diagonal)
+            self.persistent_xi_route_logits = route_logits.at[
+                jnp.arange(4), jnp.arange(4)
+            ].set(diagonal)
         self.q_response_net = None
         self.q_response_init_net = None
         if q_to_t_mode == "positive_leaky":
@@ -689,6 +990,16 @@ class ProbabilisticContractingClosedLoopHPEmulator(eqx.Module):
         self.controller_state_dim = controller_state_dim
         self.latent_dim = latent_dim
         self.persistent_xi_pathways = persistent_xi_pathways
+        self.persistent_xi_routing = persistent_xi_routing
+        self.metadata_conditioned_xi = bool(metadata_conditioned_xi)
+        self.metadata_xi_mean_cap = float(metadata_xi_mean_cap)
+        self.metadata_xi_scale_cap = float(metadata_xi_scale_cap)
+        self.colored_latent_timescales_hours = colored_latent_timescales_hours
+        self.colored_latent_pathways = colored_latent_pathways
+        self.colored_latent_state_scale_cap = float(
+            colored_latent_state_scale_cap
+        )
+        self.colored_latent_xi_scale_cap = float(colored_latent_xi_scale_cap)
         self.process_noise_mode = process_noise_mode
         self.process_noise_init = process_noise_init
         self.process_noise_floor = process_noise_floor
@@ -722,10 +1033,71 @@ class ProbabilisticContractingClosedLoopHPEmulator(eqx.Module):
         self.hp_pel_cap_w_m2 = hp_pel_cap_w_m2
         self.hp_qroom_cap_w_m2 = hp_qroom_cap_w_m2
         self.hp_energy_cap_wh_m2 = hp_energy_cap_wh_m2
+        self.hp_buffer_capacity_mode = hp_buffer_capacity_mode
+        self.hp_buffer_delta_t_min_k = float(hp_buffer_delta_t_min_k)
+        self.hp_buffer_delta_t_max_k = float(hp_buffer_delta_t_max_k)
+        self.hp_buffer_water_heat_capacity_wh_m3_k = float(
+            hp_buffer_water_heat_capacity_wh_m3_k
+        )
+        self.hp_buffer_volume_metadata_index = int(
+            hp_buffer_volume_metadata_index
+        )
+        self.dhw_recovery = None
+        self.tank_temperatures = None
+        if tank_temperatures_enabled:
+            if dhw_recovery_enabled or hp_buffer_capacity_mode != "global":
+                raise ValueError("Tank temperatures replace the legacy buffer and DHW-debt states")
+            if len(metadata_mean) != metadata_dim or len(metadata_scale) != metadata_dim:
+                raise ValueError("Tank temperatures require physical metadata scalers")
+            if not 0 <= dhw_request_input_index < input_dim or any(
+                not 0 <= index < metadata_dim for index in
+                (hp_buffer_volume_metadata_index, dhw_volume_metadata_index, dhw_recovery_metadata_index)
+            ):
+                raise ValueError("Tank temperatures require SH/DHW volumes, DHW recovery and withdrawal")
+            self.tank_temperatures = TankTemperatures(metadata_dim, latent_dim, key=jax.random.fold_in(hp_param_key, 83))
+        self.dhw_request_input_index = int(dhw_request_input_index)
+        self.dhw_volume_metadata_index = int(dhw_volume_metadata_index)
+        self.dhw_recovery_metadata_index = int(dhw_recovery_metadata_index)
+        if dhw_recovery_enabled:
+            if not 0 <= dhw_request_input_index < input_dim or any(
+                not 0 <= index < metadata_dim for index in (dhw_volume_metadata_index, dhw_recovery_metadata_index)
+            ):
+                raise ValueError("DHW recovery requires known demand, volume and recovery metadata indices")
+            if len(metadata_mean) != metadata_dim or len(metadata_scale) != metadata_dim:
+                raise ValueError("DHW recovery requires metadata scalers")
+            self.dhw_recovery = DHWRecovery(metadata_dim, latent_dim, key=jax.random.fold_in(hp_param_key, 79))
+        self.zone_heat_ratio_net = None
+        if hp_whole_building_accounting:
+            self.zone_heat_ratio_net = MLP(
+                metadata_dim + latent_dim, 1, hidden_dim=hidden_dim, depth=depth,
+                key=jax.random.fold_in(hp_param_key, 73),
+            )
+            self.zone_heat_ratio_net = eqx.tree_at(
+                lambda net: (net.layers[-1].weight, net.layers[-1].bias),
+                self.zone_heat_ratio_net,
+                (jnp.zeros_like(self.zone_heat_ratio_net.layers[-1].weight),
+                 jnp.zeros_like(self.zone_heat_ratio_net.layers[-1].bias)),
+            )
+        if hp_buffer_capacity_mode == "physical_volume":
+            initial_fraction = (
+                float(hp_buffer_delta_t_usable_init_k)
+                - float(hp_buffer_delta_t_min_k)
+            ) / (
+                float(hp_buffer_delta_t_max_k)
+                - float(hp_buffer_delta_t_min_k)
+            )
+            self.raw_buffer_delta_t_usable = jnp.asarray(
+                math.log(initial_fraction / (1.0 - initial_fraction)),
+                dtype=jnp.float32,
+            )
+        else:
+            self.raw_buffer_delta_t_usable = None
         self.input_mean = tuple(float(value) for value in input_mean)
         self.input_scale = tuple(float(value) for value in input_scale)
         self.target_mean = tuple(float(value) for value in target_mean)
         self.target_scale = tuple(float(value) for value in target_scale)
+        self.metadata_mean = tuple(float(value) for value in metadata_mean)
+        self.metadata_scale = tuple(float(value) for value in metadata_scale)
         self.energy_scale = max(float(target_scale[1]) * 24.0, 1.0)
         self.setpoint_input_index = 0
         self.outdoor_input_index = 1
@@ -758,6 +1130,29 @@ class ProbabilisticContractingClosedLoopHPEmulator(eqx.Module):
             hydronic_innovation_time_constant_hours
         )
         self.thermal_architecture = thermal_architecture
+        self.metadata_fixed_state_update = metadata_fixed_state_update
+        self.metadata_fixed_pole_parameterization = metadata_fixed_pole_parameterization
+        self.metadata_fixed_time_constant_min_hours = float(
+            metadata_fixed_time_constant_min_hours
+        )
+        self.metadata_fixed_time_constant_max_hours = float(
+            metadata_fixed_time_constant_max_hours
+        )
+        self.causal_ventilation = bool(causal_ventilation)
+        self.ventilation_model = ventilation_model
+        self.ventilation_gain_max_per_hour_m3_s = float(
+            ventilation_gain_max_per_hour_m3_s
+        )
+        self.ventilation_delta_max_c = float(ventilation_delta_max_c)
+        self.ventilation_capacity_factor_min = float(ventilation_capacity_factor_min)
+        self.ventilation_capacity_factor_max = float(ventilation_capacity_factor_max)
+        self.operation_ventilation_gain_cap = float(operation_ventilation_gain_cap)
+        self.ventilation_volume_metadata_index = int(
+            ventilation_volume_metadata_index
+        )
+        self.ventilation_capacity_metadata_index = int(
+            ventilation_capacity_metadata_index
+        )
 
     @staticmethod
     def _metadata_fixed_base(
@@ -765,17 +1160,33 @@ class ProbabilisticContractingClosedLoopHPEmulator(eqx.Module):
         encoded_dim: int,
         gamma: float,
         dt_hours: float,
+        pole_parameterization: MetadataFixedPoleParameterization = "rho",
+        time_constant_min_hours: float = 0.1,
+        time_constant_max_hours: float = 24.0 * 21.0,
     ) -> jax.Array:
-        time_constants = jnp.geomspace(1.0, 24.0 * 21.0, state_dim)
-        rho = jnp.minimum(jnp.exp(-dt_hours / time_constants), gamma - 1e-4)
-        fraction = jnp.clip((rho - 0.05) / (gamma - 0.05), 1e-5, 1.0 - 1e-5)
-        rho_raw = jnp.log(fraction) - jnp.log1p(-fraction)
+        if pole_parameterization == "time_constant":
+            fractions = (jnp.arange(state_dim, dtype=jnp.float32) + 0.5) / state_dim
+            pole_raw = jnp.log(fractions) - jnp.log1p(-fractions)
+        else:
+            time_constants = jnp.geomspace(1.0, 24.0 * 21.0, state_dim)
+            rho = jnp.minimum(jnp.exp(-dt_hours / time_constants), gamma - 1e-4)
+            fraction = jnp.clip((rho - 0.05) / (gamma - 0.05), 1e-5, 1.0 - 1e-5)
+            pole_raw = jnp.log(fraction) - jnp.log1p(-fraction)
         b_matrix = jnp.zeros((state_dim * encoded_dim,), dtype=jnp.float32)
         bias = jnp.zeros((state_dim,), dtype=jnp.float32)
         output = jnp.zeros((state_dim,), dtype=jnp.float32).at[0].set(1.0)
         return jnp.concatenate(
-            (rho_raw.astype(jnp.float32), b_matrix, bias, output, jnp.zeros((1,)))
+            (pole_raw.astype(jnp.float32), b_matrix, bias, output, jnp.zeros((1,)))
         )
+
+    def _metadata_fixed_rho(self, pole_raw: jnp.ndarray) -> jnp.ndarray:
+        fraction = jax.nn.sigmoid(pole_raw)
+        if self.metadata_fixed_pole_parameterization == "time_constant":
+            log_min = math.log(self.metadata_fixed_time_constant_min_hours)
+            log_max = math.log(self.metadata_fixed_time_constant_max_hours)
+            time_constants = jnp.exp(log_min + (log_max - log_min) * fraction)
+            return jnp.exp(-self.hp_dt_hours / time_constants)
+        return 0.05 + (self.contraction_gamma - 0.05) * fraction
 
     def metadata_fixed_parameters(
         self,
@@ -786,7 +1197,7 @@ class ProbabilisticContractingClosedLoopHPEmulator(eqx.Module):
             jnp.concatenate([metadata, xi], axis=0)
         )
         cursor = 0
-        rho_raw = raw[cursor : cursor + self.state_dim]
+        pole_raw = raw[cursor : cursor + self.state_dim]
         cursor += self.state_dim
         matrix_size = self.state_dim * self.transition_forcing_encoded_dim
         b_matrix = raw[cursor : cursor + matrix_size].reshape(
@@ -798,7 +1209,7 @@ class ProbabilisticContractingClosedLoopHPEmulator(eqx.Module):
         output = raw[cursor : cursor + self.state_dim]
         cursor += self.state_dim
         output_bias = raw[cursor]
-        rho = 0.05 + (self.contraction_gamma - 0.05) * jax.nn.sigmoid(rho_raw)
+        rho = self._metadata_fixed_rho(pole_raw)
         return (
             rho,
             0.30 * jnp.tanh(b_matrix),
@@ -807,7 +1218,170 @@ class ProbabilisticContractingClosedLoopHPEmulator(eqx.Module):
             2.0 * jnp.tanh(output_bias),
         )
 
+    def condition_xi(self, metadata: jnp.ndarray, base_xi: jnp.ndarray) -> jnp.ndarray:
+        if not self.metadata_conditioned_xi:
+            return base_xi.astype(metadata.dtype)
+        assert self.xi_prior_net is not None
+        raw = self.xi_prior_net(metadata)
+        raw_mean = raw[: self.latent_dim]
+        raw_scale = raw[self.latent_dim :]
+        mean = jnp.asarray(self.metadata_xi_mean_cap, dtype=raw.dtype) * jnp.tanh(
+            raw_mean
+        )
+        scale = jnp.asarray(self.metadata_xi_scale_cap, dtype=raw.dtype) * jax.nn.sigmoid(
+            raw_scale
+        )
+        return mean + scale * base_xi.astype(raw.dtype)
+
+    def routed_persistent_xi(
+        self,
+        xi: jnp.ndarray,
+        route: Literal["envelope", "hp", "controller", "operation"],
+    ) -> jnp.ndarray:
+        """Expose the latent coordinates assigned to one physical pathway."""
+        if self.persistent_xi_routing == "shared":
+            return xi
+        route_index = {
+            "envelope": 0,
+            "hp": 1,
+            "controller": 2,
+            "operation": 3,
+        }
+        if route not in route_index:
+            raise ValueError(f"Unknown persistent-xi route: {route!r}")
+        index = route_index[route]
+        if self.persistent_xi_routing == "soft_physical":
+            assert self.persistent_xi_route_logits is not None
+            return xi * jax.nn.sigmoid(self.persistent_xi_route_logits[index])
+        return jnp.zeros_like(xi).at[index].set(xi[index])
+
+    def apply_operational_ventilation_scale(
+        self,
+        metadata: jnp.ndarray,
+        operation_xi: jnp.ndarray,
+        input_t: jnp.ndarray,
+    ) -> jnp.ndarray:
+        """Apply the operation latent only to the existing ventilation signal."""
+        if self.operation_ventilation_net is None:
+            return input_t
+        zero_xi = jnp.zeros_like(operation_xi)
+        reference = self.operation_ventilation_net(
+            jnp.concatenate([metadata, zero_xi], axis=0)
+        )[0]
+        conditioned = self.operation_ventilation_net(
+            jnp.concatenate([metadata, operation_xi], axis=0)
+        )[0]
+        log_cap = jnp.log(
+            jnp.asarray(self.operation_ventilation_gain_cap, dtype=input_t.dtype)
+        )
+        gain = jnp.exp(log_cap * jnp.tanh(conditioned - reference))
+        physical_flow = jnp.maximum(
+            self._physical_input(input_t, self.ventilation_input_index),
+            jnp.asarray(0.0, dtype=input_t.dtype),
+        )
+        adjusted_flow = gain * physical_flow
+        normalized_flow = (
+            adjusted_flow
+            - jnp.asarray(
+                self.input_mean[self.ventilation_input_index], dtype=input_t.dtype
+            )
+        ) / jnp.asarray(
+            self.input_scale[self.ventilation_input_index], dtype=input_t.dtype
+        )
+        return input_t.at[self.ventilation_input_index].set(normalized_flow)
+
+    def colored_latent_path(self, white_noise: jnp.ndarray) -> jnp.ndarray:
+        """Transform white noise into stationary OU modes at fixed timescales."""
+        latent_count = len(self.colored_latent_timescales_hours)
+        if white_noise.ndim != 2 or white_noise.shape[1] != latent_count:
+            raise ValueError(
+                "white_noise must have shape [horizon, colored_latent_count]"
+            )
+        if latent_count == 0:
+            return white_noise
+        timescales = jnp.asarray(
+            self.colored_latent_timescales_hours,
+            dtype=white_noise.dtype,
+        )
+        rho = jnp.exp(
+            -jnp.asarray(self.hp_dt_hours, dtype=white_noise.dtype) / timescales
+        )
+        innovation_scale = jnp.sqrt(jnp.maximum(1.0 - rho**2, 0.0))
+
+        def step(
+            previous: jnp.ndarray,
+            innovation: jnp.ndarray,
+        ) -> tuple[jnp.ndarray, jnp.ndarray]:
+            current = rho * previous + innovation_scale * innovation
+            return current, current
+
+        _, tail = jax.lax.scan(step, white_noise[0], white_noise[1:])
+        return jnp.concatenate([white_noise[:1], tail], axis=0)
+
+    def colored_latent_loadings(
+        self,
+        metadata: jnp.ndarray,
+    ) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+        """Return bounded, metadata-conditioned colored-mode loadings."""
+        latent_count = len(self.colored_latent_timescales_hours)
+        if latent_count == 0:
+            return (
+                jnp.zeros((self.state_dim, 0), dtype=metadata.dtype),
+                jnp.zeros((self.latent_dim, 0), dtype=metadata.dtype),
+                jnp.zeros((self.latent_dim, 0), dtype=metadata.dtype),
+            )
+        assert self.colored_latent_net is not None
+        loading_count = self.state_dim + 2 * self.latent_dim
+        raw_loadings = self.colored_latent_net(metadata).reshape(
+            loading_count,
+            latent_count,
+        )
+        state_end = self.state_dim
+        q_end = state_end + self.latent_dim
+        state_loadings = (
+            jnp.asarray(self.colored_latent_state_scale_cap, dtype=metadata.dtype)
+            * jnp.tanh(raw_loadings[:state_end])
+        )
+        q_loadings = (
+            jnp.asarray(self.colored_latent_xi_scale_cap, dtype=metadata.dtype)
+            * jnp.tanh(raw_loadings[state_end:q_end])
+        )
+        hp_loadings = (
+            jnp.asarray(self.colored_latent_xi_scale_cap, dtype=metadata.dtype)
+            * jnp.tanh(raw_loadings[q_end:])
+        )
+        if "thermal" not in self.colored_latent_pathways:
+            state_loadings = jnp.zeros_like(state_loadings)
+        if "q_to_t" not in self.colored_latent_pathways:
+            q_loadings = jnp.zeros_like(q_loadings)
+        if "hp" not in self.colored_latent_pathways:
+            hp_loadings = jnp.zeros_like(hp_loadings)
+        return state_loadings, q_loadings, hp_loadings
+
+    def colored_latent_offsets(
+        self,
+        metadata: jnp.ndarray,
+        colored_latent_t: jnp.ndarray,
+        loadings: tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray] | None = None,
+    ) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+        """Map shared colored modes to thermal, q-to-T, and HP pathways."""
+        latent_count = len(self.colored_latent_timescales_hours)
+        if colored_latent_t.shape != (latent_count,):
+            raise ValueError(
+                "colored_latent_t must have shape [colored_latent_count]"
+            )
+        if loadings is None:
+            loadings = self.colored_latent_loadings(metadata)
+        normalizer = jnp.sqrt(
+            jnp.asarray(max(latent_count, 1), dtype=metadata.dtype)
+        )
+        return tuple(
+            loading @ colored_latent_t / normalizer for loading in loadings
+        )
+
     def encode_input(self, input_t: jnp.ndarray) -> jnp.ndarray:
+        if self.causal_ventilation:
+            input_t = input_t.at[self.ventilation_input_index].set(0.0)
         if self.hp_force_off_input_index >= 0:
             input_t = input_t.at[self.hp_force_off_input_index].set(0.0)
         if self.thermostat_demand_mode == "monotone":
@@ -946,7 +1520,48 @@ class ProbabilisticContractingClosedLoopHPEmulator(eqx.Module):
             + jnp.asarray(self.target_mean[self.temperature_target_index], dtype=temperature_scaled.dtype)
         )
 
-    def _energy_scaled(self, energy_t: jnp.ndarray) -> jnp.ndarray:
+    def buffer_delta_t_usable_k(self, dtype: jnp.dtype) -> jnp.ndarray:
+        if self.raw_buffer_delta_t_usable is None:
+            return jnp.asarray(0.0, dtype=dtype)
+        lower = jnp.asarray(self.hp_buffer_delta_t_min_k, dtype=dtype)
+        width = jnp.asarray(
+            self.hp_buffer_delta_t_max_k - self.hp_buffer_delta_t_min_k,
+            dtype=dtype,
+        )
+        return lower + width * jax.nn.sigmoid(
+            self.raw_buffer_delta_t_usable.astype(dtype)
+        )
+
+    def buffer_capacity_wh_m2(self, metadata: jnp.ndarray) -> jnp.ndarray:
+        if self.hp_buffer_capacity_mode == "global":
+            return jnp.asarray(self.hp_energy_cap_wh_m2, dtype=metadata.dtype)
+        volume_m3_per_m2 = jnp.maximum(
+            self._physical_metadata(
+                metadata,
+                self.hp_buffer_volume_metadata_index,
+            ),
+            jnp.asarray(1e-8, dtype=metadata.dtype),
+        )
+        return (
+            volume_m3_per_m2
+            * jnp.asarray(
+                self.hp_buffer_water_heat_capacity_wh_m3_k,
+                dtype=metadata.dtype,
+            )
+            * self.buffer_delta_t_usable_k(metadata.dtype)
+        )
+
+    def _energy_scaled(
+        self,
+        energy_t: jnp.ndarray,
+        metadata: jnp.ndarray,
+    ) -> jnp.ndarray:
+        if self.hp_buffer_capacity_mode == "physical_volume":
+            capacity = jnp.maximum(
+                self.buffer_capacity_wh_m2(metadata),
+                jnp.asarray(1e-6, dtype=energy_t.dtype),
+            )
+            return energy_t / capacity
         return energy_t / jnp.asarray(max(self.energy_scale, 1.0), dtype=energy_t.dtype)
 
     def _setpoint_gap_scaled(
@@ -1014,6 +1629,7 @@ class ProbabilisticContractingClosedLoopHPEmulator(eqx.Module):
         hp_mode_history_t: jnp.ndarray | None = None,
         hp_setpoint_shock_t: jnp.ndarray | None = None,
         hp_force_off_debt_t: jnp.ndarray | None = None,
+        tank_temperature_t: jnp.ndarray | None = None,
     ) -> jnp.ndarray:
         gap_feature = self._setpoint_gap_scaled(input_t, temperature_t)
         values = [
@@ -1022,7 +1638,10 @@ class ProbabilisticContractingClosedLoopHPEmulator(eqx.Module):
             encoded_input_t,
             jnp.asarray([temperature_t], dtype=encoded_input_t.dtype),
             jnp.asarray([gap_feature], dtype=encoded_input_t.dtype),
-            jnp.asarray([self._energy_scaled(energy_t)], dtype=encoded_input_t.dtype),
+            jnp.asarray(
+                [self._energy_scaled(energy_t, metadata)],
+                dtype=encoded_input_t.dtype,
+            ),
         ]
         if self.hp_activation_model == "persistent_markov":
             if controller_state_t is None or hp_latent is None:
@@ -1063,6 +1682,9 @@ class ProbabilisticContractingClosedLoopHPEmulator(eqx.Module):
                     "trace per configured timescale"
                 )
             values.append(hp_force_off_debt_t.astype(encoded_input_t.dtype))
+        if self.tank_temperatures is not None:
+            values.append(jnp.zeros((2,), dtype=metadata.dtype) if tank_temperature_t is None
+                          else (tank_temperature_t - jnp.asarray([40., 55.])) / 10.)
         return jnp.concatenate(values, axis=0)
 
     def initial_controller_state(
@@ -1355,6 +1977,10 @@ class ProbabilisticContractingClosedLoopHPEmulator(eqx.Module):
         temperature_t: jnp.ndarray,
     ) -> jnp.ndarray:
         thermal_inputs = input_t[1:]
+        if self.causal_ventilation and self.ventilation_input_index >= 1:
+            thermal_inputs = thermal_inputs.at[
+                self.ventilation_input_index - 1
+            ].set(0.0)
         if self.hp_force_off_input_index >= 1:
             thermal_inputs = thermal_inputs.at[
                 self.hp_force_off_input_index - 1
@@ -1384,6 +2010,89 @@ class ProbabilisticContractingClosedLoopHPEmulator(eqx.Module):
                 jnp.asarray([self._outdoor_gap_scaled(input_t, temperature_t)], dtype=input_t.dtype),
             ],
             axis=0,
+        )
+
+    def apply_causal_ventilation(
+        self,
+        metadata: jnp.ndarray,
+        xi: jnp.ndarray,
+        input_t: jnp.ndarray,
+        previous_temperature_scaled: jnp.ndarray,
+        predicted_temperature_scaled: jnp.ndarray,
+    ) -> jnp.ndarray:
+        """Apply a sign-constrained air-exchange increment to Tin."""
+        if self.ventilation_gain_net is None:
+            return predicted_temperature_scaled
+        raw_gain = self.ventilation_gain_net(jnp.concatenate([metadata, xi], axis=0))[0]
+        flow_m3_s = jnp.maximum(
+            self._physical_input(input_t, self.ventilation_input_index), 0.0
+        )
+        outdoor_c = self._physical_input(input_t, self.outdoor_input_index)
+        if self.ventilation_model == "physical_air_mixing":
+            volume_m3 = self._physical_metadata(
+                metadata, self.ventilation_volume_metadata_index
+            )
+            base_capacity_multiplier = self._physical_metadata(
+                metadata, self.ventilation_capacity_metadata_index
+            )
+            log_min = jnp.log(
+                jnp.asarray(self.ventilation_capacity_factor_min, dtype=raw_gain.dtype)
+            )
+            log_max = jnp.log(
+                jnp.asarray(self.ventilation_capacity_factor_max, dtype=raw_gain.dtype)
+            )
+            capacity_factor = jnp.exp(
+                log_min + (log_max - log_min) * jax.nn.sigmoid(raw_gain)
+            )
+            effective_capacity_multiplier = jnp.maximum(
+                base_capacity_multiplier * capacity_factor,
+                jnp.asarray(1e-3, dtype=raw_gain.dtype),
+            )
+            air_changes_per_hour = (
+                jnp.asarray(3600.0, dtype=raw_gain.dtype)
+                * flow_m3_s
+                / jnp.maximum(volume_m3, jnp.asarray(1e-3, dtype=raw_gain.dtype))
+            )
+            retention = jnp.exp(
+                -jnp.asarray(self.hp_dt_hours, dtype=raw_gain.dtype)
+                * air_changes_per_hour
+                / effective_capacity_multiplier
+            )
+            predicted_c = self._temperature_physical(predicted_temperature_scaled)
+            mixed_c = outdoor_c + retention * (predicted_c - outdoor_c)
+            return self._target_scaled(mixed_c, self.temperature_target_index)
+        gain = jnp.asarray(
+            self.ventilation_gain_max_per_hour_m3_s, dtype=raw_gain.dtype
+        ) * jax.nn.sigmoid(raw_gain)
+        indoor_c = self._temperature_physical(previous_temperature_scaled)
+        raw_delta_c = (
+            jnp.asarray(self.hp_dt_hours, dtype=raw_gain.dtype)
+            * gain
+            * flow_m3_s
+            * (outdoor_c - indoor_c)
+        )
+        delta_bound = jnp.asarray(self.ventilation_delta_max_c, dtype=raw_gain.dtype)
+        delta_c = delta_bound * jnp.tanh(raw_delta_c / delta_bound)
+        temperature_scale = jnp.maximum(
+            jnp.abs(
+                jnp.asarray(
+                    self.target_scale[self.temperature_target_index],
+                    dtype=raw_gain.dtype,
+                )
+            ),
+            jnp.asarray(1e-6, dtype=raw_gain.dtype),
+        )
+        return predicted_temperature_scaled + delta_c / temperature_scale
+
+    def _physical_metadata(
+        self,
+        metadata: jnp.ndarray,
+        index: int,
+    ) -> jnp.ndarray:
+        return (
+            metadata[index]
+            * jnp.asarray(self.metadata_scale[index], dtype=metadata.dtype)
+            + jnp.asarray(self.metadata_mean[index], dtype=metadata.dtype)
         )
 
     def decode_temperature(
@@ -1549,6 +2258,13 @@ class ProbabilisticContractingClosedLoopHPEmulator(eqx.Module):
         )
         return fallback_cap * jax.nn.sigmoid(logit)
 
+    def zone_heat_ratio(self, metadata: jnp.ndarray, xi: jnp.ndarray) -> jnp.ndarray:
+        """Zone W/m2 divided by whole-building W/m2, not a fraction of total watts."""
+        if self.zone_heat_ratio_net is None:
+            return jnp.asarray(1.0, dtype=metadata.dtype)
+        raw = self.zone_heat_ratio_net(jnp.concatenate([metadata, xi]))[0]
+        return jnp.exp(0.7 * jnp.tanh(raw))
+
     def hp_parameters(
         self,
         metadata: jnp.ndarray,
@@ -1585,7 +2301,36 @@ class ProbabilisticContractingClosedLoopHPEmulator(eqx.Module):
         requested_room_heat_t: jnp.ndarray,
         dt_h: jnp.ndarray,
         loss_rate: jnp.ndarray,
+        energy_cap_wh_m2: jnp.ndarray | None = None,
+        zone_heat_ratio: jnp.ndarray | float = 1.0,
     ) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+        if energy_cap_wh_m2 is not None:
+            capacity = jnp.maximum(
+                energy_cap_wh_m2,
+                jnp.asarray(1e-8, dtype=energy_t.dtype),
+            )
+            uncapped_energy_t = jnp.maximum(
+                energy_t + dt_h * generated_heat_power_t,
+                jnp.asarray(0.0, dtype=energy_t.dtype),
+            )
+            loss_fraction_t = 1.0 - jnp.exp(
+                -jnp.maximum(loss_rate, 0.0) * dt_h
+            )
+            energy_available_t = uncapped_energy_t * (1.0 - loss_fraction_t)
+            available_power_t = jnp.maximum(
+                energy_available_t / dt_h,
+                0.0,
+            )
+            qroom_t = self._nonnegative_capped(
+                jnp.minimum(requested_room_heat_t, available_power_t * zone_heat_ratio),
+                self.hp_qroom_cap_w_m2,
+            )
+            energy_after_delivery_t = jnp.maximum(
+                energy_available_t - dt_h * qroom_t / zone_heat_ratio,
+                jnp.asarray(0.0, dtype=energy_t.dtype),
+            )
+            energy_next = jnp.minimum(energy_after_delivery_t, capacity)
+            return qroom_t, available_power_t * zone_heat_ratio, energy_next
         energy_charged_t = self._nonnegative_capped(
             energy_t + dt_h * generated_heat_power_t,
             self.hp_energy_cap_wh_m2,
@@ -1597,14 +2342,14 @@ class ProbabilisticContractingClosedLoopHPEmulator(eqx.Module):
         )
         available_power_t = jnp.maximum(energy_available_t / dt_h, 0.0)
         qroom_t = self._nonnegative_capped(
-            jnp.minimum(requested_room_heat_t, available_power_t),
+            jnp.minimum(requested_room_heat_t, available_power_t * zone_heat_ratio),
             self.hp_qroom_cap_w_m2,
         )
         energy_next = self._nonnegative_capped(
-            energy_available_t - dt_h * qroom_t,
+            energy_available_t - dt_h * qroom_t / zone_heat_ratio,
             self.hp_energy_cap_wh_m2,
         )
-        return qroom_t, available_power_t, energy_next
+        return qroom_t, available_power_t * zone_heat_ratio, energy_next
 
     def initial_state(
         self,
@@ -1629,6 +2374,8 @@ class ProbabilisticContractingClosedLoopHPEmulator(eqx.Module):
         xi: jnp.ndarray,
     ) -> jnp.ndarray:
         raw = self.e0_net(jnp.concatenate([metadata, initial_temperature, xi], axis=0))[0]
+        if self.hp_buffer_capacity_mode == "physical_volume":
+            return jax.nn.sigmoid(raw) * self.buffer_capacity_wh_m2(metadata)
         energy = jax.nn.softplus(raw) * jnp.asarray(self.energy_scale, dtype=raw.dtype)
         return self._nonnegative_capped(energy, self.hp_energy_cap_wh_m2)
 
@@ -1777,7 +2524,10 @@ class ProbabilisticContractingClosedLoopHPEmulator(eqx.Module):
         state_t: jnp.ndarray,
         eps_t: jnp.ndarray,
         fixed_matrix: jnp.ndarray | None = None,
+        colored_state_t: jnp.ndarray | None = None,
     ) -> jnp.ndarray:
+        if colored_state_t is None:
+            colored_state_t = jnp.zeros((self.state_dim,), dtype=state_t.dtype)
         if self.thermal_architecture == "metadata_fixed_ss":
             rho, input_matrix, bias, _, _ = self.metadata_fixed_parameters(
                 metadata, xi
@@ -1791,12 +2541,17 @@ class ProbabilisticContractingClosedLoopHPEmulator(eqx.Module):
             scale_t = self.process_scale(
                 metadata, xi, thermal_forcing_t, state_t
             )
-            return (
+            raw_next = (
                 rho * state_t
                 + input_matrix @ encoded_forcing
                 + bias
                 + scale_t * eps_t
+                + colored_state_t
             )
+            if self.metadata_fixed_state_update == "bounded_tanh":
+                bound = jnp.asarray(self.state_bound, dtype=raw_next.dtype)
+                return bound * jnp.tanh(raw_next / bound)
+            return raw_next
         if fixed_matrix is None:
             matrix, bias = self.transition_matrix_and_bias(
                 metadata, xi, thermal_forcing_t
@@ -1806,7 +2561,9 @@ class ProbabilisticContractingClosedLoopHPEmulator(eqx.Module):
             bias = self.transition_bias(metadata, xi, thermal_forcing_t)
         scale_t = self.process_scale(metadata, xi, thermal_forcing_t, state_t)
         scaled_state = state_t / jnp.asarray(self.state_bound, dtype=state_t.dtype)
-        raw_next = matrix @ scaled_state + bias + scale_t * eps_t
+        raw_next = (
+            matrix @ scaled_state + bias + scale_t * eps_t + colored_state_t
+        )
         return jnp.asarray(self.state_bound, dtype=state_t.dtype) * jnp.tanh(raw_next)
 
     def hp_emission(
@@ -1906,6 +2663,8 @@ class ProbabilisticContractingClosedLoopHPEmulator(eqx.Module):
         hp_setpoint_shock_t: jnp.ndarray | None = None,
         hp_force_off_debt_t: jnp.ndarray | None = None,
         *,
+        zone_heat_ratio_override: jnp.ndarray | None = None,
+        controller_xi: jnp.ndarray | None = None,
         hp_scenario_mode: HPElectricRolloutMode,
         hp_concrete_temperature: jnp.ndarray | float,
         hp_generation_available_t: jnp.ndarray | float = 1.0,
@@ -1913,6 +2672,9 @@ class ProbabilisticContractingClosedLoopHPEmulator(eqx.Module):
         qroom_mode_uniform_t: jnp.ndarray | None = None,
         hydronic_innovation_t: jnp.ndarray | float = 0.0,
         hydronic_delivery_state_t: jnp.ndarray | float = 0.0,
+        tank_temperature_t: jnp.ndarray | None = None,
+        tank_parameters: jnp.ndarray | None = None,
+        tank_capacities: jnp.ndarray | None = None,
     ) -> tuple[jnp.ndarray, ...]:
         features = self.hp_features(
             metadata,
@@ -1927,31 +2689,52 @@ class ProbabilisticContractingClosedLoopHPEmulator(eqx.Module):
             hp_mode_history_t,
             hp_setpoint_shock_t,
             hp_force_off_debt_t,
+            tank_temperature_t,
+        )
+        controller_features = (
+            features
+            if controller_xi is None or self.persistent_xi_routing == "shared"
+            else self.hp_features(
+                metadata,
+                controller_xi,
+                encoded_input_t,
+                input_t,
+                energy_t,
+                temperature_t,
+                controller_state_t,
+                hp_latent,
+                hp_power_history_t,
+                hp_mode_history_t,
+                hp_setpoint_shock_t,
+                hp_force_off_debt_t,
+                tank_temperature_t,
+            )
         )
         availability_t = self._space_heating_availability(input_t)
         output = self.output_net(features)
+        controller_output = (
+            output
+            if controller_xi is None
+            else self.output_net(controller_features)
+        )
         if self.thermostat_demand_mode == "monotone":
             # Constrain only latent emitter demand. Compressor mode and active
             # power retain their unrestricted dependence on gap, history and E.
             gap_feature_index = self.metadata_dim + self.latent_dim + self.encoded_input_dim + 1
             demand_features = features.at[gap_feature_index].set(0.0)
             demand_output = self.output_net(demand_features)
+            _, _, pel_mu_logit, pel_sigma_logit, _, _ = output
             (
                 _,
                 mode_logit,
-                pel_mu_logit,
-                pel_sigma_logit,
-                _,
-                _,
-            ) = output
-            (
-                qroom_capacity_logit,
-                _,
                 _,
                 _,
                 qroom_slope_raw,
                 qroom_threshold_raw,
-            ) = demand_output
+            ) = self.output_net(
+                controller_features.at[gap_feature_index].set(0.0)
+            )
+            qroom_capacity_logit = demand_output[0]
             gap_c = self._setpoint_gap_c(input_t, temperature_t)
             qroom_gate_t = jax.nn.sigmoid(
                 self._thermostat_slope(qroom_slope_raw)
@@ -1967,7 +2750,8 @@ class ProbabilisticContractingClosedLoopHPEmulator(eqx.Module):
                 * qroom_gate_t
             )
         else:
-            qroom_logit, mode_logit, pel_mu_logit, pel_sigma_logit = output
+            qroom_logit, _, pel_mu_logit, pel_sigma_logit = output
+            mode_logit = controller_output[1]
             requested_qroom_t = availability_t * self._positive_capped_from_logit(
                 qroom_logit,
                 self.hp_qroom_cap_w_m2,
@@ -1980,7 +2764,7 @@ class ProbabilisticContractingClosedLoopHPEmulator(eqx.Module):
             if qroom_mode_uniform_t is None:
                 qroom_mode_uniform_t = jnp.asarray(0.5, dtype=input_t.dtype)
             qroom_p_start_t, qroom_p_stop_t = self.qroom_transition_probabilities(
-                demand_features,
+                controller_features.at[gap_feature_index].set(0.0),
                 input_t,
                 temperature_t,
             )
@@ -2027,7 +2811,7 @@ class ProbabilisticContractingClosedLoopHPEmulator(eqx.Module):
         )
         if self.hp_activation_model in ("persistent_markov", "asymmetric_markov"):
             assert self.hp_transition_net is not None
-            start_logit_t, stop_logit_t = self.hp_transition_net(features)
+            start_logit_t, stop_logit_t = self.hp_transition_net(controller_features)
             p_start_t = jax.nn.sigmoid(start_logit_t)
             p_stop_t = jax.nn.sigmoid(stop_logit_t)
             pi_unavailable_t = (
@@ -2088,7 +2872,7 @@ class ProbabilisticContractingClosedLoopHPEmulator(eqx.Module):
             pel_t = self._nonnegative_capped(hp_on_t * pel_active_t, self.hp_pel_cap_w_m2)
 
         controller_state_next = self.next_controller_state(
-            features,
+            controller_features,
             hp_on_t,
             controller_state_t,
             controller_noise_t,
@@ -2105,13 +2889,21 @@ class ProbabilisticContractingClosedLoopHPEmulator(eqx.Module):
             jnp.asarray(hydronic_delivery_state_t, dtype=input_t.dtype),
             requested_qroom_t,
         )
-        qroom_t, available_power_t, energy_next = self._buffer_draw(
-            energy_t,
-            cop_t * pel_t,
-            requested_qroom_t,
-            jnp.asarray(self.hp_dt_hours, dtype=input_t.dtype),
-            loss_rate,
-        )
+        if self.tank_temperatures is None:
+            qroom_t, available_power_t, energy_next = self._buffer_draw(
+                energy_t, cop_t * pel_t, requested_qroom_t,
+                jnp.asarray(self.hp_dt_hours, dtype=input_t.dtype), loss_rate,
+                self.buffer_capacity_wh_m2(metadata) if self.hp_buffer_capacity_mode == "physical_volume" else None,
+                zone_heat_ratio=(self.zone_heat_ratio(metadata, xi)
+                                 if zone_heat_ratio_override is None else zone_heat_ratio_override),
+            )
+        else:
+            room_c = temperature_t * self.target_scale[0] + self.target_mean[0]
+            qroom_t, available_power_t = self.tank_temperatures.deliver(
+                tank_parameters, tank_temperature_t, tank_capacities, room_c,
+                requested_qroom_t, cop_t * pel_t, self.hp_dt_hours,
+            )
+            energy_next = energy_t  # Replaced below by energy derived from predicted SH temperature.
         return (
             pi_t,
             cop_t,
@@ -2146,7 +2938,10 @@ class ProbabilisticContractingClosedLoopHPEmulator(eqx.Module):
         controller_noise: jnp.ndarray,
         *,
         qroom_mode_uniform: jnp.ndarray | None = None,
+        dhw_mode_uniform: jnp.ndarray | None = None,
+        tank_noise: jnp.ndarray | None = None,
         hydronic_innovation: jnp.ndarray | None = None,
+        colored_latent: jnp.ndarray | None = None,
         hp_scenario_mode: HPElectricRolloutMode = "expected",
         hp_concrete_temperature: jnp.ndarray | float = 0.5,
         hp_feedback_pel: jnp.ndarray | None = None,
@@ -2161,19 +2956,24 @@ class ProbabilisticContractingClosedLoopHPEmulator(eqx.Module):
         ventilation_nominal_flow_m3_s: jnp.ndarray | float = 0.0,
         ventilation_minimum_indoor_outdoor_delta_c: jnp.ndarray | float = 2.0,
         initial_xi: jnp.ndarray | None = None,
+        initial_state_xi: jnp.ndarray | None = None,
+        initial_energy_xi: jnp.ndarray | None = None,
         thermal_xi: jnp.ndarray | None = None,
         q_response_xi: jnp.ndarray | None = None,
         hp_xi: jnp.ndarray | None = None,
+        controller_xi: jnp.ndarray | None = None,
+        operation_xi: jnp.ndarray | None = None,
     ) -> tuple[jnp.ndarray, ProbClosedLoopAux]:
         if hp_scenario_mode not in (
             "expected",
             "bernoulli",
             "straight_through",
             "hard_expected_grad",
+            "score_function",
         ):
             raise ValueError(
                 "hp_scenario_mode must be 'expected', 'bernoulli', "
-                "'straight_through', or 'hard_expected_grad'"
+                "'straight_through', 'hard_expected_grad', or 'score_function'"
             )
         if qroom_mode_uniform is None:
             qroom_mode_uniform = jnp.mod(
@@ -2186,6 +2986,16 @@ class ProbabilisticContractingClosedLoopHPEmulator(eqx.Module):
             hydronic_innovation = jnp.zeros((inputs.shape[0],), dtype=inputs.dtype)
         if hydronic_innovation.shape != (inputs.shape[0],):
             raise ValueError("hydronic_innovation must have shape [horizon]")
+        colored_latent_count = len(self.colored_latent_timescales_hours)
+        if colored_latent is None:
+            colored_latent = jnp.zeros(
+                (inputs.shape[0], colored_latent_count),
+                dtype=inputs.dtype,
+            )
+        if colored_latent.shape != (inputs.shape[0], colored_latent_count):
+            raise ValueError(
+                "colored_latent must have shape [horizon, colored_latent_count]"
+            )
         if (hp_feedback_pel is None) != (hp_feedback_mode is None):
             raise ValueError("hp_feedback_pel and hp_feedback_mode must be provided together")
         if hp_feedback_pel is not None:
@@ -2225,17 +3035,61 @@ class ProbabilisticContractingClosedLoopHPEmulator(eqx.Module):
         # Optional pathway-specific latents are diagnostic hooks. Production
         # calls leave them unset, preserving the original shared-xi rollout.
         initial_xi = xi if initial_xi is None else initial_xi
+        initial_state_xi = initial_xi if initial_state_xi is None else initial_state_xi
+        initial_energy_xi = initial_xi if initial_energy_xi is None else initial_energy_xi
         thermal_xi = xi if thermal_xi is None else thermal_xi
         q_response_xi = xi if q_response_xi is None else q_response_xi
         hp_xi = xi if hp_xi is None else hp_xi
+        controller_xi = hp_xi if controller_xi is None else controller_xi
+        operation_xi = thermal_xi if operation_xi is None else operation_xi
+        annual_zone_heat_ratio = self.zone_heat_ratio(metadata, hp_xi)
+        dhw_aux = ()
+        if self.dhw_recovery is not None:
+            if dhw_mode_uniform is None:
+                dhw_mode_uniform = jnp.mod(hp_mode_uniform + .381966, 1.)
+            draw = jax.vmap(lambda u: self._physical_input(u, self.dhw_request_input_index))(inputs)
+            generator_available = hp_generation_availability * jax.vmap(self._hp_generation_availability)(inputs)
+            dhw_aux = self.dhw_recovery.rollout(
+                metadata, hp_xi, draw, generator_available, dhw_mode_uniform,
+                volume_m3_m2=self._physical_metadata(metadata, self.dhw_volume_metadata_index),
+                recovery_w_m2=self._physical_metadata(metadata, self.dhw_recovery_metadata_index),
+                dt_hours=self.hp_dt_hours, scenario_mode=hp_scenario_mode,
+                temperature=hp_concrete_temperature, truncate_steps=self.bptt_truncate_steps,
+            )
+            hp_generation_availability = hp_generation_availability * (1 - dhw_aux[1])
+        colored_loadings = self.colored_latent_loadings(metadata)
+        colored_state0, colored_q_xi0, colored_hp_xi0 = (
+            self.colored_latent_offsets(
+                metadata,
+                colored_latent[0],
+                colored_loadings,
+            )
+        )
+        q_response_xi0 = q_response_xi + colored_q_xi0
+        hp_xi0 = hp_xi + colored_hp_xi0
         setpoint_shock_features = self.setpoint_shock_features(inputs)
-        state0 = self.initial_state(metadata, initial_temperature, initial_xi)
-        energy0 = self.initial_energy(metadata, initial_temperature, initial_xi)
+        state0 = (
+            self.initial_state(metadata, initial_temperature, initial_state_xi)
+            + colored_state0
+        )
+        energy0 = self.initial_energy(metadata, initial_temperature, initial_energy_xi)
         temperature0 = initial_temperature[0]
+        tank_state0 = jnp.zeros((2,), dtype=inputs.dtype)
+        tank_parameters = tank_capacities = None
+        if self.tank_temperatures is not None:
+            tank_parameters = self.tank_temperatures.parameters(metadata, hp_xi)
+            volumes = jnp.stack([self._physical_metadata(metadata, index) for index in
+                                (self.hp_buffer_volume_metadata_index, self.dhw_volume_metadata_index)])
+            tank_capacities = self.tank_temperatures.capacities(tank_parameters, volumes)
+            tank_state0 = self.tank_temperatures.initial(tank_parameters, self._space_heating_availability(inputs[0]))
+            energy0 = self.tank_temperatures.energy(tank_state0, tank_capacities,
+                                                   temperature0 * self.target_scale[0] + self.target_mean[0])
+        if tank_noise is None:
+            tank_noise = jnp.zeros((inputs.shape[0], 2), dtype=inputs.dtype)
         q_response_state0 = self.initial_q_response_state(
             metadata,
             initial_temperature,
-            q_response_xi,
+            q_response_xi0,
         )
         hydronic_delivery_state0 = jnp.asarray(0.0, dtype=inputs.dtype)
         alpha = self.temperature_alpha(metadata, thermal_xi)
@@ -2250,7 +3104,7 @@ class ProbabilisticContractingClosedLoopHPEmulator(eqx.Module):
         if self.hp_activation_model == "asymmetric_markov":
             previous_mode0 = self.initial_asymmetric_markov_mode(
                 metadata,
-                hp_xi,
+                controller_xi,
                 inputs[0],
                 energy0,
                 temperature0,
@@ -2260,7 +3114,7 @@ class ProbabilisticContractingClosedLoopHPEmulator(eqx.Module):
             )
         previous_qroom_mode0 = self.initial_qroom_markov_mode(
             metadata,
-            hp_xi,
+            controller_xi,
             inputs[0],
             energy0,
             temperature0,
@@ -2278,6 +3132,7 @@ class ProbabilisticContractingClosedLoopHPEmulator(eqx.Module):
 
         def step(
             carry: tuple[
+                jnp.ndarray,
                 jnp.ndarray,
                 jnp.ndarray,
                 jnp.ndarray,
@@ -2315,6 +3170,7 @@ class ProbabilisticContractingClosedLoopHPEmulator(eqx.Module):
                 force_off_debt_t,
                 force_off_release_t,
                 previous_force_off_t,
+                tank_state_t,
             ) = carry
             (
                 time_index,
@@ -2327,7 +3183,17 @@ class ProbabilisticContractingClosedLoopHPEmulator(eqx.Module):
                 qroom_mode_uniform_t,
                 hp_generation_available_t,
                 hydronic_innovation_t,
+                colored_latent_t,
             ) = step_inputs
+            colored_state_t, colored_q_xi_t, colored_hp_xi_t = (
+                self.colored_latent_offsets(
+                    metadata,
+                    colored_latent_t,
+                    colored_loadings,
+                )
+            )
+            q_response_xi_t = q_response_xi + colored_q_xi_t
+            hp_xi_t = hp_xi + colored_hp_xi_t
             feedback_temperature_t = scale_gradient(
                 temperature_t,
                 self.temperature_feedback_gradient_scale,
@@ -2355,6 +3221,11 @@ class ProbabilisticContractingClosedLoopHPEmulator(eqx.Module):
                     temperature_mean_c=self.target_mean[self.temperature_target_index],
                     temperature_scale_c=self.target_scale[self.temperature_target_index],
                 )
+            input_t = self.apply_operational_ventilation_scale(
+                metadata,
+                operation_xi,
+                input_t,
+            )
             encoded_input_t = self.encode_input(input_t)
             hp_temperature_t = (
                 feedback_temperature_t
@@ -2380,6 +3251,9 @@ class ProbabilisticContractingClosedLoopHPEmulator(eqx.Module):
             hp_force_off_debt_t = jnp.concatenate(
                 [force_off_debt_next, force_off_release_next], axis=0
             )
+            if self.tank_temperatures is not None:
+                energy_t = self.tank_temperatures.energy(tank_state_t, tank_capacities,
+                    feedback_temperature_t * self.target_scale[0] + self.target_mean[0])
             (
                 pi_t,
                 cop_t,
@@ -2401,7 +3275,7 @@ class ProbabilisticContractingClosedLoopHPEmulator(eqx.Module):
                 qroom_p_stop_t,
             ) = self.decode_hp(
                 metadata,
-                hp_xi,
+                hp_xi_t,
                 encoded_input_t,
                 input_t,
                 energy_t,
@@ -2416,6 +3290,8 @@ class ProbabilisticContractingClosedLoopHPEmulator(eqx.Module):
                 controller_noise_t,
                 setpoint_shock_t,
                 hp_force_off_debt_t,
+                controller_xi=controller_xi,
+                zone_heat_ratio_override=annual_zone_heat_ratio,
                 hp_scenario_mode=hp_scenario_mode,
                 hp_concrete_temperature=hp_concrete_temperature,
                 hp_generation_available_t=(
@@ -2426,7 +3302,23 @@ class ProbabilisticContractingClosedLoopHPEmulator(eqx.Module):
                 qroom_mode_uniform_t=qroom_mode_uniform_t,
                 hydronic_innovation_t=hydronic_innovation_t,
                 hydronic_delivery_state_t=hydronic_delivery_state_t,
+                tank_temperature_t=tank_state_t,
+                tank_parameters=tank_parameters,
+                tank_capacities=tank_capacities,
             )
+            tank_state_next = tank_state_t
+            tank_mean_t = tank_state_t
+            if self.tank_temperatures is not None:
+                room_c = feedback_temperature_t * self.target_scale[0] + self.target_mean[0]
+                tank_state_next, tank_mean_t = self.tank_temperatures.advance(
+                    tank_parameters, tank_state_t, tank_capacities, room_c=room_c,
+                    generation_sh=cop_t * pel_t, qroom=qroom_t, hp_on=hp_on_t,
+                    water_l_h_m2=self._physical_input(input_t, self.dhw_request_input_index),
+                    recovery_w_m2=self._physical_metadata(metadata, self.dhw_recovery_metadata_index),
+                    generator_available=hp_generation_available_t * self._hp_generation_availability(input_t),
+                    dt=self.hp_dt_hours, noise=tank_noise[time_index],
+                )
+                energy_next = self.tank_temperatures.energy(tank_state_next, tank_capacities, room_c)
             hp_power_history_next, hp_mode_history_next = self.next_hp_history(
                 hp_power_history_t,
                 hp_mode_history_t,
@@ -2468,10 +3360,11 @@ class ProbabilisticContractingClosedLoopHPEmulator(eqx.Module):
                 state_t,
                 eps_t,
                 fixed_matrix,
+                colored_state_t,
             )
             q_response_state_next = self.next_q_response_state(
                 metadata,
-                q_response_xi,
+                q_response_xi_t,
                 q_response_state_t,
                 thermal_qroom_t,
             )
@@ -2482,6 +3375,13 @@ class ProbabilisticContractingClosedLoopHPEmulator(eqx.Module):
                 alpha,
                 q_response_state_next,
                 metadata,
+            )
+            temperature_next = self.apply_causal_ventilation(
+                metadata,
+                operation_xi,
+                input_t,
+                feedback_temperature_t,
+                temperature_next,
             )
             prediction_t = jnp.stack([temperature_next, qroom_scaled_t, pel_scaled_t])
             aux_t = (
@@ -2514,6 +3414,8 @@ class ProbabilisticContractingClosedLoopHPEmulator(eqx.Module):
                     qroom_p_stop_t,
                     previous_qroom_mode_t,
                 )
+            if self.tank_temperatures is not None:
+                aux_t = (*aux_t, tank_mean_t)
             return detach_carry(
                 (
                     state_next,
@@ -2529,6 +3431,7 @@ class ProbabilisticContractingClosedLoopHPEmulator(eqx.Module):
                     force_off_debt_next,
                     force_off_release_next,
                     force_off_t,
+                    tank_state_next,
                 ),
                 time_index,
                 self.bptt_truncate_steps,
@@ -2551,6 +3454,7 @@ class ProbabilisticContractingClosedLoopHPEmulator(eqx.Module):
                 force_off_debt0,
                 force_off_release0,
                 previous_force_off0,
+                tank_state0,
             ),
             (
                 time_index,
@@ -2563,6 +3467,7 @@ class ProbabilisticContractingClosedLoopHPEmulator(eqx.Module):
                 qroom_mode_uniform,
                 hp_generation_availability,
                 hydronic_innovation,
+                colored_latent,
             ),
         )
         (
@@ -2609,8 +3514,10 @@ class ProbabilisticContractingClosedLoopHPEmulator(eqx.Module):
             previous_mode_state,
             q_response_state,
         )
+        tank_outputs = (qroom_outputs.pop(),) if self.tank_temperatures is not None else ()
         if self.qroom_activation_model == "asymmetric_markov":
             aux = (*aux, *qroom_outputs)
+        aux = (*aux, *dhw_aux, *tank_outputs)
         return predictions, aux
 
     def sample_with_aux(
@@ -2621,6 +3528,7 @@ class ProbabilisticContractingClosedLoopHPEmulator(eqx.Module):
         *,
         key: jax.Array,
         num_particles: int,
+        persistent_xi: jnp.ndarray | None = None,
         sample_process_noise: bool = True,
         hp_scenario_mode: HPElectricRolloutMode = "expected",
         hp_concrete_temperature: jnp.ndarray | float = 0.5,
@@ -2643,13 +3551,28 @@ class ProbabilisticContractingClosedLoopHPEmulator(eqx.Module):
             "bernoulli",
             "straight_through",
             "hard_expected_grad",
+            "score_function",
         ):
             raise ValueError(
                 "hp_scenario_mode must be 'expected', 'bernoulli', "
-                "'straight_through', or 'hard_expected_grad'"
-            )
+                "'straight_through', 'hard_expected_grad', or 'score_function'"
+        )
         xi_key, process_key, mode_key, power_key, hydronic_key = jax.random.split(key, 5)
-        xi = jax.random.normal(xi_key, (num_particles, self.latent_dim))
+        colored_latent_key = jax.random.fold_in(process_key, 29)
+        if persistent_xi is None:
+            base_xi = jax.random.normal(
+                xi_key,
+                (num_particles, self.latent_dim),
+                dtype=metadata.dtype,
+            )
+        else:
+            if persistent_xi.shape != (num_particles, self.latent_dim):
+                raise ValueError(
+                    "persistent_xi must have shape "
+                    f"({num_particles}, {self.latent_dim}); got {persistent_xi.shape}"
+                )
+            base_xi = jnp.asarray(persistent_xi, dtype=metadata.dtype)
+        xi = jax.vmap(lambda row_xi: self.condition_xi(metadata, row_xi))(base_xi)
         if self.hp_activation_model == "persistent_markov":
             hp_latent_key = jax.random.fold_in(xi_key, 17)
             hp_latent = jax.random.normal(
@@ -2677,7 +3600,27 @@ class ProbabilisticContractingClosedLoopHPEmulator(eqx.Module):
             process_noise = jax.random.normal(process_key, (num_particles, inputs.shape[0], self.state_dim))
         else:
             process_noise = jnp.zeros((num_particles, inputs.shape[0], self.state_dim))
+        tank_noise = (jax.random.normal(jax.random.fold_in(process_key, 83), (num_particles, inputs.shape[0], 2))
+                      if sample_process_noise and self.tank_temperatures is not None
+                      else jnp.zeros((num_particles, inputs.shape[0], 2), dtype=inputs.dtype))
+        colored_latent_count = len(self.colored_latent_timescales_hours)
+        if sample_process_noise and colored_latent_count:
+            colored_white_noise = jax.random.normal(
+                colored_latent_key,
+                (num_particles, inputs.shape[0], colored_latent_count),
+                dtype=inputs.dtype,
+            )
+            colored_latent = jax.vmap(self.colored_latent_path)(colored_white_noise)
+        else:
+            colored_latent = jnp.zeros(
+                (num_particles, inputs.shape[0], colored_latent_count),
+                dtype=inputs.dtype,
+            )
         hp_mode_uniform = jax.random.uniform(mode_key, (num_particles, inputs.shape[0]))
+        dhw_mode_uniform = (
+            jax.random.uniform(jax.random.fold_in(mode_key, 79), (num_particles, inputs.shape[0]))
+            if self.dhw_recovery is not None else jnp.zeros_like(hp_mode_uniform)
+        )
         qroom_mode_uniform = jax.random.uniform(
             jax.random.fold_in(mode_key, 71),
             (num_particles, inputs.shape[0]),
@@ -2692,7 +3635,7 @@ class ProbabilisticContractingClosedLoopHPEmulator(eqx.Module):
                 (num_particles, inputs.shape[0]), dtype=inputs.dtype
             )
         predictions, aux = jax.vmap(
-            lambda particle_xi, particle_process_noise, particle_mode_uniform, particle_qroom_mode_uniform, particle_power_noise, particle_hp_latent, particle_controller_noise, particle_hydronic_innovation: self.rollout_particle(
+            lambda particle_xi, particle_process_noise, particle_colored_latent, particle_mode_uniform, particle_qroom_mode_uniform, particle_power_noise, particle_hp_latent, particle_controller_noise, particle_hydronic_innovation, particle_dhw_uniform, particle_tank_noise: self.rollout_particle(
                 metadata,
                 inputs,
                 initial_temperature,
@@ -2703,7 +3646,10 @@ class ProbabilisticContractingClosedLoopHPEmulator(eqx.Module):
                 particle_hp_latent,
                 particle_controller_noise,
                 qroom_mode_uniform=particle_qroom_mode_uniform,
+                dhw_mode_uniform=particle_dhw_uniform,
+                tank_noise=particle_tank_noise,
                 hydronic_innovation=particle_hydronic_innovation,
+                colored_latent=particle_colored_latent,
                 hp_scenario_mode=hp_scenario_mode,
                 hp_concrete_temperature=hp_concrete_temperature,
                 hp_feedback_pel=hp_feedback_pel,
@@ -2726,31 +3672,54 @@ class ProbabilisticContractingClosedLoopHPEmulator(eqx.Module):
                     if "initial" in self.persistent_xi_pathways
                     else jnp.zeros_like(particle_xi)
                 ),
+                initial_state_xi=(
+                    self.routed_persistent_xi(particle_xi, "envelope")
+                    if "initial" in self.persistent_xi_pathways
+                    else jnp.zeros_like(particle_xi)
+                ),
+                initial_energy_xi=(
+                    self.routed_persistent_xi(particle_xi, "hp")
+                    if "initial" in self.persistent_xi_pathways
+                    else jnp.zeros_like(particle_xi)
+                ),
                 thermal_xi=(
-                    particle_xi
+                    self.routed_persistent_xi(particle_xi, "envelope")
                     if "thermal" in self.persistent_xi_pathways
                     else jnp.zeros_like(particle_xi)
                 ),
                 q_response_xi=(
-                    particle_xi
+                    self.routed_persistent_xi(particle_xi, "envelope")
                     if "q_to_t" in self.persistent_xi_pathways
                     else jnp.zeros_like(particle_xi)
                 ),
                 hp_xi=(
-                    particle_xi
+                    self.routed_persistent_xi(particle_xi, "hp")
                     if "hp" in self.persistent_xi_pathways
+                    else jnp.zeros_like(particle_xi)
+                ),
+                controller_xi=(
+                    self.routed_persistent_xi(particle_xi, "controller")
+                    if "hp" in self.persistent_xi_pathways
+                    else jnp.zeros_like(particle_xi)
+                ),
+                operation_xi=(
+                    self.routed_persistent_xi(particle_xi, "operation")
+                    if "thermal" in self.persistent_xi_pathways
                     else jnp.zeros_like(particle_xi)
                 ),
             )
         )(
             xi,
             process_noise,
+            colored_latent,
             hp_mode_uniform,
             qroom_mode_uniform,
             hp_power_noise,
             hp_latent,
             controller_noise,
             hydronic_innovation,
+            dhw_mode_uniform,
+            tank_noise,
         )
         return predictions, (
             *aux[:13],
@@ -2994,7 +3963,16 @@ class ProbabilisticContractingClosedLoopHPEmulator(eqx.Module):
             previous_qroom_mode_t = unpacked[cursor]
         else:
             previous_qroom_mode_t = jnp.asarray(1.0, dtype=augmented_state.dtype)
-        alpha = self.temperature_alpha(metadata, xi)
+        envelope_xi = self.routed_persistent_xi(xi, "envelope")
+        hp_xi = self.routed_persistent_xi(xi, "hp")
+        controller_xi = self.routed_persistent_xi(xi, "controller")
+        operation_xi = self.routed_persistent_xi(xi, "operation")
+        input_t = self.apply_operational_ventilation_scale(
+            metadata,
+            operation_xi,
+            input_t,
+        )
+        alpha = self.temperature_alpha(metadata, envelope_xi)
         encoded_input_t = self.encode_input(input_t)
         (
             _,
@@ -3017,7 +3995,7 @@ class ProbabilisticContractingClosedLoopHPEmulator(eqx.Module):
             _,
         ) = self.decode_hp(
             metadata,
-            xi,
+            hp_xi,
             encoded_input_t,
             input_t,
             energy_t,
@@ -3031,6 +4009,7 @@ class ProbabilisticContractingClosedLoopHPEmulator(eqx.Module):
             hp_latent,
             controller_noise_t,
             hp_setpoint_shock_t,
+            controller_xi=controller_xi,
             hp_scenario_mode="expected",
             hp_concrete_temperature=jnp.asarray(0.5, dtype=state_t.dtype),
             previous_qroom_mode_t=previous_qroom_mode_t,
@@ -3047,13 +4026,13 @@ class ProbabilisticContractingClosedLoopHPEmulator(eqx.Module):
         qroom_scaled_t = self._target_scaled(qroom_t, self.qroom_target_index)
         thermal_forcing_t = self.thermal_forcing(input_t, qroom_scaled_t, temperature_t)
         fixed_matrix = (
-            self.transition_matrix(metadata, xi)
+            self.transition_matrix(metadata, envelope_xi)
             if self.transition_matrix_mode == "fixed"
             else None
         )
         state_next = self.one_step_state(
             metadata,
-            xi,
+            envelope_xi,
             thermal_forcing_t,
             state_t,
             process_noise_t,
@@ -3061,17 +4040,24 @@ class ProbabilisticContractingClosedLoopHPEmulator(eqx.Module):
         )
         q_response_state_next = self.next_q_response_state(
             metadata,
-            xi,
+            envelope_xi,
             q_response_state_t,
             qroom_t,
         )
         temperature_next = self.decode_temperature(
             state_next,
-            xi,
+            envelope_xi,
             temperature_t,
             alpha,
             q_response_state_next,
             metadata,
+        )
+        temperature_next = self.apply_causal_ventilation(
+            metadata,
+            operation_xi,
+            input_t,
+            temperature_t,
+            temperature_next,
         )
         return self.pack_stability_state(
             state_next,

@@ -2,12 +2,14 @@
 
 from .lstm import (
     AutoregressiveLSTM,
+    HurdleProbabilisticAutoregressiveLSTM,
     ProbabilisticAutoregressiveLSTM,
     VanillaProbabilisticAutoregressiveLSTM,
 )
 
 __all__ = [
     "AutoregressiveLSTM",
+    "HurdleProbabilisticAutoregressiveLSTM",
     "ProbabilisticAutoregressiveLSTM",
     "VanillaProbabilisticAutoregressiveLSTM",
 ]

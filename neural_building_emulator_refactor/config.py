@@ -50,6 +50,23 @@ class ProbabilisticLSTMConfig:
     hp_inactive_leakage_weight: float = 0.1
     softopt_weight: float = 2.0
     softopt_temperature: float = 0.1
+    flex_kpi_crps_weight: float = 0.0
+    flex_kpi_crps_horizons_hours: tuple[float, ...] = (0.5, 1.0, 2.0, 3.0)
+    flex_kpi_crps_setpoint_threshold_c: float = 0.05
+    flex_kpi_crps_min_events: int = 8
+    flex_kpi_crps_windows_per_profile: int = 1
+    process_regularization_weight: float = 0.0
+    increment_energy_weight: float = 0.0
+    increment_energy_lags: tuple[int, ...] = (1, 2, 4, 8)
+    increment_energy_lags_per_batch: int = 1
+    increment_energy_output_weights: tuple[float, ...] = (1.0, 1.0, 1.0)
+    increment_energy_constant_setpoint_only: bool = True
+    increment_energy_setpoint_threshold_c: float = 0.05
+    event_energy_weight: float = 0.0
+    event_energy_horizons_hours: tuple[float, ...] = (0.5, 1.0, 2.0, 3.0)
+    event_energy_events_per_profile: int = 4
+    event_energy_output_weights: tuple[float, ...] = (1.0, 1.0, 1.0)
+    event_energy_setpoint_threshold_c: float = 0.05
     variogram_weight: float = 1.0
     variogram_power: float = 0.5
     variogram_lags: tuple[int, ...] = (1, 2, 4, 8)
@@ -78,6 +95,7 @@ class ExperimentConfig:
     heating_mode: str = "zone_thermal"
     heat_input_normalization: str = "per_floor_area"
     hp_power_area_normalization: str = "building_heated_area"
+    hp_dhw_metadata: bool = False
     optimizer: OptimizerConfig = field(default_factory=OptimizerConfig)
     lstm: LSTMConfig = field(default_factory=LSTMConfig)
     probabilistic_lstm: ProbabilisticLSTMConfig = field(
@@ -135,14 +153,80 @@ class ExperimentConfig:
             "heteroscedastic",
         ):
             raise ValueError("unknown probabilistic LSTM process-noise mode")
-        if probabilistic.hp_training_mode != "expected":
+        if probabilistic.hp_training_mode not in ("expected", "hard_expected_grad"):
             raise ValueError(
-                "the matched probabilistic LSTM currently trains with expected HP power"
+                "LSTM HP training mode must be expected or hard_expected_grad"
             )
+        if (probabilistic.hp_training_mode == "hard_expected_grad"
+                and self.model_name == "closed_loop_hp_probabilistic_lstm"):
+            raise ValueError("Hard HP training is supported by hurdle LSTMs, not the legacy head")
+        if probabilistic.flex_kpi_crps_weight < 0.0:
+            raise ValueError("flex_kpi_crps_weight must be non-negative")
+        if probabilistic.process_regularization_weight < 0.0:
+            raise ValueError("process_regularization_weight must be non-negative")
+        if (not probabilistic.flex_kpi_crps_horizons_hours
+                or any(h <= 0.0 for h in probabilistic.flex_kpi_crps_horizons_hours)):
+            raise ValueError("Flexibility horizons must be nonempty and positive")
+        if (probabilistic.flex_kpi_crps_min_events < 1
+                or probabilistic.flex_kpi_crps_setpoint_threshold_c < 0.0):
+            raise ValueError("Invalid flexibility event settings")
+        group_size = probabilistic.flex_kpi_crps_windows_per_profile
+        if group_size < 1 or self.optimizer.batch_size % group_size:
+            raise ValueError("Batch size must be divisible by flexibility windows_per_profile")
         if probabilistic.hp_scenario_mode not in ("bernoulli", "expected"):
             raise ValueError("unknown probabilistic LSTM HP scenario mode")
         if probabilistic.softopt_temperature <= 0.0:
             raise ValueError("probabilistic LSTM softopt temperature must be positive")
+        if probabilistic.increment_energy_weight < 0.0:
+            raise ValueError("probabilistic LSTM increment energy weight must be non-negative")
+        if any(value <= 0 for value in probabilistic.increment_energy_lags):
+            raise ValueError("probabilistic LSTM increment energy lags must be positive")
+        if probabilistic.increment_energy_lags_per_batch < 1:
+            raise ValueError(
+                "probabilistic LSTM increment energy lags_per_batch must be positive"
+            )
+        if len(probabilistic.increment_energy_output_weights) != 3:
+            raise ValueError(
+                "probabilistic LSTM increment energy output weights must contain T, Q, P"
+            )
+        if any(value < 0.0 for value in probabilistic.increment_energy_output_weights):
+            raise ValueError(
+                "probabilistic LSTM increment energy output weights must be non-negative"
+            )
+        if sum(probabilistic.increment_energy_output_weights) <= 0.0:
+            raise ValueError(
+                "probabilistic LSTM increment energy output weights need a positive value"
+            )
+        if probabilistic.increment_energy_setpoint_threshold_c < 0.0:
+            raise ValueError(
+                "probabilistic LSTM increment setpoint threshold must be non-negative"
+            )
+        if probabilistic.event_energy_weight < 0.0:
+            raise ValueError("probabilistic LSTM event energy weight must be non-negative")
+        if any(value <= 0.0 for value in probabilistic.event_energy_horizons_hours):
+            raise ValueError(
+                "probabilistic LSTM event energy horizons must be positive"
+            )
+        if probabilistic.event_energy_events_per_profile < 1:
+            raise ValueError(
+                "probabilistic LSTM event energy events_per_profile must be positive"
+            )
+        if len(probabilistic.event_energy_output_weights) != 3:
+            raise ValueError(
+                "probabilistic LSTM event energy output weights must contain T, Q, P"
+            )
+        if any(value < 0.0 for value in probabilistic.event_energy_output_weights):
+            raise ValueError(
+                "probabilistic LSTM event energy output weights must be non-negative"
+            )
+        if sum(probabilistic.event_energy_output_weights) <= 0.0:
+            raise ValueError(
+                "probabilistic LSTM event energy output weights need a positive value"
+            )
+        if probabilistic.event_energy_setpoint_threshold_c < 0.0:
+            raise ValueError(
+                "probabilistic LSTM event setpoint threshold must be non-negative"
+            )
         if len(probabilistic.output_weights) != 3:
             raise ValueError("probabilistic LSTM output_weights must contain T, Q, P")
         if len(probabilistic.variogram_output_weights) != 3:

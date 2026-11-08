@@ -43,6 +43,18 @@ LEGACY_OPTION_FIELDS = {
         "contracting_temperature_feedback_gradient_scale"
     ),
     "contracting_transition_conditioning": "contracting_transition_conditioning",
+    "contracting_metadata_fixed_state_update": (
+        "contracting_metadata_fixed_state_update"
+    ),
+    "contracting_metadata_fixed_pole_parameterization": (
+        "contracting_metadata_fixed_pole_parameterization"
+    ),
+    "contracting_metadata_fixed_time_constant_min_hours": (
+        "contracting_metadata_fixed_time_constant_min_hours"
+    ),
+    "contracting_metadata_fixed_time_constant_max_hours": (
+        "contracting_metadata_fixed_time_constant_max_hours"
+    ),
     "contracting_additive_feedback_gain_bound": "contracting_additive_feedback_gain_bound",
     "contracting_q_to_t_mode": "contracting_q_to_t_mode",
     "contracting_q_to_t_time_constants_hours": "contracting_q_to_t_time_constants_hours",
@@ -56,6 +68,13 @@ LEGACY_OPTION_FIELDS = {
     "bptt_truncate_steps": "bptt_truncate_steps",
     "hp_thermostat_demand_mode": "hp_thermostat_demand_mode",
     "hp_energy_cap_hours": "hp_energy_cap_hours",
+    "hp_buffer_capacity_mode": "hp_buffer_capacity_mode",
+    "hp_buffer_delta_t_usable_init_k": "hp_buffer_delta_t_usable_init_k",
+    "hp_buffer_delta_t_min_k": "hp_buffer_delta_t_min_k",
+    "hp_buffer_delta_t_max_k": "hp_buffer_delta_t_max_k",
+    "hp_buffer_water_heat_capacity_wh_m3_k": (
+        "hp_buffer_water_heat_capacity_wh_m3_k"
+    ),
     "hp_inactive_leakage_weight": "hp_inactive_leakage_weight",
     "hp_cop_cap": "hp_cop_cap",
     "prob_particles": "prob_particles",
@@ -63,8 +82,30 @@ LEGACY_OPTION_FIELDS = {
     "prob_plot_particles": "prob_plot_particles",
     "prob_latent_dim": "prob_latent_dim",
     "prob_persistent_xi_pathways": "prob_persistent_xi_pathways",
+    "prob_persistent_xi_routing": "prob_persistent_xi_routing",
+    "prob_metadata_conditioned_xi": "prob_metadata_conditioned_xi",
+    "prob_metadata_xi_mean_cap": "prob_metadata_xi_mean_cap",
+    "prob_metadata_xi_scale_cap": "prob_metadata_xi_scale_cap",
+    "prob_colored_latent_timescales_hours": (
+        "prob_colored_latent_timescales_hours"
+    ),
+    "prob_colored_latent_pathways": "prob_colored_latent_pathways",
+    "prob_colored_latent_state_scale_cap": (
+        "prob_colored_latent_state_scale_cap"
+    ),
+    "prob_colored_latent_xi_scale_cap": "prob_colored_latent_xi_scale_cap",
     "prob_process_noise": "prob_process_noise",
     "prob_process_noise_init": "prob_process_noise_init",
+    "prob_training_backend": "prob_training_backend",
+    "trajectory_critic_chunk_steps": "trajectory_critic_chunk_steps",
+    "trajectory_critic_hidden_dim": "trajectory_critic_hidden_dim",
+    "trajectory_critic_depth": "trajectory_critic_depth",
+    "trajectory_critic_learning_rate": "trajectory_critic_learning_rate",
+    "trajectory_critic_loss_weight": "trajectory_critic_loss_weight",
+    "trajectory_critic_continuation_weight": (
+        "trajectory_critic_continuation_weight"
+    ),
+    "trajectory_score_function_weight": "trajectory_score_function_weight",
     "prob_physics_weight": "prob_physics_weight",
     "prob_hp_emission_mode": "prob_hp_emission_mode",
     "prob_hp_training_mode": "prob_hp_training_mode",
@@ -79,6 +120,30 @@ LEGACY_OPTION_FIELDS = {
         "prob_hp_force_off_debt_timescales_hours"
     ),
     "prob_softopt_weight": "prob_softopt_weight",
+    "prob_increment_energy_weight": "prob_increment_energy_weight",
+    "prob_increment_energy_lags": "prob_increment_energy_lags",
+    "prob_increment_energy_lags_per_batch": "prob_increment_energy_lags_per_batch",
+    "prob_increment_energy_output_weights": "prob_increment_energy_output_weights",
+    "prob_increment_energy_constant_setpoint_only": (
+        "prob_increment_energy_constant_setpoint_only"
+    ),
+    "prob_increment_energy_setpoint_threshold_c": (
+        "prob_increment_energy_setpoint_threshold_c"
+    ),
+    "prob_event_energy_weight": "prob_event_energy_weight",
+    "prob_event_energy_horizons_hours": "prob_event_energy_horizons_hours",
+    "prob_event_energy_events_per_profile": "prob_event_energy_events_per_profile",
+    "prob_event_energy_include_force_off": "prob_event_energy_include_force_off",
+    "prob_event_energy_output_weights": "prob_event_energy_output_weights",
+    "prob_event_energy_setpoint_threshold_c": (
+        "prob_event_energy_setpoint_threshold_c"
+    ),
+    "prob_block_energy_weight": "prob_block_energy_weight",
+    "prob_block_energy_horizons_hours": "prob_block_energy_horizons_hours",
+    "prob_block_energy_horizons_per_batch": (
+        "prob_block_energy_horizons_per_batch"
+    ),
+    "prob_block_energy_output_weights": "prob_block_energy_output_weights",
     "prob_variogram_weight": "prob_variogram_weight",
     "prob_variogram_lags": "prob_variogram_lags",
     "prob_variogram_output_weights": "prob_variogram_output_weights",
@@ -92,6 +157,24 @@ LEGACY_OPTION_FIELDS = {
     "prob_flex_kpi_crps_estimator": "prob_flex_kpi_crps_estimator",
     "prob_flex_kpi_crps_ridge": "prob_flex_kpi_crps_ridge",
     "prob_flex_kpi_crps_controls": "prob_flex_kpi_crps_controls",
+    "prob_flex_kpi_crps_windows_per_profile": (
+        "prob_flex_kpi_crps_windows_per_profile"
+    ),
+    "prob_flex_kpi_crps_aux_every_steps": "prob_flex_kpi_crps_aux_every_steps",
+    "prob_flex_kpi_crps_aux_buildings": "prob_flex_kpi_crps_aux_buildings",
+    "prob_targeted_flex_energy_weight": "prob_targeted_flex_energy_weight",
+    "prob_targeted_flex_short_horizon_hours": (
+        "prob_targeted_flex_short_horizon_hours"
+    ),
+    "prob_targeted_flex_long_horizon_hours": (
+        "prob_targeted_flex_long_horizon_hours"
+    ),
+    "prob_targeted_flex_coordinate_center": (
+        "prob_targeted_flex_coordinate_center"
+    ),
+    "prob_targeted_flex_coordinate_scale": (
+        "prob_targeted_flex_coordinate_scale"
+    ),
     "qroom_mode_loss_weight": "qroom_mode_loss_weight",
     "qroom_on_threshold_w_m2": "qroom_on_threshold_w_m2",
     "skip_grad_norm_above": "skip_grad_norm_above",
@@ -111,7 +194,9 @@ def _legacy_overrides(path: Path | None, args: argparse.Namespace) -> dict:
         if not isinstance(values, dict):
             raise ValueError("--legacy-config-json must contain one JSON object")
     for argument_name, config_name in LEGACY_OPTION_FIELDS.items():
-        value = getattr(args, argument_name)
+        # Some legacy-only options are available through JSON overrides but
+        # have no flag in this parser. An absent flag must not erase that value.
+        value = getattr(args, argument_name, None)
         if value is not None:
             values[config_name] = value
     return values
@@ -158,6 +243,20 @@ def _add_legacy_model_arguments(parser: argparse.ArgumentParser) -> None:
             "exogenous_additive_feedback",
         ),
     )
+    parser.add_argument(
+        "--contracting-metadata-fixed-state-update",
+        choices=("linear", "bounded_tanh"),
+    )
+    parser.add_argument(
+        "--contracting-metadata-fixed-pole-parameterization",
+        choices=("rho", "time_constant"),
+    )
+    parser.add_argument(
+        "--contracting-metadata-fixed-time-constant-min-hours", type=float
+    )
+    parser.add_argument(
+        "--contracting-metadata-fixed-time-constant-max-hours", type=float
+    )
     parser.add_argument("--contracting-additive-feedback-gain-bound", type=float)
     parser.add_argument(
         "--contracting-q-to-t-mode",
@@ -182,6 +281,17 @@ def _add_legacy_model_arguments(parser: argparse.ArgumentParser) -> None:
         choices=("unconstrained", "monotone", "causal_monotone"),
     )
     parser.add_argument("--hp-energy-cap-hours", type=float)
+    parser.add_argument(
+        "--hp-buffer-capacity-mode",
+        choices=("global", "physical_volume"),
+    )
+    parser.add_argument("--hp-buffer-delta-t-usable-init-k", type=float)
+    parser.add_argument("--hp-buffer-delta-t-min-k", type=float)
+    parser.add_argument("--hp-buffer-delta-t-max-k", type=float)
+    parser.add_argument(
+        "--hp-buffer-water-heat-capacity-wh-m3-k",
+        type=float,
+    )
     parser.add_argument("--hp-inactive-leakage-weight", type=float)
     parser.add_argument("--hp-cop-cap", type=float)
     parser.add_argument("--prob-particles", type=int)
@@ -197,8 +307,26 @@ def _add_legacy_model_arguments(parser: argparse.ArgumentParser) -> None:
             "The default preserves the legacy all-path behavior."
         ),
     )
+    parser.add_argument(
+        "--prob-metadata-conditioned-xi",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+    )
+    parser.add_argument("--prob-metadata-xi-mean-cap", type=float)
+    parser.add_argument("--prob-metadata-xi-scale-cap", type=float)
     parser.add_argument("--prob-process-noise", choices=("none", "constant", "heteroscedastic"))
     parser.add_argument("--prob-process-noise-init", type=float)
+    parser.add_argument(
+        "--prob-training-backend",
+        choices=("backprop", "trajectory_actor_critic"),
+    )
+    parser.add_argument("--trajectory-critic-chunk-steps", type=int)
+    parser.add_argument("--trajectory-critic-hidden-dim", type=int)
+    parser.add_argument("--trajectory-critic-depth", type=int)
+    parser.add_argument("--trajectory-critic-learning-rate", type=float)
+    parser.add_argument("--trajectory-critic-loss-weight", type=float)
+    parser.add_argument("--trajectory-critic-continuation-weight", type=float)
+    parser.add_argument("--trajectory-score-function-weight", type=float)
     parser.add_argument(
         "--prob-physics-weight",
         type=float,
@@ -213,7 +341,12 @@ def _add_legacy_model_arguments(parser: argparse.ArgumentParser) -> None:
     )
     parser.add_argument(
         "--prob-hp-training-mode",
-        choices=("expected", "straight_through", "hard_expected_grad"),
+        choices=(
+            "expected",
+            "straight_through",
+            "hard_expected_grad",
+            "score_function",
+        ),
     )
     parser.add_argument(
         "--prob-hp-activation-model",
@@ -240,6 +373,25 @@ def _add_legacy_model_arguments(parser: argparse.ArgumentParser) -> None:
         ),
     )
     parser.add_argument("--prob-softopt-weight", type=float)
+    parser.add_argument("--prob-increment-energy-weight", type=float)
+    parser.add_argument("--prob-increment-energy-lags", type=int, nargs="+")
+    parser.add_argument("--prob-increment-energy-lags-per-batch", type=int)
+    parser.add_argument("--prob-increment-energy-output-weights", type=float, nargs=3)
+    parser.add_argument(
+        "--prob-increment-energy-constant-setpoint-only",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+    )
+    parser.add_argument("--prob-increment-energy-setpoint-threshold-c", type=float)
+    parser.add_argument("--prob-event-energy-weight", type=float)
+    parser.add_argument("--prob-event-energy-horizons-hours", type=float, nargs="+")
+    parser.add_argument("--prob-event-energy-events-per-profile", type=int)
+    parser.add_argument("--prob-event-energy-output-weights", type=float, nargs=3)
+    parser.add_argument("--prob-event-energy-setpoint-threshold-c", type=float)
+    parser.add_argument("--prob-block-energy-weight", type=float)
+    parser.add_argument("--prob-block-energy-horizons-hours", type=float, nargs="+")
+    parser.add_argument("--prob-block-energy-horizons-per-batch", type=int)
+    parser.add_argument("--prob-block-energy-output-weights", type=float, nargs=3)
     parser.add_argument("--prob-variogram-weight", type=float)
     parser.add_argument("--prob-variogram-lags", type=int, nargs="+")
     parser.add_argument("--prob-variogram-output-weights", type=float, nargs="+")
@@ -254,6 +406,9 @@ def _add_legacy_model_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--prob-flex-kpi-crps-horizons-hours", type=float, nargs="+")
     parser.add_argument("--prob-flex-kpi-crps-setpoint-threshold-c", type=float)
     parser.add_argument("--prob-flex-kpi-crps-min-events", type=int)
+    parser.add_argument("--prob-flex-kpi-crps-windows-per-profile", type=int)
+    parser.add_argument("--prob-flex-kpi-crps-aux-every-steps", type=int)
+    parser.add_argument("--prob-flex-kpi-crps-aux-buildings", type=int)
     parser.add_argument(
         "--prob-flex-kpi-crps-estimator",
         choices=("direct_ratio", "regression"),
@@ -392,6 +547,57 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--prob-lstm-hp-inactive-leakage-weight", type=float, default=0.1)
     parser.add_argument("--prob-lstm-softopt-weight", type=float, default=2.0)
     parser.add_argument("--prob-lstm-softopt-temperature", type=float, default=0.1)
+    parser.add_argument("--prob-lstm-increment-energy-weight", type=float, default=0.0)
+    parser.add_argument(
+        "--prob-lstm-increment-energy-lags",
+        type=int,
+        nargs="+",
+        default=(1, 2, 4, 8),
+    )
+    parser.add_argument(
+        "--prob-lstm-increment-energy-lags-per-batch",
+        type=int,
+        default=1,
+    )
+    parser.add_argument(
+        "--prob-lstm-increment-energy-output-weights",
+        type=float,
+        nargs=3,
+        default=(1.0, 1.0, 1.0),
+    )
+    parser.add_argument(
+        "--prob-lstm-increment-energy-constant-setpoint-only",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
+    parser.add_argument(
+        "--prob-lstm-increment-energy-setpoint-threshold-c",
+        type=float,
+        default=0.05,
+    )
+    parser.add_argument("--prob-lstm-event-energy-weight", type=float, default=0.0)
+    parser.add_argument(
+        "--prob-lstm-event-energy-horizons-hours",
+        type=float,
+        nargs="+",
+        default=(0.5, 1.0, 2.0, 3.0),
+    )
+    parser.add_argument(
+        "--prob-lstm-event-energy-events-per-profile",
+        type=int,
+        default=4,
+    )
+    parser.add_argument(
+        "--prob-lstm-event-energy-output-weights",
+        type=float,
+        nargs=3,
+        default=(1.0, 1.0, 1.0),
+    )
+    parser.add_argument(
+        "--prob-lstm-event-energy-setpoint-threshold-c",
+        type=float,
+        default=0.05,
+    )
     parser.add_argument("--prob-lstm-variogram-weight", type=float, default=1.0)
     parser.add_argument("--prob-lstm-variogram-power", type=float, default=0.5)
     parser.add_argument("--prob-lstm-variogram-lags", type=int, nargs="+", default=(1, 2, 4, 8))
@@ -476,6 +682,33 @@ def config_from_args(args: argparse.Namespace) -> ExperimentConfig:
             hp_inactive_leakage_weight=args.prob_lstm_hp_inactive_leakage_weight,
             softopt_weight=args.prob_lstm_softopt_weight,
             softopt_temperature=args.prob_lstm_softopt_temperature,
+            increment_energy_weight=args.prob_lstm_increment_energy_weight,
+            increment_energy_lags=tuple(args.prob_lstm_increment_energy_lags),
+            increment_energy_lags_per_batch=(
+                args.prob_lstm_increment_energy_lags_per_batch
+            ),
+            increment_energy_output_weights=tuple(
+                args.prob_lstm_increment_energy_output_weights
+            ),
+            increment_energy_constant_setpoint_only=(
+                args.prob_lstm_increment_energy_constant_setpoint_only
+            ),
+            increment_energy_setpoint_threshold_c=(
+                args.prob_lstm_increment_energy_setpoint_threshold_c
+            ),
+            event_energy_weight=args.prob_lstm_event_energy_weight,
+            event_energy_horizons_hours=tuple(
+                args.prob_lstm_event_energy_horizons_hours
+            ),
+            event_energy_events_per_profile=(
+                args.prob_lstm_event_energy_events_per_profile
+            ),
+            event_energy_output_weights=tuple(
+                args.prob_lstm_event_energy_output_weights
+            ),
+            event_energy_setpoint_threshold_c=(
+                args.prob_lstm_event_energy_setpoint_threshold_c
+            ),
             variogram_weight=args.prob_lstm_variogram_weight,
             variogram_power=args.prob_lstm_variogram_power,
             variogram_lags=tuple(args.prob_lstm_variogram_lags),

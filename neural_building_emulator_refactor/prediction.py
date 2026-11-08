@@ -27,6 +27,7 @@ from neural_building_emulator.train import (
 from .artifacts import LoadedArtifact
 from .models import (
     AutoregressiveLSTM,
+    HurdleProbabilisticAutoregressiveLSTM,
     ProbabilisticAutoregressiveLSTM,
     VanillaProbabilisticAutoregressiveLSTM,
 )
@@ -101,7 +102,11 @@ def _predict_probabilistic_lstm(
     model = artifact.model
     if not isinstance(
         model,
-        (ProbabilisticAutoregressiveLSTM, VanillaProbabilisticAutoregressiveLSTM),
+        (
+            ProbabilisticAutoregressiveLSTM,
+            VanillaProbabilisticAutoregressiveLSTM,
+            HurdleProbabilisticAutoregressiveLSTM,
+        ),
     ):
         raise TypeError(
             f"Expected a probabilistic autoregressive LSTM, got {type(model)!r}"
@@ -125,7 +130,8 @@ def _predict_probabilistic_lstm(
     )
     scenario_mode = hp_scenario_mode if num_scenarios > 0 else "expected"
     if ventilation_rollout is not None and not isinstance(
-        model, VanillaProbabilisticAutoregressiveLSTM
+        model,
+        (VanillaProbabilisticAutoregressiveLSTM, HurdleProbabilisticAutoregressiveLSTM),
     ):
         raise ValueError("EnergyPlus-rule ventilation requires the vanilla probabilistic LSTM")
     normalized = model.sample(

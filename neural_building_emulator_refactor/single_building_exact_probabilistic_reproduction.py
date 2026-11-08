@@ -32,6 +32,8 @@ from neural_building_emulator.model_io import _build_model_skeleton, load_traini
 from neural_building_emulator.models import ProbabilisticContractingClosedLoopHPEmulator
 from neural_building_emulator.scaling import StandardScaler, WindowScalers
 from neural_building_emulator.train import (
+    estimate_event_response_energy_scales,
+    estimate_increment_energy_scales,
     predict_probabilistic_closed_loop_full_profile,
     probabilistic_closed_loop_train_step,
     sample_probabilistic_closed_loop_full_profile_scenarios,
@@ -149,10 +151,48 @@ def _train(
     target_scale = jnp.asarray(scalers.target.scale)
     dt_hours = float(config.get("hp_dt_hours", 0.25))
     ires_hours = tuple(float(value) for value in config.get("prob_ires_horizons_hours", (0.5, 1, 2, 3)))
+    increment_lags = tuple(
+        int(value) for value in config.get("prob_increment_energy_lags", (1, 2, 4, 8))
+    )
+    event_hours = tuple(
+        float(value)
+        for value in config.get("prob_event_energy_horizons_hours", (0.5, 1, 2, 3))
+    )
+    event_steps = _horizon_steps(event_hours, dt_hours)
+    block_hours = tuple(
+        float(value)
+        for value in config.get("prob_block_energy_horizons_hours", (6, 24, 72))
+    )
+    block_steps = _horizon_steps(block_hours, dt_hours)
     flex_hours = tuple(
         float(value) for value in config.get("prob_flex_kpi_crps_horizons_hours", (0.5, 1, 2, 3))
     )
     setpoint_scale = max(float(scalers.inputs.scale[0]), 1e-6)
+    increment_scales = jnp.asarray(
+        estimate_increment_energy_scales(
+            targets,
+            inputs,
+            lags=increment_lags,
+            constant_setpoint_only=bool(
+                config.get("prob_increment_energy_constant_setpoint_only", True)
+            ),
+            setpoint_delta_threshold=(
+                float(config.get("prob_increment_energy_setpoint_threshold_c", 0.05))
+                / setpoint_scale
+            ),
+        )
+    )
+    event_scales = jnp.asarray(
+        estimate_event_response_energy_scales(
+            targets,
+            inputs,
+            horizon_steps=event_steps,
+            setpoint_delta_threshold=(
+                float(config.get("prob_event_energy_setpoint_threshold_c", 0.05))
+                / setpoint_scale
+            ),
+        )
+    )
     rng = np.random.default_rng(args.seed)
     key = jax.random.PRNGKey(args.seed)
     history: list[dict[str, float]] = []
@@ -198,6 +238,36 @@ def _train(
                 float(config.get("prob_softopt_weight", 0.1)),
                 float(config.get("prob_softopt_temperature", 0.1)),
                 tuple(float(value) for value in config.get("closed_loop_trajectory_output_weights", (1, 1, 1))),
+                float(config.get("prob_increment_energy_weight", 0.0)),
+                increment_lags,
+                int(config.get("prob_increment_energy_lags_per_batch", 1)),
+                tuple(
+                    float(value)
+                    for value in config.get(
+                        "prob_increment_energy_output_weights", (1, 1, 1)
+                    )
+                ),
+                bool(config.get("prob_increment_energy_constant_setpoint_only", True)),
+                float(config.get("prob_increment_energy_setpoint_threshold_c", 0.05)) / setpoint_scale,
+                increment_scales,
+                float(config.get("prob_event_energy_weight", 0.0)),
+                event_steps,
+                int(config.get("prob_event_energy_events_per_profile", 4)),
+                tuple(
+                    float(value)
+                    for value in config.get("prob_event_energy_output_weights", (1, 1, 1))
+                ),
+                float(config.get("prob_event_energy_setpoint_threshold_c", 0.05)) / setpoint_scale,
+                event_scales,
+                float(config.get("prob_block_energy_weight", 0.0)),
+                block_steps,
+                int(config.get("prob_block_energy_horizons_per_batch", 1)),
+                tuple(
+                    float(value)
+                    for value in config.get(
+                        "prob_block_energy_output_weights", (1, 1, 1)
+                    )
+                ),
                 float(config.get("prob_variogram_weight", 0.0)),
                 tuple(int(value) for value in config.get("prob_variogram_lags", (1, 2, 4, 8))),
                 float(config.get("prob_variogram_power", 0.5)),
@@ -216,6 +286,49 @@ def _train(
                 config.get("prob_flex_kpi_crps_estimator", "regression"),
                 float(config.get("prob_flex_kpi_crps_ridge", 0.001)),
                 config.get("prob_flex_kpi_crps_controls", "full"),
+                int(config.get("prob_flex_kpi_crps_windows_per_profile", 1)),
+                float(config.get("prob_targeted_flex_energy_weight", 0.0)),
+                max(
+                    1,
+                    int(
+                        round(
+                            float(
+                                config.get(
+                                    "prob_targeted_flex_short_horizon_hours", 0.5
+                                )
+                            )
+                            / dt_hours
+                        )
+                    ),
+                ),
+                float(config.get("prob_targeted_flex_short_horizon_hours", 0.5)),
+                max(
+                    1,
+                    int(
+                        round(
+                            float(
+                                config.get(
+                                    "prob_targeted_flex_long_horizon_hours", 3.0
+                                )
+                            )
+                            / dt_hours
+                        )
+                    ),
+                ),
+                float(config.get("prob_targeted_flex_long_horizon_hours", 3.0)),
+                tuple(
+                    float(value)
+                    for value in config.get(
+                        "prob_targeted_flex_coordinate_center", (0.0, 0.0, 0.0)
+                    )
+                ),
+                tuple(
+                    float(value)
+                    for value in config.get(
+                        "prob_targeted_flex_coordinate_scale", (1.0, 1.0, 1.0)
+                    )
+                ),
+                float(np.asarray(target_scale)[2]) / setpoint_scale,
                 float(config.get("prob_physics_weight", 0.0)),
                 float(config.get("prob_horizon_weight_power", 0.0)),
                 0.0,
@@ -245,11 +358,13 @@ def _train(
             "skipped_batches": float(skipped),
             "minutes": float((time.perf_counter() - started) / 60.0),
             "loss_energy": float(component_mean[0]),
-            "loss_variogram": float(component_mean[1]),
-            "loss_softopt": float(component_mean[4]),
-            "loss_hp_bce": float(component_mean[5]),
-            "loss_hp_active_nll": float(component_mean[7]),
-            "loss_physics": float(component_mean[9]),
+            "loss_increment_energy": float(component_mean[1]),
+            "loss_event_energy": float(component_mean[2]),
+            "loss_variogram": float(component_mean[3]),
+            "loss_softopt": float(component_mean[6]),
+            "loss_hp_bce": float(component_mean[7]),
+            "loss_hp_active_nll": float(component_mean[9]),
+            "loss_physics": float(component_mean[11]),
         }
         history.append(row)
         print(

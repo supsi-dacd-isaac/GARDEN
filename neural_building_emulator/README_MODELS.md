@@ -1366,6 +1366,35 @@ trajectory-level dependence. Regression controls and ridge regularization do
 not apply in this mode. The score is skipped for windows with fewer than the
 configured event count or without interventions in both directions.
 
+To approximate annual scenario coherence without differentiating through a
+full-year rollout, group several seasonal windows from the same building:
+
+```bash
+--prob-flex-kpi-crps-windows-per-profile 4
+```
+
+The sampler draws multiple `xi` particles per building, reuses particle `k`'s
+`xi` across all four windows, keeps process and HP-emission noise independent
+between windows, and pools event numerators and denominators before computing
+direct-F CRPS. The default value `1` preserves independent-window training.
+
+To keep the ordinary trajectory losses on independent windows and apply the
+grouped score only as an auxiliary optimizer update, use:
+
+```bash
+--prob-flex-kpi-crps-windows-per-profile 4
+--prob-flex-kpi-crps-aux-every-steps 4
+--prob-flex-kpi-crps-aux-buildings 4
+```
+
+The main batch then uses the historical independent-window sampler and omits
+direct-F CRPS. After every four main updates, a flex-only update samples four
+setpoint-policy buildings with four seasonal windows each. It shares `xi`
+within each building, keeps local process and HP noise independent, and applies
+only the configured weighted direct-F CRPS. Setting
+`--prob-flex-kpi-crps-aux-every-steps 0` retains the replacement-batch behavior
+described above.
+
 The contracting probabilistic model also has an optional persistent HP
 controller:
 

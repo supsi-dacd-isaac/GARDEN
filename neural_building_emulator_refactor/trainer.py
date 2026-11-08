@@ -24,6 +24,7 @@ from neural_building_emulator.data import (
     WindowConfig,
     WindowedArrays,
     load_closed_loop_result_splits,
+    load_closed_loop_training_profiles,
     load_result_splits,
     make_closed_loop_windows,
     make_windows,
@@ -109,6 +110,7 @@ def _prepare_data(
         seed=config.seed,
         heat_input_normalization=config.heat_input_normalization,  # type: ignore[arg-type]
         hp_power_area_normalization=config.hp_power_area_normalization,  # type: ignore[arg-type]
+        include_dhw_metadata=config.hp_dhw_metadata,
     )
     window_config = WindowConfig(
         sequence_length=config.sequence_length,
@@ -139,23 +141,7 @@ def _prepare_data(
         train_windows = transform_windows(raw_train, scalers)
         test_windows = transform_windows(raw_test, scalers)
     else:
-        splits = load_closed_loop_result_splits(split_config)
-        train_profiles = to_closed_loop_profiles(
-            splits.train,
-            include_hp_force_off=(
-                HP_FORCE_OFF_REQUESTED_COLUMN in splits.input_columns
-            ),
-            hp_power_area_normalization=splits.hp_power_area_normalization,
-            metadata_columns=splits.metadata_columns,
-        )
-        test_profiles = to_closed_loop_profiles(
-            splits.test,
-            include_hp_force_off=(
-                HP_FORCE_OFF_REQUESTED_COLUMN in splits.input_columns
-            ),
-            hp_power_area_normalization=splits.hp_power_area_normalization,
-            metadata_columns=splits.metadata_columns,
-        )
+        splits, train_profiles, test_profiles = load_closed_loop_training_profiles(split_config)
         raw_train = make_closed_loop_windows(train_profiles, window_config)
         raw_test = (
             make_closed_loop_windows(test_profiles, window_config)

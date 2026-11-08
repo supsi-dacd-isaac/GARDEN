@@ -22,8 +22,14 @@ HPElectricRolloutMode = Literal[
     "bernoulli",
     "straight_through",
     "hard_expected_grad",
+    "score_function",
 ]
-HPTrainingMode = Literal["expected", "straight_through", "hard_expected_grad"]
+HPTrainingMode = Literal[
+    "expected",
+    "straight_through",
+    "hard_expected_grad",
+    "score_function",
+]
 ProbHpEmissionMode = Literal["bounded", "legacy_lognormal_mean"]
 HPActivationModel = Literal[
     "independent",
@@ -708,10 +714,11 @@ class ProbabilisticClosedLoopHPEmulator(eqx.Module):
             "bernoulli",
             "straight_through",
             "hard_expected_grad",
+            "score_function",
         ):
             raise ValueError(
                 "hp_scenario_mode must be 'expected', 'bernoulli', "
-                "'straight_through', or 'hard_expected_grad'"
+                "'straight_through', 'hard_expected_grad', or 'score_function'"
             )
         generated_ventilation = ventilation_time_available is not None
         if generated_ventilation != (ventilation_minimum_indoor_temperature_c is not None):
@@ -923,6 +930,7 @@ class ProbabilisticClosedLoopHPEmulator(eqx.Module):
         *,
         key: jax.Array,
         num_particles: int,
+        persistent_xi: jnp.ndarray | None = None,
         sample_process_noise: bool = True,
         hp_scenario_mode: HPElectricRolloutMode = "expected",
         hp_concrete_temperature: jnp.ndarray | float = 0.5,
@@ -938,13 +946,22 @@ class ProbabilisticClosedLoopHPEmulator(eqx.Module):
             "bernoulli",
             "straight_through",
             "hard_expected_grad",
+            "score_function",
         ):
             raise ValueError(
                 "hp_scenario_mode must be 'expected', 'bernoulli', "
-                "'straight_through', or 'hard_expected_grad'"
+                "'straight_through', 'hard_expected_grad', or 'score_function'"
             )
         xi_key, process_key, mode_key, power_key = jax.random.split(key, 4)
-        xi = jax.random.normal(xi_key, (num_particles, self.latent_dim))
+        if persistent_xi is None:
+            xi = jax.random.normal(xi_key, (num_particles, self.latent_dim))
+        else:
+            if persistent_xi.shape != (num_particles, self.latent_dim):
+                raise ValueError(
+                    "persistent_xi must have shape "
+                    f"({num_particles}, {self.latent_dim}); got {persistent_xi.shape}"
+                )
+            xi = jnp.asarray(persistent_xi, dtype=metadata.dtype)
         if sample_process_noise and self.process_noise_mode != "none":
             process_noise = jax.random.normal(process_key, (num_particles, inputs.shape[0], self.state_dim))
         else:

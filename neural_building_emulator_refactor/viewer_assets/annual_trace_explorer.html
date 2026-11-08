@@ -1,0 +1,89 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>GARDEN · Annual trajectory explorer</title>
+  <style>
+    :root { color-scheme:light; --ink:#182f42; --muted:#536879; --teal:#086c6b; --border:#dbe4e8; }
+    * { box-sizing:border-box; }
+    body { margin:0; background:#f3f6f7; color:var(--ink); font:14px/1.5 system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif; }
+    main { max-width:1800px; margin:auto; padding:26px 28px 18px; }
+    .heading { display:flex; align-items:center; justify-content:space-between; gap:20px; }
+    .eyebrow { color:var(--teal); font-size:11px; font-weight:750; letter-spacing:.12em; text-transform:uppercase; }
+    h1 { font-size:29px; line-height:1.2; margin:5px 0 7px; letter-spacing:-.7px; }
+    .subtitle { margin:0; color:var(--muted); }
+    .badge { border:1px solid #c9dce0; background:#e7f2f1; color:#175a5e; border-radius:20px; padding:7px 13px; white-space:nowrap; font-size:12px; }
+    .selectors { display:grid; grid-template-columns:1fr 1fr 1.25fr 1fr; gap:12px; margin:22px 0 14px; }
+    .selector { display:block; background:white; padding:12px 15px; border:1px solid var(--border); border-radius:11px; }
+    .selector span { display:block; color:var(--muted); font-size:11px; font-weight:700; letter-spacing:.08em; text-transform:uppercase; margin-bottom:4px; }
+    select { font:inherit; font-weight:650; color:var(--ink); border:0; background:white; width:100%; padding:5px 0; cursor:pointer; }
+    select:focus-visible,button:focus-visible,input:focus-visible { outline:2px solid var(--teal); outline-offset:3px; }
+    .toolbar { display:flex; align-items:center; gap:9px; flex-wrap:wrap; margin-bottom:10px; }
+    .group { display:flex; gap:5px; align-items:center; }
+    button { font:inherit; font-size:12px; font-weight:600; padding:7px 11px; border:1px solid #cfdae0; border-radius:6px; background:white; color:var(--ink); cursor:pointer; }
+    button:hover { background:#eaf3f3; border-color:#7bafaf; }
+    button.primary { background:var(--teal); color:white; border-color:var(--teal); }
+    button:disabled { opacity:.4; cursor:default; }
+    input[type=date] { font:inherit; font-size:12px; border:1px solid #cfdae0; border-radius:6px; padding:6px; color:var(--ink); background:white; }
+    .dates { margin-left:auto; }
+    .statusline { display:flex; gap:12px; justify-content:space-between; align-items:center; padding:8px 2px 12px; color:var(--muted); font-size:12px; }
+    #status[data-error=true] { color:#b52b25; font-weight:600; }
+    a { color:var(--teal); text-underline-offset:3px; }
+    .plotcard { position:relative; background:white; border:1px solid var(--border); border-radius:12px; overflow:hidden; box-shadow:0 3px 14px #16334306; }
+    #plot { width:100%; height:900px; }
+    #loading { position:absolute; z-index:10; inset:0; display:grid; place-items:center; background:#ffffffd9; color:var(--teal); font-weight:650; pointer-events:none; }
+    #loading[hidden] { display:none; }
+    .notes { display:flex; justify-content:space-between; gap:18px; color:var(--muted); font-size:12px; padding:13px 2px 4px; }
+    .notes p { margin:0 0 4px; }
+    .swatch { display:inline-block; width:13px; height:10px; background:#f0b85f70; border:1px solid #e5ab52; border-radius:2px; margin-right:5px; }
+    #force-summary { white-space:nowrap; }
+    details { margin-top:10px; font-size:12px; color:var(--muted); }
+    summary { cursor:pointer; }
+    details p { overflow-wrap:anywhere; }
+    @media (max-width:850px) { main { padding:18px 12px; } .selectors { grid-template-columns:1fr 1fr; } .heading { align-items:flex-start; } h1 { font-size:23px; } .badge { display:none; } .dates { margin-left:0; } .notes { display:block; } #plot { height:900px; } }
+    @media (max-width:450px) { .selectors { gap:7px; } .selector { padding:9px; } select { font-size:12px; } .statusline { align-items:flex-start; } }
+  </style>
+</head>
+<body>
+<main>
+  <header class="heading">
+    <div><div class="eyebrow">GARDEN / v9-final / 1,000-building benchmark</div>
+      <h1>Annual trajectory explorer</h1>
+      <p class="subtitle">EnergyPlus and emulator predictions, across policies and models.</p>
+    </div>
+    <span class="badge">95% predictive bands · 15-minute resolution</span>
+  </header>
+  <section class="selectors" aria-label="Choose annual traces">
+    <label class="selector"><span>1 / Policy</span><select id="policy"><option value="setpoint">Setpoint</option><option value="force_off">Force-off</option></select></label>
+    <label class="selector"><span>2 / Dataset type</span><select id="dataset"><option value="excitation">Perturbation</option><option value="tariff" selected>Tariff-based</option></select></label>
+    <label class="selector"><span>3 / Model</span><select id="model"></select></label>
+    <label class="selector"><span>4 / Building EGID</span><select id="egid"></select></label>
+  </section>
+  <div class="toolbar" aria-label="Time navigation">
+    <div class="group"><button id="full" class="primary">Full year</button><button id="week">7 days</button><button id="month">30 days</button></div>
+    <div class="group"><button id="previous" title="Previous time window">← Previous</button><button id="next" title="Next time window">Next →</button></div>
+    <div class="group"><button id="previous-event" title="Inspect previous force-off event">← Force-off</button><button id="next-event" title="Inspect next force-off event">Force-off →</button></div>
+    <div class="group dates"><label for="from">From</label><input id="from" type="date" min="2023-01-01" max="2023-12-31"><label for="to">to</label><input id="to" type="date" min="2023-01-01" max="2023-12-31"><button id="apply">Apply</button></div>
+  </div>
+  <div class="statusline"><span id="status" role="status" aria-live="polite">Loading saved annual traces…</span><a id="source" target="_blank" rel="noopener">Original plot ↗</a></div>
+  <section class="plotcard" aria-label="Indoor temperature, room heat and heat-pump power">
+    <div id="plot"></div><div id="loading">Loading annual trajectories…</div>
+  </section>
+  <div class="notes">
+    <div><p>Drag to zoom; use the toolbar to pan. All three time axes stay linked. Switching models preserves your time window.</p>
+    <p>Bands: native pointwise 2.5–97.5% ensemble quantiles. Red: ensemble mean. Blue: EnergyPlus. Gray: heating setpoint.</p></div>
+    <div id="force-summary"><span class="swatch"></span><span id="force-text">Requested force-off is shaded on the power panel.</span></div>
+  </div>
+  <details><summary>About these results</summary>
+    <p id="provenance"></p>
+    <p>Five held-out buildings, four neural models and four policy datasets. The selected checkpoints come from the completed 15-epoch comparison. The two LSTM results were reused by that comparison. LightGBM predicts flexibility KPIs and has no physical T/Q/P trajectories to display.</p>
+    <p>All saved samples are retained, without smoothing or re-emulation. These predictive bands have no RNS/RNS–ECC post-calibration. Shading represents the requested generation lockout, not a constraint that delivered room heat must be zero. Times follow the dataset's local standard time without daylight-saving conversion.</p>
+    <p>Power units: Qroom per zone floor area; Pel_SH per building heated floor area. <a href="build_audit.json" target="_blank">Source and alignment audit ↗</a></p>
+  </details>
+</main>
+<script src="plotly.min.js"></script>
+<script src="manifest.js"></script>
+<script src="viewer.js"></script>
+</body>
+</html>

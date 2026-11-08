@@ -8,7 +8,7 @@ import time
 from dataclasses import dataclass, replace
 from datetime import datetime
 from pathlib import Path
-from typing import Iterator, Literal, Sequence
+from typing import Callable, Iterator, Literal, Sequence
 
 import equinox as eqx
 import jax
@@ -23,6 +23,8 @@ from .columns import (
     CLOSED_LOOP_METADATA_COLUMNS,
     CLOSED_LOOP_TARGET_COLUMNS,
     DHW_MIXED_WATER_PER_HEATED_AREA_COLUMN,
+    DHW_VOLUME_PER_HEATED_AREA_COLUMN,
+    DHW_RECOVERY_PER_HEATED_AREA_COLUMN,
     DISTURBANCE_COLUMNS,
     HEATING_INPUT_COLUMNS,
     HP_FORCE_OFF_REQUESTED_COLUMN,
@@ -30,6 +32,7 @@ from .columns import (
     INTERNAL_GAIN_PER_FLOOR_AREA_COLUMN,
     InputFeatureMode,
     OCCUPANTS_PER_FLOOR_AREA_COLUMN,
+    SH_VOLUME_PER_HEATED_AREA_COLUMN,
     SPACE_HEATING_AVAILABILITY_COLUMN,
 )
 from .data import (
@@ -42,6 +45,7 @@ from .data import (
     WindowTargetAlignment,
     WindowedArrays,
     load_closed_loop_result_splits,
+    load_closed_loop_training_profiles,
     load_result_splits,
     make_closed_loop_windows,
     make_windows,
@@ -49,6 +53,7 @@ from .data import (
     to_profiles,
 )
 from .metrics import regression_metrics
+from .plant_supervision import plant_block_crps
 from .model_io import load_training_artifact, save_training_artifact
 from .models import (
     ClosedLoopHPEmulator,
@@ -80,6 +85,14 @@ from .scaling import (
     transform_windows,
 )
 from .ventilation import VentilationRolloutMode, build_eplus_ventilation_schedule
+from .trajectory_actor_critic import (
+    ParticleContinuationCritic,
+    build_continuation_features,
+    energy_score_per_profile,
+    energy_score_prefixes_per_profile,
+    evaluate_critic,
+    stop_gradient_module,
+)
 
 TargetMode = Literal["absolute", "delta", "residual"]
 CheckpointMetric = Literal[
@@ -109,6 +122,8 @@ ContractingTemperatureAlphaConditioning = Literal["metadata_xi", "metadata"]
 ClosedLoopStabilityMethod = Literal["exact_svd", "power_iteration"]
 FlexibilityKpiControls = Literal["none", "weather", "full"]
 FlexibilityKpiEstimator = Literal["direct_ratio", "regression"]
+ProbTrainingBackend = Literal["backprop", "trajectory_actor_critic"]
+HPBufferCapacityMode = Literal["global", "physical_volume"]
 ModelKind = Literal[
     "deterministic",
     "probabilistic",
@@ -131,9 +146,13 @@ ProbabilisticClosedLoopModel = (
 SETPOINT_METADATA_COLUMN = "shSetpoint"
 PROB_CLOSED_LOOP_LOSS_COMPONENT_NAMES = (
     "energy",
+    "increment_energy",
+    "event_energy",
+    "block_energy",
     "variogram",
     "ires",
     "flex_kpi_crps",
+    "targeted_flex_energy",
     "softopt",
     "hp_bce",
     "qroom_bce",
@@ -141,6 +160,10 @@ PROB_CLOSED_LOOP_LOSS_COMPONENT_NAMES = (
     "hp_inactive_leakage",
     "physics",
     "stability",
+    "plant_source_crps",
+    "plant_delivery_crps",
+    "dhw_mode_bce",
+    "tank_temperature_crps",
 )
 UPDATE_FINITE_FLAG_NAMES = (
     "loss",
@@ -169,6 +192,16 @@ PROB_CLOSED_LOOP_GRADIENT_GROUP_NAMES = (
     "input_encoder",
     "other",
 )
+TRAJECTORY_CRITIC_STAT_NAMES = (
+    "loss",
+    "grad_norm",
+    "update_accepted",
+    "value_mean",
+    "target_mean",
+    "explained_variance",
+    "continuation_component",
+    "score_function_component",
+)
 PROB_CLOSED_LOOP_GRADIENT_ROOT_GROUPS = {
     "temperature_alpha_net": "alpha",
     "temperature_net": "temperature_equilibrium",
@@ -189,6 +222,7 @@ PROB_CLOSED_LOOP_GRADIENT_ROOT_GROUPS = {
     "hp_transition_net": "hp",
     "hp_mode0_net": "hp",
     "qroom_transition_net": "hp",
+    "raw_buffer_delta_t_usable": "hp",
     "cop_intercept": "hp",
     "cop_slope": "hp",
     "raw_energy_loss_rate": "hp",
@@ -294,11 +328,45 @@ class TrainConfig:
         "q_to_t",
         "hp",
     )
+    prob_persistent_xi_routing: Literal[
+        "shared", "physical", "soft_physical"
+    ] = "shared"
+    prob_metadata_conditioned_xi: bool = False
+    prob_metadata_xi_mean_cap: float = 1.0
+    prob_metadata_xi_scale_cap: float = 2.0
+    prob_colored_latent_timescales_hours: tuple[float, ...] = ()
+    prob_colored_latent_pathways: tuple[str, ...] = ("thermal", "q_to_t", "hp")
+    prob_colored_latent_state_scale_cap: float = 0.02
+    prob_colored_latent_xi_scale_cap: float = 0.5
     prob_process_noise: ProbProcessNoiseMode = "constant"
     prob_process_noise_init: float = -6.0
+    prob_training_backend: ProbTrainingBackend = "backprop"
+    trajectory_critic_chunk_steps: int = 32
+    trajectory_critic_hidden_dim: int = 128
+    trajectory_critic_depth: int = 2
+    trajectory_critic_learning_rate: float = 3e-4
+    trajectory_critic_loss_weight: float = 1.0
+    trajectory_critic_continuation_weight: float = 1.0
+    trajectory_score_function_weight: float = 1.0
     prob_softopt_weight: float = 0.1
     prob_softopt_temperature: float = 0.1
     closed_loop_trajectory_output_weights: tuple[float, ...] = (1.0, 1.0, 1.0)
+    prob_increment_energy_weight: float = 0.0
+    prob_increment_energy_lags: tuple[int, ...] = (1, 2, 4, 8)
+    prob_increment_energy_lags_per_batch: int = 1
+    prob_increment_energy_output_weights: tuple[float, ...] = (1.0, 1.0, 1.0)
+    prob_increment_energy_constant_setpoint_only: bool = True
+    prob_increment_energy_setpoint_threshold_c: float = 0.05
+    prob_event_energy_weight: float = 0.0
+    prob_event_energy_horizons_hours: tuple[float, ...] = (0.5, 1.0, 2.0, 3.0)
+    prob_event_energy_events_per_profile: int = 4
+    prob_event_energy_output_weights: tuple[float, ...] = (1.0, 1.0, 1.0)
+    prob_event_energy_setpoint_threshold_c: float = 0.05
+    prob_event_energy_include_force_off: bool = False
+    prob_block_energy_weight: float = 0.0
+    prob_block_energy_horizons_hours: tuple[float, ...] = (6.0, 24.0, 72.0)
+    prob_block_energy_horizons_per_batch: int = 1
+    prob_block_energy_output_weights: tuple[float, ...] = (1.0, 1.0, 1.0)
     prob_variogram_weight: float = 0.1
     prob_variogram_lags: tuple[int, ...] = (1, 4, 16, 96)
     prob_variogram_power: float = 0.5
@@ -315,6 +383,14 @@ class TrainConfig:
     prob_flex_kpi_crps_estimator: FlexibilityKpiEstimator = "regression"
     prob_flex_kpi_crps_ridge: float = 1e-3
     prob_flex_kpi_crps_controls: FlexibilityKpiControls = "full"
+    prob_flex_kpi_crps_windows_per_profile: int = 1
+    prob_flex_kpi_crps_aux_every_steps: int = 0
+    prob_flex_kpi_crps_aux_buildings: int = 4
+    prob_targeted_flex_energy_weight: float = 0.0
+    prob_targeted_flex_short_horizon_hours: float = 0.5
+    prob_targeted_flex_long_horizon_hours: float = 3.0
+    prob_targeted_flex_coordinate_center: tuple[float, ...] = (0.0, 0.0, 0.0)
+    prob_targeted_flex_coordinate_scale: tuple[float, ...] = (1.0, 1.0, 1.0)
     prob_physics_weight: float = 0.0
     prob_horizon_weight_power: float = 0.0
     hp_controller_state_dim: int = 2
@@ -332,6 +408,21 @@ class TrainConfig:
     hp_qroom_cap_w_m2: float = 0.0
     hp_energy_cap_wh_m2: float = 0.0
     hp_energy_cap_hours: float = 24.0
+    hp_buffer_capacity_mode: HPBufferCapacityMode = "global"
+    hp_buffer_delta_t_usable_init_k: float = 5.0
+    hp_buffer_delta_t_min_k: float = 1.0
+    hp_buffer_delta_t_max_k: float = 15.0
+    hp_buffer_water_heat_capacity_wh_m3_k: float = 1163.0
+    hp_whole_building_accounting: bool = False
+    hp_plant_metadata: bool = False
+    prob_plant_source_loss_weight: float = 0.0
+    prob_plant_delivery_loss_weight: float = 0.0
+    prob_plant_block_hours: tuple[float, ...] = (4.0, 24.0)
+    prob_dhw_recovery_state: bool = False
+    prob_dhw_mode_loss_weight: float = 0.0
+    hp_dhw_metadata: bool = False
+    prob_tank_temperature_state: bool = False
+    prob_tank_temperature_loss_weight: float = 0.0
     hp_cap_factor: float = 1.25
     closed_loop_stability_weight: float = 0.0
     closed_loop_stability_gamma: float = 0.995
@@ -354,6 +445,21 @@ class TrainConfig:
     contracting_temperature_feedback_gradient_scale: float = 1.0
     contracting_transition_conditioning: ContractingTransitionConditioning = "state_feedback"
     contracting_thermal_architecture: ThermalArchitecture = "bounded_mlp"
+    contracting_metadata_fixed_state_update: Literal["linear", "bounded_tanh"] = "linear"
+    contracting_metadata_fixed_pole_parameterization: Literal[
+        "rho", "time_constant"
+    ] = "rho"
+    contracting_metadata_fixed_time_constant_min_hours: float = 0.1
+    contracting_metadata_fixed_time_constant_max_hours: float = 24.0 * 21.0
+    contracting_causal_ventilation: bool = False
+    contracting_ventilation_model: Literal[
+        "learned_gain", "physical_air_mixing"
+    ] = "learned_gain"
+    contracting_ventilation_gain_max_per_hour_m3_s: float = 4.0
+    contracting_ventilation_gain_initial_per_hour_m3_s: float = 1.0
+    contracting_ventilation_delta_max_c: float = 2.0
+    contracting_ventilation_capacity_factor_min: float = 0.25
+    contracting_ventilation_capacity_factor_max: float = 4.0
     contracting_additive_feedback_gain_bound: float = 1.0
     contracting_q_to_t_mode: ThermalQResponseMode = "unconstrained"
     contracting_q_to_t_time_constants_hours: tuple[float, ...] = (
@@ -394,6 +500,7 @@ def minibatches(
     batch_size: int,
     rng: np.random.Generator,
     shuffle: bool,
+    include_plant_targets: bool = False,
 ) -> Iterator[tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]]:
     n = windows.targets.shape[0]
     indices = np.arange(n)
@@ -401,12 +508,118 @@ def minibatches(
         rng.shuffle(indices)
     for start in range(0, n, batch_size):
         batch_idx = indices[start : start + batch_size]
-        yield (
+        batch = (
             windows.metadata[batch_idx],
             windows.inputs[batch_idx],
             windows.initial_temperature[batch_idx],
             windows.targets[batch_idx],
         )
+        if include_plant_targets:
+            if not isinstance(windows, ClosedLoopWindowedArrays) or windows.plant_targets is None:
+                raise ValueError("Requested plant labels are unavailable")
+            batch += (windows.plant_targets[batch_idx],)
+        yield batch
+
+
+def grouped_profile_minibatches(
+    windows: ClosedLoopWindowedArrays,
+    *,
+    batch_size: int,
+    windows_per_profile: int,
+    rng: np.random.Generator,
+    shuffle: bool,
+    require_setpoint_events: bool = False,
+    setpoint_delta_threshold: float = 0.0,
+    include_plant_targets: bool = False,
+) -> Iterator[tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]]:
+    """Yield seasonal window groups whose rows share one building identity.
+
+    Rows belonging to one building are contiguous. The probabilistic rollout
+    uses that layout to reuse particle ``xi`` across the group while retaining
+    independent process and emission noise for every window.
+    """
+    if windows_per_profile < 2:
+        raise ValueError("windows_per_profile must be at least 2 in grouped mode")
+    if windows_per_profile > batch_size:
+        raise ValueError("windows_per_profile cannot exceed batch_size")
+
+    profile_ids = np.unique(windows.profile_ids)
+    if not len(profile_ids):
+        return
+    groups_per_batch = max(1, batch_size // windows_per_profile)
+    windows_per_batch = groups_per_batch * windows_per_profile
+    batch_count = int(np.ceil(windows.targets.shape[0] / windows_per_batch))
+    # One building can contribute several policy trajectories. Starts increase
+    # within a trajectory and reset when the next trajectory begins. Keep those
+    # trajectories separate so a nominal W-window direct-F group does not mix
+    # setpoint and force-off windows and silently reduce its effective W.
+    trajectory_groups: list[np.ndarray] = []
+    for profile_id in profile_ids:
+        candidates = np.flatnonzero(windows.profile_ids == profile_id)
+        starts = windows.start_indices[candidates]
+        reset_positions = np.flatnonzero(starts[1:] <= starts[:-1]) + 1
+        trajectory_groups.extend(
+            group for group in np.split(candidates, reset_positions) if len(group)
+        )
+    if require_setpoint_events:
+        trajectory_groups = [
+            group
+            for group in trajectory_groups
+            if np.any(
+                np.abs(np.diff(windows.inputs[group, :, 0], axis=1))
+                > setpoint_delta_threshold
+            )
+        ]
+        if not trajectory_groups:
+            raise ValueError(
+                "No policy trajectory contains setpoint events above the requested threshold"
+            )
+    trajectory_group_ids = np.arange(len(trajectory_groups), dtype=np.int64)
+
+    deterministic_cursor = 0
+    for _ in range(batch_count):
+        if shuffle:
+            selected_groups = rng.choice(
+                trajectory_group_ids,
+                size=groups_per_batch,
+                replace=len(trajectory_group_ids) < groups_per_batch,
+            )
+        else:
+            selected_groups = np.asarray(
+                [
+                    trajectory_group_ids[
+                        (deterministic_cursor + offset) % len(trajectory_group_ids)
+                    ]
+                    for offset in range(groups_per_batch)
+                ]
+            )
+            deterministic_cursor += groups_per_batch
+
+        grouped_indices: list[np.ndarray] = []
+        for group_id in selected_groups:
+            ordered = trajectory_groups[int(group_id)]
+            seasonal_strata = np.array_split(ordered, windows_per_profile)
+            chosen = []
+            for stratum in seasonal_strata:
+                pool = stratum if len(stratum) else ordered
+                if shuffle:
+                    chosen.append(int(rng.choice(pool)))
+                else:
+                    chosen.append(int(pool[0]))
+            grouped_indices.append(np.asarray(chosen, dtype=np.int64))
+
+        batch_idx = np.concatenate(grouped_indices)
+        batch = (
+            windows.metadata[batch_idx],
+            windows.inputs[batch_idx],
+            windows.initial_temperature[batch_idx],
+            windows.targets[batch_idx],
+        )
+        if include_plant_targets:
+            if windows.plant_targets is None:
+                raise ValueError("Requested plant labels are unavailable")
+            batch += (windows.plant_targets[batch_idx],)
+        yield batch
 
 
 def rotating_window_start_offset(epoch: int, epochs: int, stride: int) -> int:
@@ -441,6 +654,8 @@ def fixed_evaluation_subset(
         inputs=windows.inputs[indices],
         targets=windows.targets[indices],
         initial_temperature=windows.initial_temperature[indices],
+        **({"plant_targets": windows.plant_targets[indices]}
+           if isinstance(windows, ClosedLoopWindowedArrays) and windows.plant_targets is not None else {}),
     )
 
 
@@ -780,6 +995,165 @@ def constant_setpoint_pair_mask(
     return (interval_jump_count <= 0.0).astype(setpoint.dtype)
 
 
+def masked_feature_energy_score(
+    predictions: jnp.ndarray,
+    targets: jnp.ndarray,
+    *,
+    feature_scale: jnp.ndarray,
+    output_weights: tuple[float, ...] = (),
+    item_mask: jnp.ndarray | None = None,
+) -> jnp.ndarray:
+    """Energy score for a particle ensemble of low-dimensional features.
+
+    ``predictions`` has shape ``[batch, particles, items, outputs]`` and
+    ``targets`` has shape ``[batch, items, outputs]``. Each item is scored
+    separately before averaging, which keeps long windows from turning the
+    Euclidean norm into another level-dominated trajectory score.
+    """
+    weights = normalized_output_loss_weights(
+        predictions.shape[-1],
+        output_weights,
+        dtype=predictions.dtype,
+    )
+    scale = jnp.maximum(
+        jnp.asarray(feature_scale, dtype=predictions.dtype),
+        jnp.asarray(1e-4, dtype=predictions.dtype),
+    )
+    root_weights = jnp.sqrt(weights) / scale
+    centered = (
+        predictions - targets[:, jnp.newaxis, :, :]
+    ) * root_weights[jnp.newaxis, jnp.newaxis, jnp.newaxis, :]
+    obs_distance = jnp.sqrt(jnp.sum(centered**2, axis=-1) + 1e-6)
+    pairwise = (
+        predictions[:, :, jnp.newaxis, :, :]
+        - predictions[:, jnp.newaxis, :, :, :]
+    ) * root_weights[jnp.newaxis, jnp.newaxis, jnp.newaxis, jnp.newaxis, :]
+    pairwise_distance = jnp.sqrt(jnp.sum(pairwise**2, axis=-1) + 1e-6)
+    per_item = jnp.mean(obs_distance, axis=1) - 0.5 * jnp.mean(
+        pairwise_distance,
+        axis=(1, 2),
+    )
+    if item_mask is None:
+        return jnp.mean(per_item)
+    mask = jnp.asarray(item_mask, dtype=predictions.dtype)
+    count = jnp.sum(mask)
+    return jnp.where(
+        count > 0.0,
+        jnp.sum(per_item * mask) / jnp.maximum(count, 1.0),
+        jnp.asarray(0.0, dtype=predictions.dtype),
+    )
+
+
+def increment_energy_score(
+    predictions: jnp.ndarray,
+    targets: jnp.ndarray,
+    inputs: jnp.ndarray,
+    key: jax.Array,
+    *,
+    lags: tuple[int, ...],
+    feature_scales: jnp.ndarray,
+    lags_per_batch: int = 1,
+    output_weights: tuple[float, ...] = (),
+    constant_setpoint_only: bool = False,
+    setpoint_delta_threshold: float = 0.0,
+) -> jnp.ndarray:
+    """Energy score on signed T/Q/P increments at sampled temporal lags."""
+    valid = tuple((index, lag) for index, lag in enumerate(lags) if 0 < lag < predictions.shape[2])
+    if not valid:
+        return jnp.asarray(0.0, dtype=predictions.dtype)
+
+    def branch_for(scale_index: int, lag: int):
+        def score(_: None) -> jnp.ndarray:
+            prediction_delta = predictions[:, :, lag:, :] - predictions[:, :, :-lag, :]
+            target_delta = targets[:, lag:, :] - targets[:, :-lag, :]
+            mask = None
+            if constant_setpoint_only:
+                mask = constant_setpoint_pair_mask(
+                    inputs,
+                    lag=lag,
+                    setpoint_delta_threshold=setpoint_delta_threshold,
+                )
+            return masked_feature_energy_score(
+                prediction_delta,
+                target_delta,
+                feature_scale=feature_scales[scale_index],
+                output_weights=output_weights,
+                item_mask=mask,
+            )
+
+        return score
+
+    branches = tuple(branch_for(scale_index, lag) for scale_index, lag in valid)
+    sample_count = min(max(int(lags_per_batch), 1), len(branches))
+    if sample_count == len(branches):
+        return jnp.mean(jnp.stack([branch(None) for branch in branches]))
+    selected = jax.random.permutation(key, len(branches))[:sample_count]
+    return jnp.mean(
+        jnp.stack([jax.lax.switch(index, branches, None) for index in selected])
+    )
+
+
+def block_average_energy_score(
+    predictions: jnp.ndarray,
+    targets: jnp.ndarray,
+    key: jax.Array,
+    *,
+    block_steps: tuple[int, ...],
+    horizons_per_batch: int = 1,
+    output_weights: tuple[float, ...] = (),
+) -> jnp.ndarray:
+    """Energy score on multiscale, non-overlapping block-average trajectories.
+
+    The transformed trajectory retains the joint dependence between successive
+    low-frequency blocks. Dividing by the square root of the block count keeps
+    different horizons comparable instead of favoring the coarsest scale.
+    """
+    valid = tuple(steps for steps in block_steps if 0 < steps <= predictions.shape[2])
+    if not valid:
+        return jnp.asarray(0.0, dtype=predictions.dtype)
+
+    def branch_for(steps: int):
+        block_count = predictions.shape[2] // steps
+        trimmed_steps = block_count * steps
+
+        def score(_: None) -> jnp.ndarray:
+            prediction_blocks = jnp.mean(
+                predictions[:, :, :trimmed_steps, :].reshape(
+                    predictions.shape[0],
+                    predictions.shape[1],
+                    block_count,
+                    steps,
+                    predictions.shape[-1],
+                ),
+                axis=3,
+            )
+            target_blocks = jnp.mean(
+                targets[:, :trimmed_steps, :].reshape(
+                    targets.shape[0],
+                    block_count,
+                    steps,
+                    targets.shape[-1],
+                ),
+                axis=2,
+            )
+            return energy_score(
+                prediction_blocks,
+                target_blocks,
+                output_weights=output_weights,
+            ) / jnp.sqrt(jnp.asarray(block_count, dtype=predictions.dtype))
+
+        return score
+
+    branches = tuple(branch_for(steps) for steps in valid)
+    sample_count = min(max(int(horizons_per_batch), 1), len(branches))
+    if sample_count == len(branches):
+        return jnp.mean(jnp.stack([branch(None) for branch in branches]))
+    selected = jax.random.permutation(key, len(branches))[:sample_count]
+    return jnp.mean(
+        jnp.stack([jax.lax.switch(index, branches, None) for index in selected])
+    )
+
+
 def variogram_score(
     predictions: jnp.ndarray,
     targets: jnp.ndarray,
@@ -933,6 +1307,186 @@ def intervention_response_energy_score(
     if not scores:
         return zero
     return jnp.mean(jnp.stack(scores))
+
+
+def event_response_energy_score(
+    predictions: jnp.ndarray,
+    targets: jnp.ndarray,
+    inputs: jnp.ndarray,
+    key: jax.Array,
+    *,
+    horizon_steps: tuple[int, ...],
+    feature_scales: jnp.ndarray,
+    events_per_profile: int,
+    setpoint_delta_threshold: float,
+    output_weights: tuple[float, ...] = (),
+    additional_event_inputs: tuple[tuple[int, float], ...] = (),
+) -> jnp.ndarray:
+    """Joint response score at exogenous command changes, never target-selected."""
+    scores = []
+    horizon = predictions.shape[2]
+    setpoint = inputs[:, :, 0]
+    threshold = jnp.asarray(setpoint_delta_threshold, dtype=predictions.dtype)
+    zero = jnp.asarray(0.0, dtype=predictions.dtype)
+
+    for scale_index, steps in enumerate(horizon_steps):
+        if steps < 1 or 2 * steps > horizon:
+            continue
+        starts = jnp.arange(steps, horizon - steps + 1)
+        setpoint_delta = jnp.take(setpoint, starts, axis=-1) - jnp.take(
+            setpoint,
+            starts - 1,
+            axis=-1,
+        )
+        event_mask = jnp.abs(setpoint_delta) >= threshold
+        for input_index, delta_threshold in additional_event_inputs:
+            command = inputs[:, :, input_index]
+            delta = command[:, starts] - command[:, starts - 1]
+            event_mask = event_mask | (jnp.abs(delta) >= delta_threshold)
+        target_response = _time_window_means(
+            targets,
+            starts=starts,
+            window_steps=steps,
+        ) - _time_window_means(
+            targets,
+            starts=starts - steps,
+            window_steps=steps,
+        )
+        prediction_response = _time_window_means(
+            predictions,
+            starts=starts,
+            window_steps=steps,
+        ) - _time_window_means(
+            predictions,
+            starts=starts - steps,
+            window_steps=steps,
+        )
+        profile_keys = jax.random.split(
+            jax.random.fold_in(key, scale_index),
+            predictions.shape[0],
+        )
+
+        def sample_profile_events(mask: jnp.ndarray, profile_key: jax.Array):
+            logits = jnp.where(
+                mask,
+                jnp.asarray(0.0, dtype=predictions.dtype),
+                jnp.asarray(-1e30, dtype=predictions.dtype),
+            )
+            indices = jax.random.categorical(
+                profile_key,
+                logits,
+                shape=(events_per_profile,),
+            )
+            has_event = jnp.any(mask)
+            return jnp.where(has_event, indices, 0), has_event
+
+        sampled_indices, has_event = jax.vmap(sample_profile_events)(
+            event_mask,
+            profile_keys,
+        )
+        sampled_targets = jnp.take_along_axis(
+            target_response,
+            sampled_indices[:, :, jnp.newaxis],
+            axis=1,
+        )
+        sampled_predictions = jnp.take_along_axis(
+            prediction_response,
+            sampled_indices[:, jnp.newaxis, :, jnp.newaxis],
+            axis=2,
+        )
+        sampled_mask = jnp.broadcast_to(
+            has_event[:, jnp.newaxis],
+            sampled_indices.shape,
+        )
+        scores.append(
+            masked_feature_energy_score(
+                sampled_predictions,
+                sampled_targets,
+                feature_scale=feature_scales[scale_index],
+                output_weights=output_weights,
+                item_mask=sampled_mask,
+            )
+        )
+    if not scores:
+        return zero
+    return jnp.mean(jnp.stack(scores))
+
+
+def estimate_increment_energy_scales(
+    targets: np.ndarray,
+    inputs: np.ndarray,
+    *,
+    lags: tuple[int, ...],
+    constant_setpoint_only: bool,
+    setpoint_delta_threshold: float,
+    floor: float = 0.05,
+) -> np.ndarray:
+    """Estimate fixed RMS scales for increment features from training data."""
+    scales = np.ones((len(lags), targets.shape[-1]), dtype=np.float32)
+    setpoint = np.asarray(inputs[:, :, 0], dtype=np.float32)
+    for index, lag in enumerate(lags):
+        if lag < 1 or lag >= targets.shape[1]:
+            continue
+        delta = np.asarray(targets[:, lag:, :] - targets[:, :-lag, :], dtype=np.float64)
+        if constant_setpoint_only:
+            jumps = np.abs(np.diff(setpoint, axis=1)) > setpoint_delta_threshold
+            jump_count = np.concatenate(
+                [np.zeros((jumps.shape[0], 1), dtype=np.int64), np.cumsum(jumps, axis=1)],
+                axis=1,
+            )
+            mask = (jump_count[:, lag:] - jump_count[:, :-lag]) == 0
+        else:
+            mask = np.ones(delta.shape[:2], dtype=bool)
+        for output_index in range(delta.shape[-1]):
+            values = delta[:, :, output_index][mask]
+            if values.size:
+                rms = float(np.sqrt(np.mean(values**2)))
+                scales[index, output_index] = max(rms, floor)
+    return scales
+
+
+def estimate_event_response_energy_scales(
+    targets: np.ndarray,
+    inputs: np.ndarray,
+    *,
+    horizon_steps: tuple[int, ...],
+    setpoint_delta_threshold: float,
+    floor: float = 0.05,
+    additional_event_inputs: tuple[tuple[int, float], ...] = (),
+) -> np.ndarray:
+    """Estimate fixed RMS scales for joint intervention-response features."""
+    scales = np.ones((len(horizon_steps), targets.shape[-1]), dtype=np.float32)
+    setpoint = np.asarray(inputs[:, :, 0], dtype=np.float32)
+    for horizon_index, steps in enumerate(horizon_steps):
+        if steps < 1 or 2 * steps > targets.shape[1]:
+            continue
+        starts = np.arange(steps, targets.shape[1] - steps + 1)
+        setpoint_delta = setpoint[:, starts] - setpoint[:, starts - 1]
+        event_mask = np.abs(setpoint_delta) >= setpoint_delta_threshold
+        for input_index, delta_threshold in additional_event_inputs:
+            command = inputs[:, :, input_index]
+            delta = command[:, starts] - command[:, starts - 1]
+            event_mask |= np.abs(delta) >= delta_threshold
+        target_cumsum = np.concatenate(
+            [
+                np.zeros((targets.shape[0], 1, targets.shape[-1]), dtype=np.float64),
+                np.cumsum(targets, axis=1, dtype=np.float64),
+            ],
+            axis=1,
+        )
+        post = (
+            target_cumsum[:, starts + steps, :] - target_cumsum[:, starts, :]
+        ) / float(steps)
+        pre = (
+            target_cumsum[:, starts, :] - target_cumsum[:, starts - steps, :]
+        ) / float(steps)
+        response = post - pre
+        for output_index in range(response.shape[-1]):
+            values = response[:, :, output_index][event_mask]
+            if values.size:
+                rms = float(np.sqrt(np.mean(values**2)))
+                scales[horizon_index, output_index] = max(rms, floor)
+    return scales
 
 
 def _masked_standardize_controls(values: jnp.ndarray, mask: jnp.ndarray) -> jnp.ndarray:
@@ -1163,6 +1717,7 @@ def flexibility_direct_ratio_crps(
     setpoint_delta_threshold: float,
     min_events: int,
     target_channel: int = 2,
+    windows_per_profile: int = 1,
 ) -> jnp.ndarray:
     """CRPS on directional ratio-of-sums flexibility gains.
 
@@ -1174,6 +1729,13 @@ def flexibility_direct_ratio_crps(
     before applying CRPS. Keeping each particle intact through the event sums
     preserves its cross-event dependence in the scored KPI distribution.
     """
+    if windows_per_profile < 1:
+        raise ValueError("windows_per_profile must be positive")
+    if predictions.shape[0] % windows_per_profile:
+        raise ValueError(
+            "The batch size must be divisible by windows_per_profile for pooled F scoring"
+        )
+    group_count = predictions.shape[0] // windows_per_profile
     scores = []
     rollout_horizon = predictions.shape[2]
     setpoint = inputs[:, :, 0]
@@ -1192,14 +1754,18 @@ def flexibility_direct_ratio_crps(
             starts - 1,
             axis=1,
         )
+        setpoint_delta = jnp.reshape(
+            setpoint_delta,
+            (group_count, windows_per_profile, setpoint_delta.shape[-1]),
+        )
         event_mask = jnp.abs(setpoint_delta) >= threshold
         up_mask = (event_mask & (setpoint_delta > 0.0)).astype(predictions.dtype)
         down_mask = (event_mask & (setpoint_delta < 0.0)).astype(predictions.dtype)
-        event_count = jnp.sum(up_mask + down_mask, axis=1)
+        event_count = jnp.sum(up_mask + down_mask, axis=(1, 2))
         valid = (
             (event_count >= jnp.asarray(min_events, dtype=predictions.dtype))
-            & (jnp.sum(up_mask, axis=1) > 0.0)
-            & (jnp.sum(down_mask, axis=1) > 0.0)
+            & (jnp.sum(up_mask, axis=(1, 2)) > 0.0)
+            & (jnp.sum(down_mask, axis=(1, 2)) > 0.0)
         ).astype(predictions.dtype)
 
         target_pre = _window_means_at_starts(
@@ -1222,32 +1788,46 @@ def flexibility_direct_ratio_crps(
             starts=starts,
             window_steps=steps,
         )
-        target_response = target_post - target_pre
-        prediction_response = prediction_post - prediction_pre
+        target_response = jnp.reshape(
+            target_post - target_pre,
+            (group_count, windows_per_profile, target_post.shape[-1]),
+        )
+        prediction_response = jnp.reshape(
+            prediction_post - prediction_pre,
+            (
+                group_count,
+                windows_per_profile,
+                prediction_post.shape[1],
+                prediction_post.shape[-1],
+            ),
+        )
 
-        up_denominator = jnp.maximum(jnp.sum(up_mask * setpoint_delta, axis=1), epsilon)
+        up_denominator = jnp.maximum(
+            jnp.sum(up_mask * setpoint_delta, axis=(1, 2)),
+            epsilon,
+        )
         down_denominator = jnp.minimum(
-            jnp.sum(down_mask * setpoint_delta, axis=1),
+            jnp.sum(down_mask * setpoint_delta, axis=(1, 2)),
             -epsilon,
         )
         hours_value = jnp.asarray(hours, dtype=predictions.dtype)
         target_kpi = hours_value * jnp.stack(
             [
-                jnp.sum(up_mask * target_response, axis=1) / up_denominator,
-                jnp.sum(down_mask * target_response, axis=1) / down_denominator,
+                jnp.sum(up_mask * target_response, axis=(1, 2)) / up_denominator,
+                jnp.sum(down_mask * target_response, axis=(1, 2)) / down_denominator,
             ],
             axis=-1,
         )
         prediction_kpi = hours_value * jnp.stack(
             [
                 jnp.sum(
-                    up_mask[:, jnp.newaxis, :] * prediction_response,
-                    axis=-1,
+                    up_mask[:, :, jnp.newaxis, :] * prediction_response,
+                    axis=(1, 3),
                 )
                 / up_denominator[:, jnp.newaxis],
                 jnp.sum(
-                    down_mask[:, jnp.newaxis, :] * prediction_response,
-                    axis=-1,
+                    down_mask[:, :, jnp.newaxis, :] * prediction_response,
+                    axis=(1, 3),
                 )
                 / down_denominator[:, jnp.newaxis],
             ],
@@ -1278,6 +1858,440 @@ def flexibility_direct_ratio_crps(
     if not scores:
         return zero
     return jnp.mean(jnp.stack(scores))
+
+
+def targeted_flexibility_energy_score(
+    predictions: jnp.ndarray,
+    targets: jnp.ndarray,
+    inputs: jnp.ndarray,
+    *,
+    short_horizon_steps: int,
+    short_horizon_hours: float,
+    long_horizon_steps: int,
+    long_horizon_hours: float,
+    setpoint_delta_threshold: float,
+    min_events: int,
+    coordinate_center: tuple[float, ...],
+    coordinate_scale: tuple[float, ...],
+    physical_kpi_scale: float,
+    target_channel: int = 2,
+    windows_per_profile: int = 1,
+    middle_horizon_steps: int | None = None,
+    middle_horizon_hours: float | None = None,
+    initial_temperature: jnp.ndarray | None = None,
+    regression_ridge: float = 1e-3,
+    regression_controls: FlexibilityKpiControls = "full",
+) -> jnp.ndarray:
+    """Energy score on selected direct-F and regression response geometry."""
+    if windows_per_profile < 1:
+        raise ValueError("windows_per_profile must be positive")
+    if predictions.shape[0] % windows_per_profile:
+        raise ValueError(
+            "The batch size must be divisible by windows_per_profile for pooled F scoring"
+        )
+    coordinate_count = len(coordinate_center)
+    if coordinate_count not in (3, 8) or len(coordinate_scale) != coordinate_count:
+        raise ValueError(
+            "targeted flexibility center and scale must each contain 3 or 8 values"
+        )
+    group_count = predictions.shape[0] // windows_per_profile
+    setpoint = inputs[:, :, 0]
+    target_power = targets[:, :, target_channel]
+    prediction_power = predictions[:, :, :, target_channel]
+    threshold = jnp.asarray(setpoint_delta_threshold, dtype=predictions.dtype)
+    epsilon = jnp.asarray(1e-6, dtype=predictions.dtype)
+
+    def directional_kpis(
+        steps: int,
+        hours: float,
+    ) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+        starts = jnp.arange(steps, predictions.shape[2] - steps + 1)
+        setpoint_delta = jnp.take(setpoint, starts, axis=1) - jnp.take(
+            setpoint,
+            starts - 1,
+            axis=1,
+        )
+        setpoint_delta = jnp.reshape(
+            setpoint_delta,
+            (group_count, windows_per_profile, setpoint_delta.shape[-1]),
+        )
+        event_mask = jnp.abs(setpoint_delta) >= threshold
+        up_mask = (
+            event_mask & (setpoint_delta > 0.0)
+        ).astype(predictions.dtype)
+        down_mask = (
+            event_mask & (setpoint_delta < 0.0)
+        ).astype(predictions.dtype)
+        event_count = jnp.sum(up_mask + down_mask, axis=(1, 2))
+        valid = (
+            (event_count >= jnp.asarray(min_events, dtype=predictions.dtype))
+            & (jnp.sum(up_mask, axis=(1, 2)) > 0.0)
+            & (jnp.sum(down_mask, axis=(1, 2)) > 0.0)
+        ).astype(predictions.dtype)
+
+        target_pre = _window_means_at_starts(
+            target_power,
+            starts=starts - steps,
+            window_steps=steps,
+        )
+        target_post = _window_means_at_starts(
+            target_power,
+            starts=starts,
+            window_steps=steps,
+        )
+        prediction_pre = _window_means_at_starts(
+            prediction_power,
+            starts=starts - steps,
+            window_steps=steps,
+        )
+        prediction_post = _window_means_at_starts(
+            prediction_power,
+            starts=starts,
+            window_steps=steps,
+        )
+        target_response = jnp.reshape(
+            target_post - target_pre,
+            (group_count, windows_per_profile, target_post.shape[-1]),
+        )
+        prediction_response = jnp.reshape(
+            prediction_post - prediction_pre,
+            (
+                group_count,
+                windows_per_profile,
+                prediction_post.shape[1],
+                prediction_post.shape[-1],
+            ),
+        )
+        up_denominator = jnp.maximum(
+            jnp.sum(up_mask * setpoint_delta, axis=(1, 2)),
+            epsilon,
+        )
+        down_denominator = jnp.minimum(
+            jnp.sum(down_mask * setpoint_delta, axis=(1, 2)),
+            -epsilon,
+        )
+        hours_value = jnp.asarray(hours, dtype=predictions.dtype)
+        target_kpi = hours_value * jnp.stack(
+            [
+                jnp.sum(up_mask * target_response, axis=(1, 2)) / up_denominator,
+                jnp.sum(down_mask * target_response, axis=(1, 2))
+                / down_denominator,
+            ],
+            axis=-1,
+        )
+        prediction_kpi = hours_value * jnp.stack(
+            [
+                jnp.sum(
+                    up_mask[:, :, jnp.newaxis, :] * prediction_response,
+                    axis=(1, 3),
+                )
+                / up_denominator[:, jnp.newaxis],
+                jnp.sum(
+                    down_mask[:, :, jnp.newaxis, :] * prediction_response,
+                    axis=(1, 3),
+                )
+                / down_denominator[:, jnp.newaxis],
+            ],
+            axis=-1,
+        )
+        return target_kpi, prediction_kpi, valid
+
+    short_target, short_prediction, short_valid = directional_kpis(
+        short_horizon_steps,
+        short_horizon_hours,
+    )
+    long_target, long_prediction, long_valid = directional_kpis(
+        long_horizon_steps,
+        long_horizon_hours,
+    )
+    if coordinate_count == 3:
+        target_coordinates = jnp.stack(
+            [
+                short_target[:, 0],
+                short_target[:, 0] - short_target[:, 1],
+                long_target[:, 0] - short_target[:, 0],
+            ],
+            axis=-1,
+        )
+        prediction_coordinates = jnp.stack(
+            [
+                short_prediction[:, :, 0],
+                short_prediction[:, :, 0] - short_prediction[:, :, 1],
+                long_prediction[:, :, 0] - short_prediction[:, :, 0],
+            ],
+            axis=-1,
+        )
+        valid = short_valid * long_valid
+    else:
+        if middle_horizon_steps is None or middle_horizon_hours is None:
+            raise ValueError("8-D response geometry requires a middle horizon")
+        if initial_temperature is None:
+            raise ValueError("8-D response geometry requires initial_temperature")
+        if not short_horizon_hours < middle_horizon_hours < long_horizon_hours:
+            raise ValueError("The middle response horizon must lie between short and long")
+
+        middle_target, middle_prediction, middle_valid = directional_kpis(
+            middle_horizon_steps,
+            middle_horizon_hours,
+        )
+        full_setpoint_delta = jnp.concatenate(
+            [jnp.zeros_like(setpoint[:, :1]), setpoint[:, 1:] - setpoint[:, :-1]],
+            axis=1,
+        )
+        full_event_mask = jnp.abs(full_setpoint_delta) >= threshold
+        previous_event_delta = _previous_setpoint_event_delta(
+            full_setpoint_delta,
+            full_event_mask,
+        )
+        initial = jnp.reshape(
+            initial_temperature, (initial_temperature.shape[0], -1)
+        )[:, :1]
+        current_target_temperature = jnp.concatenate(
+            [initial, targets[:, :-1, 0]], axis=1
+        )
+
+        def regression_kpis(
+            steps: int,
+            hours: float,
+        ) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+            starts = jnp.arange(steps, predictions.shape[2] - steps + 1)
+            event_count_per_window = starts.shape[0]
+            setpoint_delta = jnp.take(setpoint, starts, axis=1) - jnp.take(
+                setpoint,
+                starts - 1,
+                axis=1,
+            )
+            event_mask = (jnp.abs(setpoint_delta) >= threshold).astype(
+                predictions.dtype
+            )
+            target_pre = _window_means_at_starts(
+                target_power,
+                starts=starts - steps,
+                window_steps=steps,
+            )
+            target_post = _window_means_at_starts(
+                target_power,
+                starts=starts,
+                window_steps=steps,
+            )
+            prediction_pre = _window_means_at_starts(
+                prediction_power,
+                starts=starts - steps,
+                window_steps=steps,
+            )
+            prediction_post = _window_means_at_starts(
+                prediction_power,
+                starts=starts,
+                window_steps=steps,
+            )
+            target_response = jnp.reshape(
+                target_post - target_pre,
+                (group_count, windows_per_profile * event_count_per_window),
+            )
+            prediction_response = jnp.reshape(
+                prediction_post - prediction_pre,
+                (
+                    group_count,
+                    windows_per_profile,
+                    prediction_post.shape[1],
+                    event_count_per_window,
+                ),
+            )
+            prediction_response = jnp.reshape(
+                jnp.transpose(prediction_response, (0, 2, 1, 3)),
+                (
+                    group_count,
+                    prediction_post.shape[1],
+                    windows_per_profile * event_count_per_window,
+                ),
+            )
+            setpoint_delta = jnp.reshape(
+                setpoint_delta,
+                (group_count, windows_per_profile * event_count_per_window),
+            )
+            event_mask = jnp.reshape(
+                event_mask,
+                (group_count, windows_per_profile * event_count_per_window),
+            )
+            columns = [
+                jnp.ones_like(setpoint_delta),
+                jnp.maximum(setpoint_delta, 0.0),
+                jnp.minimum(setpoint_delta, 0.0),
+            ]
+            if regression_controls != "none":
+                event_disturbances = jnp.take(inputs[:, :, 1:], starts, axis=1)
+                disturbance_values = inputs[:, :, 1:4]
+                pre_disturbance = _time_window_means(
+                    disturbance_values,
+                    starts=starts - steps,
+                    window_steps=steps,
+                )
+                post_disturbance = _time_window_means(
+                    disturbance_values,
+                    starts=starts,
+                    window_steps=steps,
+                )
+                control_parts = [
+                    event_disturbances,
+                    post_disturbance - pre_disturbance,
+                ]
+                if regression_controls == "full":
+                    pre_state = jnp.stack(
+                        [
+                            jnp.reshape(target_pre, target_pre.shape),
+                            jnp.take(current_target_temperature, starts, axis=1),
+                            jnp.take(setpoint, starts - 1, axis=1),
+                            jnp.take(previous_event_delta, starts, axis=1),
+                        ],
+                        axis=-1,
+                    )
+                    control_parts.insert(0, pre_state)
+                pooled_controls = jnp.reshape(
+                    jnp.concatenate(control_parts, axis=-1),
+                    (
+                        group_count,
+                        windows_per_profile * event_count_per_window,
+                        -1,
+                    ),
+                )
+                standardized_controls = _masked_standardize_controls(
+                    pooled_controls,
+                    event_mask,
+                )
+                columns.extend(jnp.moveaxis(standardized_controls, -1, 0))
+
+            design = jax.lax.stop_gradient(jnp.stack(columns, axis=-1))
+            weighted_design = design * event_mask[..., jnp.newaxis]
+            xtx = jnp.einsum("gep,geq->gpq", design, weighted_design)
+            design_dim = design.shape[-1]
+            ridge_diagonal = jnp.ones(
+                (design_dim,), dtype=predictions.dtype
+            ).at[0].set(0.0)
+            penalty = (
+                jnp.asarray(regression_ridge, dtype=predictions.dtype)
+                * jnp.diag(ridge_diagonal)
+                + epsilon * jnp.eye(design_dim)
+            )
+            projection = jnp.linalg.solve(
+                xtx + penalty[jnp.newaxis, :, :],
+                jnp.swapaxes(weighted_design, -2, -1),
+            )
+            target_beta = jnp.einsum("gpe,ge->gp", projection, target_response)
+            prediction_beta = jnp.einsum(
+                "gpe,gke->gkp", projection, prediction_response
+            )
+            hours_value = jnp.asarray(hours, dtype=predictions.dtype)
+            target_kpi = hours_value * target_beta[:, 1:3]
+            prediction_kpi = hours_value * prediction_beta[:, :, 1:3]
+            event_count = jnp.sum(event_mask, axis=1)
+            valid = (
+                (event_count >= jnp.asarray(min_events, dtype=predictions.dtype))
+                & (event_count > jnp.asarray(design_dim, dtype=predictions.dtype))
+                & jnp.any((event_mask > 0.0) & (setpoint_delta > 0.0), axis=1)
+                & jnp.any((event_mask > 0.0) & (setpoint_delta < 0.0), axis=1)
+            ).astype(predictions.dtype)
+            return target_kpi, prediction_kpi, valid
+
+        regression_short_target, regression_short_prediction, regression_short_valid = (
+            regression_kpis(short_horizon_steps, short_horizon_hours)
+        )
+        regression_middle_target, regression_middle_prediction, regression_middle_valid = (
+            regression_kpis(middle_horizon_steps, middle_horizon_hours)
+        )
+        regression_long_target, regression_long_prediction, regression_long_valid = (
+            regression_kpis(long_horizon_steps, long_horizon_hours)
+        )
+        interpolation_fraction = jnp.asarray(
+            (middle_horizon_hours - short_horizon_hours)
+            / (long_horizon_hours - short_horizon_hours),
+            dtype=predictions.dtype,
+        )
+
+        def response_coordinates(
+            short: jnp.ndarray,
+            middle: jnp.ndarray,
+            long: jnp.ndarray,
+        ) -> jnp.ndarray:
+            interpolated_middle = short[..., 0] + interpolation_fraction * (
+                long[..., 0] - short[..., 0]
+            )
+            return jnp.stack(
+                [
+                    short[..., 0],
+                    short[..., 0] - short[..., 1],
+                    long[..., 0] - short[..., 0],
+                    middle[..., 0] - interpolated_middle,
+                ],
+                axis=-1,
+            )
+
+        target_coordinates = jnp.concatenate(
+            [
+                response_coordinates(short_target, middle_target, long_target),
+                response_coordinates(
+                    regression_short_target,
+                    regression_middle_target,
+                    regression_long_target,
+                ),
+            ],
+            axis=-1,
+        )
+        prediction_coordinates = jnp.concatenate(
+            [
+                response_coordinates(
+                    short_prediction,
+                    middle_prediction,
+                    long_prediction,
+                ),
+                response_coordinates(
+                    regression_short_prediction,
+                    regression_middle_prediction,
+                    regression_long_prediction,
+                ),
+            ],
+            axis=-1,
+        )
+        valid = (
+            short_valid
+            * middle_valid
+            * long_valid
+            * regression_short_valid
+            * regression_middle_valid
+            * regression_long_valid
+        )
+    center = jnp.asarray(coordinate_center, dtype=predictions.dtype)
+    scale = jnp.maximum(
+        jnp.asarray(coordinate_scale, dtype=predictions.dtype),
+        epsilon,
+    )
+    physical_scale = jnp.asarray(physical_kpi_scale, dtype=predictions.dtype)
+    standardized_target = (physical_scale * target_coordinates - center) / scale
+    standardized_prediction = (
+        physical_scale * prediction_coordinates - center[jnp.newaxis, jnp.newaxis, :]
+    ) / scale[jnp.newaxis, jnp.newaxis, :]
+    observation_delta = (
+        standardized_prediction - standardized_target[:, jnp.newaxis, :]
+    )
+    observation_distance = jnp.sqrt(
+        jnp.sum(observation_delta**2, axis=-1) + epsilon
+    )
+    pairwise_delta = (
+        standardized_prediction[:, :, jnp.newaxis, :]
+        - standardized_prediction[:, jnp.newaxis, :, :]
+    )
+    pairwise_distance = jnp.sqrt(
+        jnp.sum(pairwise_delta**2, axis=-1) + epsilon
+    )
+    per_profile_score = jnp.mean(observation_distance, axis=1) - 0.5 * jnp.mean(
+        pairwise_distance,
+        axis=(1, 2),
+    )
+    valid_count = jnp.sum(valid)
+    return jnp.where(
+        valid_count > 0.0,
+        jnp.sum(per_profile_score * valid) / jnp.maximum(valid_count, 1.0),
+        jnp.asarray(0.0, dtype=predictions.dtype),
+    )
 
 
 def predict_probabilistic_batch(
@@ -1776,20 +2790,56 @@ def predict_probabilistic_closed_loop_batch_with_aux(
     sample_process_noise: bool,
     hp_scenario_mode: HPElectricRolloutMode,
     hp_concrete_temperature: jnp.ndarray | float = 0.5,
+    persistent_xi_group_size: int = 1,
 ) -> tuple[jnp.ndarray, tuple[jnp.ndarray, ...]]:
-    keys = jax.random.split(key, metadata.shape[0])
+    if persistent_xi_group_size < 1:
+        raise ValueError("persistent_xi_group_size must be positive")
+    if persistent_xi_group_size == 1:
+        keys = jax.random.split(key, metadata.shape[0])
+        return jax.vmap(
+            lambda row_metadata, row_inputs, row_initial_temperature, row_key: model.sample_with_aux(
+                row_metadata,
+                row_inputs,
+                row_initial_temperature,
+                key=row_key,
+                num_particles=num_particles,
+                sample_process_noise=sample_process_noise,
+                hp_scenario_mode=hp_scenario_mode,
+                hp_concrete_temperature=hp_concrete_temperature,
+            )
+        )(metadata, inputs, initial_temperature, keys)
+
+    if metadata.shape[0] % persistent_xi_group_size:
+        raise ValueError(
+            "Grouped persistent xi requires a batch size divisible by "
+            "persistent_xi_group_size"
+        )
+    xi_key, local_key = jax.random.split(key)
+    group_count = metadata.shape[0] // persistent_xi_group_size
+    grouped_xi = jax.random.normal(
+        xi_key,
+        (group_count, num_particles, model.latent_dim),
+        dtype=metadata.dtype,
+    )
+    persistent_xi = jnp.repeat(
+        grouped_xi,
+        persistent_xi_group_size,
+        axis=0,
+    )
+    keys = jax.random.split(local_key, metadata.shape[0])
     return jax.vmap(
-        lambda row_metadata, row_inputs, row_initial_temperature, row_key: model.sample_with_aux(
+        lambda row_metadata, row_inputs, row_initial_temperature, row_key, row_xi: model.sample_with_aux(
             row_metadata,
             row_inputs,
             row_initial_temperature,
             key=row_key,
             num_particles=num_particles,
+            persistent_xi=row_xi,
             sample_process_noise=sample_process_noise,
             hp_scenario_mode=hp_scenario_mode,
             hp_concrete_temperature=hp_concrete_temperature,
         )
-    )(metadata, inputs, initial_temperature, keys)
+    )(metadata, inputs, initial_temperature, keys, persistent_xi)
 
 
 def local_jacobian_spectral_norm(
@@ -2012,6 +3062,23 @@ def probabilistic_closed_loop_loss_fn(
     softopt_weight: float,
     softopt_temperature: float,
     trajectory_output_weights: tuple[float, ...],
+    increment_energy_weight: float,
+    increment_energy_lags: tuple[int, ...],
+    increment_energy_lags_per_batch: int,
+    increment_energy_output_weights: tuple[float, ...],
+    increment_energy_constant_setpoint_only: bool,
+    increment_energy_setpoint_delta_threshold: float,
+    increment_energy_feature_scales: jnp.ndarray,
+    event_energy_weight: float,
+    event_energy_horizon_steps: tuple[int, ...],
+    event_energy_events_per_profile: int,
+    event_energy_output_weights: tuple[float, ...],
+    event_energy_setpoint_delta_threshold: float,
+    event_energy_feature_scales: jnp.ndarray,
+    block_energy_weight: float,
+    block_energy_horizon_steps: tuple[int, ...],
+    block_energy_horizons_per_batch: int,
+    block_energy_output_weights: tuple[float, ...],
     variogram_weight: float,
     variogram_lags: tuple[int, ...],
     variogram_power: float,
@@ -2030,6 +3097,15 @@ def probabilistic_closed_loop_loss_fn(
     flex_kpi_crps_estimator: FlexibilityKpiEstimator,
     flex_kpi_crps_ridge: float,
     flex_kpi_crps_controls: FlexibilityKpiControls,
+    flex_kpi_crps_windows_per_profile: int,
+    targeted_flex_energy_weight: float,
+    targeted_flex_short_horizon_steps: int,
+    targeted_flex_short_horizon_hours: float,
+    targeted_flex_long_horizon_steps: int,
+    targeted_flex_long_horizon_hours: float,
+    targeted_flex_coordinate_center: tuple[float, ...],
+    targeted_flex_coordinate_scale: tuple[float, ...],
+    targeted_flex_physical_kpi_scale: float,
     physics_weight: float,
     horizon_weight_power: float,
     stability_weight: float,
@@ -2038,8 +3114,20 @@ def probabilistic_closed_loop_loss_fn(
     stability_aggregation: Literal["mean", "max"],
     stability_method: ClosedLoopStabilityMethod,
     stability_power_iterations: int,
+    plant_targets: jnp.ndarray | None = None,
+    plant_source_loss_weight: float = 0.0,
+    plant_delivery_loss_weight: float = 0.0,
+    plant_block_steps: tuple[int, ...] = (16, 96),
+    dhw_mode_loss_weight: float = 0.0,
+    event_energy_additional_inputs: tuple[tuple[int, float], ...] = (),
+    tank_temperature_loss_weight: float = 0.0,
 ) -> tuple[jnp.ndarray, jnp.ndarray]:
+    # Preserve the historical rollout/stability key stream when the new score
+    # is disabled, so legacy recipes remain exactly reproducible.
     rollout_key, stability_key = jax.random.split(key)
+    increment_key = jax.random.fold_in(key, 0x1A6)
+    event_key = jax.random.fold_in(key, 0xE7E)
+    block_key = jax.random.fold_in(key, 0xB10C)
     predictions, aux = predict_probabilistic_closed_loop_batch_with_aux(
         model,
         metadata,
@@ -2050,6 +3138,7 @@ def probabilistic_closed_loop_loss_fn(
         sample_process_noise=True,
         hp_scenario_mode=hp_training_mode,
         hp_concrete_temperature=hp_concrete_temperature,
+        persistent_xi_group_size=flex_kpi_crps_windows_per_profile,
     )
     zero = jnp.asarray(0.0, dtype=predictions.dtype)
     energy_component = energy_score(
@@ -2057,6 +3146,44 @@ def probabilistic_closed_loop_loss_fn(
         targets,
         output_weights=trajectory_output_weights,
     )
+    increment_energy_component = zero
+    if increment_energy_weight > 0.0:
+        increment_energy_component = increment_energy_weight * increment_energy_score(
+            predictions,
+            targets,
+            inputs,
+            increment_key,
+            lags=increment_energy_lags,
+            feature_scales=increment_energy_feature_scales,
+            lags_per_batch=increment_energy_lags_per_batch,
+            output_weights=increment_energy_output_weights,
+            constant_setpoint_only=increment_energy_constant_setpoint_only,
+            setpoint_delta_threshold=increment_energy_setpoint_delta_threshold,
+        )
+    event_energy_component = zero
+    if event_energy_weight > 0.0:
+        event_energy_component = event_energy_weight * event_response_energy_score(
+            predictions,
+            targets,
+            inputs,
+            event_key,
+            horizon_steps=event_energy_horizon_steps,
+            feature_scales=event_energy_feature_scales,
+            events_per_profile=event_energy_events_per_profile,
+            setpoint_delta_threshold=event_energy_setpoint_delta_threshold,
+            output_weights=event_energy_output_weights,
+            additional_event_inputs=event_energy_additional_inputs,
+        )
+    block_energy_component = zero
+    if block_energy_weight > 0.0:
+        block_energy_component = block_energy_weight * block_average_energy_score(
+            predictions,
+            targets,
+            block_key,
+            block_steps=block_energy_horizon_steps,
+            horizons_per_batch=block_energy_horizons_per_batch,
+            output_weights=block_energy_output_weights,
+        )
     variogram_component = zero
     if variogram_weight > 0.0:
         variogram_component = variogram_weight * variogram_score(
@@ -2091,6 +3218,7 @@ def probabilistic_closed_loop_loss_fn(
                 setpoint_delta_threshold=flex_kpi_crps_setpoint_delta_threshold,
                 min_events=flex_kpi_crps_min_events,
                 target_channel=2,
+                windows_per_profile=flex_kpi_crps_windows_per_profile,
             )
         else:
             flex_kpi_crps = flexibility_coefficient_crps(
@@ -2107,6 +3235,41 @@ def probabilistic_closed_loop_loss_fn(
                 target_channel=2,
             )
         flex_kpi_crps_component = flex_kpi_crps_weight * flex_kpi_crps
+    targeted_flex_energy_component = zero
+    if targeted_flex_energy_weight > 0.0:
+        targeted_middle_steps = None
+        targeted_middle_hours = None
+        if len(targeted_flex_coordinate_center) == 8:
+            middle_index = min(
+                range(len(flex_kpi_crps_horizon_hours)),
+                key=lambda index: abs(flex_kpi_crps_horizon_hours[index] - 2.0),
+            )
+            targeted_middle_steps = flex_kpi_crps_horizon_steps[middle_index]
+            targeted_middle_hours = flex_kpi_crps_horizon_hours[middle_index]
+        targeted_flex_energy_component = (
+            targeted_flex_energy_weight
+            * targeted_flexibility_energy_score(
+                predictions,
+                targets,
+                inputs,
+                short_horizon_steps=targeted_flex_short_horizon_steps,
+                short_horizon_hours=targeted_flex_short_horizon_hours,
+                long_horizon_steps=targeted_flex_long_horizon_steps,
+                long_horizon_hours=targeted_flex_long_horizon_hours,
+                setpoint_delta_threshold=flex_kpi_crps_setpoint_delta_threshold,
+                min_events=flex_kpi_crps_min_events,
+                coordinate_center=targeted_flex_coordinate_center,
+                coordinate_scale=targeted_flex_coordinate_scale,
+                physical_kpi_scale=targeted_flex_physical_kpi_scale,
+                target_channel=2,
+                windows_per_profile=flex_kpi_crps_windows_per_profile,
+                middle_horizon_steps=targeted_middle_steps,
+                middle_horizon_hours=targeted_middle_hours,
+                initial_temperature=initial_temperature,
+                regression_ridge=flex_kpi_crps_ridge,
+                regression_controls=flex_kpi_crps_controls,
+            )
+        )
     softopt_component = zero
     if softopt_weight > 0.0:
         softopt_component = softopt_weight * soft_optimistic_loss(
@@ -2264,12 +3427,52 @@ def probabilistic_closed_loop_loss_fn(
             power_iterations=stability_power_iterations,
         )
 
+    plant_components = jnp.zeros((2,), dtype=predictions.dtype)
+    if plant_source_loss_weight > 0.0 or plant_delivery_loss_weight > 0.0:
+        if plant_targets is None or not isinstance(model, ProbabilisticContractingClosedLoopHPEmulator):
+            raise ValueError("Plant supervision requires labels and the probabilistic contracting model")
+        ratios = jax.vmap(lambda m, xs: jax.vmap(lambda x: model.zone_heat_ratio(
+            m, model.routed_persistent_xi(x, "hp") if "hp" in model.persistent_xi_pathways else jnp.zeros_like(x)
+        ))(xs))(metadata, aux[13])
+        physical = predictions * target_scale + target_mean
+        plant_predictions = jnp.stack([
+            aux[1] * physical[..., 2], physical[..., 1] / ratios[..., None],
+        ], axis=-1)
+        plant_components = plant_block_crps(
+            plant_predictions, plant_targets[..., :2], horizon_steps=plant_block_steps,
+            power_scale=jnp.maximum(target_scale[1], 1.0),
+        ) * jnp.asarray([plant_source_loss_weight, plant_delivery_loss_weight])
+
+    dhw_component = zero
+    if dhw_mode_loss_weight > 0:
+        if plant_targets is None or model.dhw_recovery is None:
+            raise ValueError("DHW mode supervision requires the causal DHW state and training labels")
+        warmup = min(int(round(4 / model.hp_dt_hours)), inputs.shape[1] - 1)
+        probability = jnp.clip(jnp.mean(aux[-3], axis=1)[:, warmup:], 1e-5, 1 - 1e-5)
+        observed = plant_targets[:, warmup:, 2]
+        bce = -jnp.mean(observed * jnp.log(probability) + (1 - observed) * jnp.log1p(-probability))
+        dhw_component = dhw_mode_loss_weight * jnp.sqrt(jnp.asarray(inputs.shape[1], predictions.dtype)) * bce
+
+    tank_component = zero
+    if tank_temperature_loss_weight > 0:
+        if plant_targets is None or plant_targets.shape[-1] != 5 or model.tank_temperatures is None:
+            raise ValueError("Tank supervision requires SH/DHW labels and the two-temperature state")
+        warmup = min(int(round(4 / model.hp_dt_hours)), inputs.shape[1] // 4)
+        tank_component = tank_temperature_loss_weight * jnp.sum(plant_block_crps(
+            aux[-1][:, :, warmup:], plant_targets[:, warmup:, 3:5],
+            horizon_steps=(1,), power_scale=jnp.asarray(10., dtype=predictions.dtype),
+        ))
+
     components = jnp.stack(
         [
             energy_component,
+            increment_energy_component,
+            event_energy_component,
+            block_energy_component,
             variogram_component,
             ires_component,
             flex_kpi_crps_component,
+            targeted_flex_energy_component,
             softopt_component,
             hp_bce_component,
             qroom_bce_component,
@@ -2277,6 +3480,10 @@ def probabilistic_closed_loop_loss_fn(
             hp_inactive_leakage_component,
             physics_component,
             stability_component,
+            plant_components[0],
+            plant_components[1],
+            dhw_component,
+            tank_component,
         ]
     )
     return jnp.sum(components), components
@@ -2307,6 +3514,23 @@ def probabilistic_closed_loop_train_step(
     softopt_weight: float,
     softopt_temperature: float,
     trajectory_output_weights: tuple[float, ...],
+    increment_energy_weight: float,
+    increment_energy_lags: tuple[int, ...],
+    increment_energy_lags_per_batch: int,
+    increment_energy_output_weights: tuple[float, ...],
+    increment_energy_constant_setpoint_only: bool,
+    increment_energy_setpoint_delta_threshold: float,
+    increment_energy_feature_scales: jnp.ndarray,
+    event_energy_weight: float,
+    event_energy_horizon_steps: tuple[int, ...],
+    event_energy_events_per_profile: int,
+    event_energy_output_weights: tuple[float, ...],
+    event_energy_setpoint_delta_threshold: float,
+    event_energy_feature_scales: jnp.ndarray,
+    block_energy_weight: float,
+    block_energy_horizon_steps: tuple[int, ...],
+    block_energy_horizons_per_batch: int,
+    block_energy_output_weights: tuple[float, ...],
     variogram_weight: float,
     variogram_lags: tuple[int, ...],
     variogram_power: float,
@@ -2325,6 +3549,15 @@ def probabilistic_closed_loop_train_step(
     flex_kpi_crps_estimator: FlexibilityKpiEstimator,
     flex_kpi_crps_ridge: float,
     flex_kpi_crps_controls: FlexibilityKpiControls,
+    flex_kpi_crps_windows_per_profile: int,
+    targeted_flex_energy_weight: float,
+    targeted_flex_short_horizon_steps: int,
+    targeted_flex_short_horizon_hours: float,
+    targeted_flex_long_horizon_steps: int,
+    targeted_flex_long_horizon_hours: float,
+    targeted_flex_coordinate_center: tuple[float, ...],
+    targeted_flex_coordinate_scale: tuple[float, ...],
+    targeted_flex_physical_kpi_scale: float,
     physics_weight: float,
     horizon_weight_power: float,
     stability_weight: float,
@@ -2336,6 +3569,13 @@ def probabilistic_closed_loop_train_step(
     skip_nonfinite_updates: bool,
     validate_candidate_update: bool,
     skip_grad_norm_above: float = 0.0,
+    plant_targets: jnp.ndarray | None = None,
+    plant_source_loss_weight: float = 0.0,
+    plant_delivery_loss_weight: float = 0.0,
+    plant_block_steps: tuple[int, ...] = (16, 96),
+    dhw_mode_loss_weight: float = 0.0,
+    event_energy_additional_inputs: tuple[tuple[int, float], ...] = (),
+    tank_temperature_loss_weight: float = 0.0,
 ) -> tuple[
     ProbabilisticClosedLoopModel,
     optax.OptState,
@@ -2367,6 +3607,23 @@ def probabilistic_closed_loop_train_step(
         softopt_weight,
         softopt_temperature,
         trajectory_output_weights,
+        increment_energy_weight,
+        increment_energy_lags,
+        increment_energy_lags_per_batch,
+        increment_energy_output_weights,
+        increment_energy_constant_setpoint_only,
+        increment_energy_setpoint_delta_threshold,
+        increment_energy_feature_scales,
+        event_energy_weight,
+        event_energy_horizon_steps,
+        event_energy_events_per_profile,
+        event_energy_output_weights,
+        event_energy_setpoint_delta_threshold,
+        event_energy_feature_scales,
+        block_energy_weight,
+        block_energy_horizon_steps,
+        block_energy_horizons_per_batch,
+        block_energy_output_weights,
         variogram_weight,
         variogram_lags,
         variogram_power,
@@ -2385,6 +3642,15 @@ def probabilistic_closed_loop_train_step(
         flex_kpi_crps_estimator,
         flex_kpi_crps_ridge,
         flex_kpi_crps_controls,
+        flex_kpi_crps_windows_per_profile,
+        targeted_flex_energy_weight,
+        targeted_flex_short_horizon_steps,
+        targeted_flex_short_horizon_hours,
+        targeted_flex_long_horizon_steps,
+        targeted_flex_long_horizon_hours,
+        targeted_flex_coordinate_center,
+        targeted_flex_coordinate_scale,
+        targeted_flex_physical_kpi_scale,
         physics_weight,
         horizon_weight_power,
         stability_weight,
@@ -2393,6 +3659,13 @@ def probabilistic_closed_loop_train_step(
         stability_aggregation,
         stability_method,
         stability_power_iterations,
+        plant_targets,
+        plant_source_loss_weight,
+        plant_delivery_loss_weight,
+        plant_block_steps,
+        dhw_mode_loss_weight,
+        event_energy_additional_inputs,
+        tank_temperature_loss_weight,
     )
     gradient_group_norms = _probabilistic_closed_loop_gradient_group_norms(grads)
     updates, candidate_opt_state = optimizer.update(grads, opt_state, eqx.filter(model, eqx.is_array))
@@ -2409,6 +3682,7 @@ def probabilistic_closed_loop_train_step(
             sample_process_noise=True,
             hp_scenario_mode=hp_training_mode,
             hp_concrete_temperature=hp_concrete_temperature,
+            persistent_xi_group_size=flex_kpi_crps_windows_per_profile,
         )
         candidate_forward_is_finite = _array_tree_all_finite((candidate_predictions, candidate_aux))
     update_flags = _update_finite_flags(
@@ -2437,6 +3711,561 @@ def probabilistic_closed_loop_train_step(
         update_flags,
         update_stats,
         gradient_group_norms,
+    )
+
+
+@eqx.filter_value_and_grad
+def probabilistic_closed_loop_aux_flex_loss_fn(
+    model: ProbabilisticClosedLoopModel,
+    metadata: jnp.ndarray,
+    inputs: jnp.ndarray,
+    initial_temperature: jnp.ndarray,
+    targets: jnp.ndarray,
+    key: jax.Array,
+    num_particles: int,
+    hp_training_mode: HPTrainingMode,
+    hp_concrete_temperature: jnp.ndarray,
+    flex_kpi_crps_weight: float,
+    flex_kpi_crps_horizon_steps: tuple[int, ...],
+    flex_kpi_crps_horizon_hours: tuple[float, ...],
+    flex_kpi_crps_setpoint_delta_threshold: float,
+    flex_kpi_crps_min_events: int,
+    flex_kpi_crps_windows_per_profile: int,
+) -> jnp.ndarray:
+    """Flex-only loss on coherent seasonal windows from one policy trajectory."""
+    predictions, _ = predict_probabilistic_closed_loop_batch_with_aux(
+        model,
+        metadata,
+        inputs,
+        initial_temperature,
+        key=key,
+        num_particles=num_particles,
+        sample_process_noise=True,
+        hp_scenario_mode=hp_training_mode,
+        hp_concrete_temperature=hp_concrete_temperature,
+        persistent_xi_group_size=flex_kpi_crps_windows_per_profile,
+    )
+    score = flexibility_direct_ratio_crps(
+        predictions,
+        targets,
+        inputs,
+        horizon_steps=flex_kpi_crps_horizon_steps,
+        horizon_hours=flex_kpi_crps_horizon_hours,
+        setpoint_delta_threshold=flex_kpi_crps_setpoint_delta_threshold,
+        min_events=flex_kpi_crps_min_events,
+        target_channel=2,
+        windows_per_profile=flex_kpi_crps_windows_per_profile,
+    )
+    return flex_kpi_crps_weight * score
+
+
+@eqx.filter_jit
+def probabilistic_closed_loop_aux_flex_train_step(
+    model: ProbabilisticClosedLoopModel,
+    opt_state: optax.OptState,
+    optimizer: optax.GradientTransformation,
+    metadata: jnp.ndarray,
+    inputs: jnp.ndarray,
+    initial_temperature: jnp.ndarray,
+    targets: jnp.ndarray,
+    key: jax.Array,
+    num_particles: int,
+    hp_training_mode: HPTrainingMode,
+    hp_concrete_temperature: jnp.ndarray,
+    flex_kpi_crps_weight: float,
+    flex_kpi_crps_horizon_steps: tuple[int, ...],
+    flex_kpi_crps_horizon_hours: tuple[float, ...],
+    flex_kpi_crps_setpoint_delta_threshold: float,
+    flex_kpi_crps_min_events: int,
+    flex_kpi_crps_windows_per_profile: int,
+    skip_nonfinite_updates: bool,
+    validate_candidate_update: bool,
+    skip_grad_norm_above: float = 0.0,
+) -> tuple[
+    ProbabilisticClosedLoopModel,
+    optax.OptState,
+    jnp.ndarray,
+    jnp.ndarray,
+    jnp.ndarray,
+    jnp.ndarray,
+]:
+    loss, grads = probabilistic_closed_loop_aux_flex_loss_fn(
+        model,
+        metadata,
+        inputs,
+        initial_temperature,
+        targets,
+        key,
+        num_particles,
+        hp_training_mode,
+        hp_concrete_temperature,
+        flex_kpi_crps_weight,
+        flex_kpi_crps_horizon_steps,
+        flex_kpi_crps_horizon_hours,
+        flex_kpi_crps_setpoint_delta_threshold,
+        flex_kpi_crps_min_events,
+        flex_kpi_crps_windows_per_profile,
+    )
+    gradient_group_norms = _probabilistic_closed_loop_gradient_group_norms(grads)
+    updates, candidate_opt_state = optimizer.update(
+        grads,
+        opt_state,
+        eqx.filter(model, eqx.is_array),
+    )
+    candidate_model = eqx.apply_updates(model, updates)
+    candidate_forward_is_finite = jnp.asarray(True)
+    if validate_candidate_update:
+        candidate_predictions, candidate_aux = predict_probabilistic_closed_loop_batch_with_aux(
+            candidate_model,
+            metadata,
+            inputs,
+            initial_temperature,
+            key=key,
+            num_particles=num_particles,
+            sample_process_noise=True,
+            hp_scenario_mode=hp_training_mode,
+            hp_concrete_temperature=hp_concrete_temperature,
+            persistent_xi_group_size=flex_kpi_crps_windows_per_profile,
+        )
+        candidate_forward_is_finite = _array_tree_all_finite(
+            (candidate_predictions, candidate_aux)
+        )
+    update_flags = _update_finite_flags(
+        loss=loss,
+        components=jnp.asarray([loss]),
+        grads=grads,
+        updates=updates,
+        opt_state=candidate_opt_state,
+        model=candidate_model,
+        forward_is_finite=candidate_forward_is_finite,
+        max_grad_norm=skip_grad_norm_above,
+    )
+    update_stats = _update_stats(grads=grads, updates=updates, model=candidate_model)
+    update_is_finite = jnp.all(update_flags)
+    if skip_nonfinite_updates:
+        model = _select_array_tree(update_is_finite, candidate_model, model)
+        opt_state = _select_array_tree(update_is_finite, candidate_opt_state, opt_state)
+    else:
+        model = candidate_model
+        opt_state = candidate_opt_state
+    return (
+        model,
+        opt_state,
+        loss,
+        update_flags,
+        update_stats,
+        gradient_group_norms,
+    )
+
+
+def _trajectory_critic_time_indices(horizon: int, chunk_steps: int) -> jnp.ndarray:
+    indices = list(range(chunk_steps - 1, horizon, chunk_steps))
+    if not indices or indices[-1] != horizon - 1:
+        indices.append(horizon - 1)
+    return jnp.asarray(indices, dtype=jnp.int32)
+
+
+@eqx.filter_value_and_grad(has_aux=True)
+def trajectory_actor_critic_loss_fn(
+    trainables: tuple[ProbabilisticClosedLoopModel, ParticleContinuationCritic],
+    metadata: jnp.ndarray,
+    inputs: jnp.ndarray,
+    initial_temperature: jnp.ndarray,
+    targets: jnp.ndarray,
+    key: jax.Array,
+    num_particles: int,
+    hp_training_mode: HPTrainingMode,
+    hp_concrete_temperature: jnp.ndarray,
+    trajectory_output_weights: tuple[float, ...],
+    increment_energy_weight: float,
+    increment_energy_lags: tuple[int, ...],
+    increment_energy_lags_per_batch: int,
+    increment_energy_output_weights: tuple[float, ...],
+    increment_energy_constant_setpoint_only: bool,
+    increment_energy_setpoint_delta_threshold: float,
+    increment_energy_feature_scales: jnp.ndarray,
+    event_energy_weight: float,
+    event_energy_horizon_steps: tuple[int, ...],
+    event_energy_events_per_profile: int,
+    event_energy_output_weights: tuple[float, ...],
+    event_energy_setpoint_delta_threshold: float,
+    event_energy_feature_scales: jnp.ndarray,
+    critic_chunk_steps: int,
+    critic_loss_weight: float,
+    critic_continuation_weight: float,
+    score_function_weight: float,
+) -> tuple[jnp.ndarray, tuple[jnp.ndarray, ...]]:
+    """Proper-score objective with a learned TBPTT continuation value.
+
+    The exact measured objective remains the trajectory, increment, and event
+    energy scores. The critic is trained on the remaining raw trajectory score;
+    its frozen value supplies an approximate continuation derivative across
+    detached recurrent chunks. In ``score_function`` mode it also acts as the
+    baseline for hard Bernoulli HP samples.
+    """
+
+    model, critic = trainables
+    rollout_key, increment_key, event_key = jax.random.split(key, 3)
+    predictions, aux = predict_probabilistic_closed_loop_batch_with_aux(
+        model,
+        metadata,
+        inputs,
+        initial_temperature,
+        key=rollout_key,
+        num_particles=num_particles,
+        sample_process_noise=True,
+        hp_scenario_mode=hp_training_mode,
+        hp_concrete_temperature=hp_concrete_temperature,
+    )
+    zero = jnp.asarray(0.0, dtype=predictions.dtype)
+    energy_component = energy_score(
+        predictions,
+        targets,
+        output_weights=trajectory_output_weights,
+    )
+    increment_energy_component = zero
+    if increment_energy_weight > 0.0:
+        increment_energy_component = increment_energy_weight * increment_energy_score(
+            predictions,
+            targets,
+            inputs,
+            increment_key,
+            lags=increment_energy_lags,
+            feature_scales=increment_energy_feature_scales,
+            lags_per_batch=increment_energy_lags_per_batch,
+            output_weights=increment_energy_output_weights,
+            constant_setpoint_only=increment_energy_constant_setpoint_only,
+            setpoint_delta_threshold=increment_energy_setpoint_delta_threshold,
+        )
+    event_energy_component = zero
+    if event_energy_weight > 0.0:
+        event_energy_component = event_energy_weight * event_response_energy_score(
+            predictions,
+            targets,
+            inputs,
+            event_key,
+            horizon_steps=event_energy_horizon_steps,
+            feature_scales=event_energy_feature_scales,
+            events_per_profile=event_energy_events_per_profile,
+            setpoint_delta_threshold=event_energy_setpoint_delta_threshold,
+            output_weights=event_energy_output_weights,
+        )
+    score_loss = energy_component + increment_energy_component + event_energy_component
+    components = jnp.stack(
+        [
+            energy_component,
+            increment_energy_component,
+            event_energy_component,
+            *([zero] * (len(PROB_CLOSED_LOOP_LOSS_COMPONENT_NAMES) - 3)),
+        ]
+    )
+
+    output_weights = normalized_output_loss_weights(
+        predictions.shape[-1],
+        trajectory_output_weights,
+        dtype=predictions.dtype,
+    )
+    profile_prefix_scores = energy_score_prefixes_per_profile(
+        predictions,
+        targets,
+        output_weights,
+    )
+    profile_terminal_scores = profile_prefix_scores[:, -1]
+    boundary_indices = _trajectory_critic_time_indices(
+        predictions.shape[2],
+        critic_chunk_steps,
+    )
+    particle_features, context_features = build_continuation_features(
+        predictions=predictions,
+        metadata=metadata,
+        inputs=inputs,
+        targets=targets,
+        x_state=aux[PROB_CLOSED_LOOP_AUX_X_STATE],
+        energy=aux[PROB_CLOSED_LOOP_AUX_ENERGY],
+        temperature_state=aux[PROB_CLOSED_LOOP_AUX_TEMPERATURE_STATE],
+        xi=aux[PROB_CLOSED_LOOP_AUX_XI],
+        # Hard HP actions receive their policy gradient from the likelihood
+        # ratio below. The critic may observe pi, but must not create a second,
+        # biased pathwise derivative through a discrete action probability.
+        hp_probability=jax.lax.stop_gradient(aux[0]),
+        hp_mode=aux[5],
+        time_indices=boundary_indices,
+        energy_scale=float(model.energy_scale),
+    )
+    prefix_at_boundaries = jnp.take(
+        profile_prefix_scores,
+        boundary_indices,
+        axis=1,
+    )
+    remaining_targets = profile_terminal_scores[:, jnp.newaxis] - prefix_at_boundaries
+
+    critic_values = evaluate_critic(
+        critic,
+        jax.lax.stop_gradient(particle_features),
+        jax.lax.stop_gradient(context_features),
+    )
+    critic_residual = critic_values - jax.lax.stop_gradient(remaining_targets)
+    critic_loss = jnp.mean(critic_residual**2)
+    target_variance = jnp.var(remaining_targets)
+    critic_explained_variance = 1.0 - jnp.var(critic_residual) / jnp.maximum(
+        target_variance,
+        jnp.asarray(1e-6, dtype=predictions.dtype),
+    )
+
+    continuation_component = zero
+    if critic_continuation_weight > 0.0 and boundary_indices.shape[0] > 1:
+        frozen_critic = stop_gradient_module(critic)
+        continuation_values = evaluate_critic(
+            frozen_critic,
+            particle_features[:, :-1],
+            context_features[:, :-1],
+        )
+        continuation_component = critic_continuation_weight * jnp.mean(
+            continuation_values
+        )
+
+    score_function_component = zero
+    if hp_training_mode == "score_function" and score_function_weight > 0.0:
+        eps = jnp.asarray(1e-5, dtype=predictions.dtype)
+        hp_probability = jnp.clip(aux[0], eps, 1.0 - eps)
+        hp_mode = jax.lax.stop_gradient(aux[5])
+        log_probability = hp_mode * jnp.log(hp_probability) + (
+            1.0 - hp_mode
+        ) * jnp.log1p(-hp_probability)
+
+        chunk_terms = []
+        previous_end = -1
+        frozen_values = jax.lax.stop_gradient(critic_values)
+        for boundary_position, boundary_end in enumerate(
+            range(critic_chunk_steps - 1, predictions.shape[2], critic_chunk_steps)
+        ):
+            chunk_start = previous_end + 1
+            chunk_log_probability = jnp.sum(
+                log_probability[:, :, chunk_start : boundary_end + 1],
+                axis=2,
+            )
+            if previous_end < 0:
+                realized_remaining = profile_terminal_scores
+                batch_size = realized_remaining.shape[0]
+                leave_one_out_sum = (
+                    jnp.sum(realized_remaining) - realized_remaining
+                )
+                baseline = jnp.where(
+                    batch_size > 1,
+                    leave_one_out_sum / jnp.maximum(batch_size - 1, 1),
+                    jnp.zeros_like(realized_remaining),
+                )
+            else:
+                realized_remaining = (
+                    profile_terminal_scores - profile_prefix_scores[:, previous_end]
+                )
+                baseline = frozen_values[:, boundary_position - 1]
+            advantage = jax.lax.stop_gradient(realized_remaining - baseline)
+            chunk_terms.append(
+                jnp.mean(advantage[:, jnp.newaxis] * chunk_log_probability)
+            )
+            previous_end = boundary_end
+        if previous_end < predictions.shape[2] - 1:
+            chunk_log_probability = jnp.sum(
+                log_probability[:, :, previous_end + 1 :],
+                axis=2,
+            )
+            realized_remaining = (
+                profile_terminal_scores - profile_prefix_scores[:, previous_end]
+            )
+            baseline = frozen_values[:, -2] if frozen_values.shape[1] > 1 else zero
+            advantage = jax.lax.stop_gradient(realized_remaining - baseline)
+            chunk_terms.append(
+                jnp.mean(advantage[:, jnp.newaxis] * chunk_log_probability)
+            )
+        score_function_component = score_function_weight * jnp.sum(
+            jnp.stack(chunk_terms)
+        )
+
+    model_objective = (
+        score_loss + continuation_component + score_function_component
+    )
+    combined_objective = model_objective + critic_loss_weight * critic_loss
+    diagnostics = (
+        score_loss,
+        components,
+        critic_loss,
+        continuation_component,
+        score_function_component,
+        jnp.mean(critic_values),
+        jnp.mean(remaining_targets),
+        critic_explained_variance,
+        model_objective,
+    )
+    return combined_objective, diagnostics
+
+
+@eqx.filter_jit
+def trajectory_actor_critic_train_step(
+    model: ProbabilisticClosedLoopModel,
+    critic: ParticleContinuationCritic,
+    opt_state: optax.OptState,
+    critic_opt_state: optax.OptState,
+    optimizer: optax.GradientTransformation,
+    critic_optimizer: optax.GradientTransformation,
+    metadata: jnp.ndarray,
+    inputs: jnp.ndarray,
+    initial_temperature: jnp.ndarray,
+    targets: jnp.ndarray,
+    key: jax.Array,
+    num_particles: int,
+    hp_training_mode: HPTrainingMode,
+    hp_concrete_temperature: jnp.ndarray,
+    trajectory_output_weights: tuple[float, ...],
+    increment_energy_weight: float,
+    increment_energy_lags: tuple[int, ...],
+    increment_energy_lags_per_batch: int,
+    increment_energy_output_weights: tuple[float, ...],
+    increment_energy_constant_setpoint_only: bool,
+    increment_energy_setpoint_delta_threshold: float,
+    increment_energy_feature_scales: jnp.ndarray,
+    event_energy_weight: float,
+    event_energy_horizon_steps: tuple[int, ...],
+    event_energy_events_per_profile: int,
+    event_energy_output_weights: tuple[float, ...],
+    event_energy_setpoint_delta_threshold: float,
+    event_energy_feature_scales: jnp.ndarray,
+    critic_chunk_steps: int,
+    critic_loss_weight: float,
+    critic_continuation_weight: float,
+    score_function_weight: float,
+    skip_nonfinite_updates: bool,
+    skip_grad_norm_above: float,
+) -> tuple[
+    ProbabilisticClosedLoopModel,
+    ParticleContinuationCritic,
+    optax.OptState,
+    optax.OptState,
+    jnp.ndarray,
+    jnp.ndarray,
+    jnp.ndarray,
+    jnp.ndarray,
+    jnp.ndarray,
+    jnp.ndarray,
+]:
+    (combined_loss, diagnostics), grads = trajectory_actor_critic_loss_fn(
+        (model, critic),
+        metadata,
+        inputs,
+        initial_temperature,
+        targets,
+        key,
+        num_particles,
+        hp_training_mode,
+        hp_concrete_temperature,
+        trajectory_output_weights,
+        increment_energy_weight,
+        increment_energy_lags,
+        increment_energy_lags_per_batch,
+        increment_energy_output_weights,
+        increment_energy_constant_setpoint_only,
+        increment_energy_setpoint_delta_threshold,
+        increment_energy_feature_scales,
+        event_energy_weight,
+        event_energy_horizon_steps,
+        event_energy_events_per_profile,
+        event_energy_output_weights,
+        event_energy_setpoint_delta_threshold,
+        event_energy_feature_scales,
+        critic_chunk_steps,
+        critic_loss_weight,
+        critic_continuation_weight,
+        score_function_weight,
+    )
+    model_grads, critic_grads = grads
+    critic_grad_norm = _array_tree_global_norm(critic_grads)
+    gradient_group_norms = _probabilistic_closed_loop_gradient_group_norms(
+        model_grads
+    )
+    model_updates, candidate_opt_state = optimizer.update(
+        model_grads,
+        opt_state,
+        eqx.filter(model, eqx.is_array),
+    )
+    critic_updates, candidate_critic_opt_state = critic_optimizer.update(
+        critic_grads,
+        critic_opt_state,
+        eqx.filter(critic, eqx.is_array),
+    )
+    candidate_model = eqx.apply_updates(model, model_updates)
+    candidate_critic = eqx.apply_updates(critic, critic_updates)
+    model_update_flags = _update_finite_flags(
+        loss=diagnostics[8],
+        components=(diagnostics[0], diagnostics[1], diagnostics[3], diagnostics[4]),
+        grads=model_grads,
+        updates=model_updates,
+        opt_state=candidate_opt_state,
+        model=candidate_model,
+        forward_is_finite=jnp.asarray(True),
+        max_grad_norm=skip_grad_norm_above,
+    )
+    critic_update_flags = _update_finite_flags(
+        loss=diagnostics[2],
+        components=(diagnostics[5], diagnostics[6], diagnostics[7]),
+        grads=critic_grads,
+        updates=critic_updates,
+        opt_state=candidate_critic_opt_state,
+        model=candidate_critic,
+        forward_is_finite=jnp.asarray(True),
+    )
+    model_update_is_finite = jnp.all(model_update_flags)
+    critic_update_is_finite = jnp.all(critic_update_flags)
+    if skip_nonfinite_updates:
+        model = _select_array_tree(model_update_is_finite, candidate_model, model)
+        critic = _select_array_tree(
+            critic_update_is_finite,
+            candidate_critic,
+            critic,
+        )
+        opt_state = _select_array_tree(
+            model_update_is_finite,
+            candidate_opt_state,
+            opt_state,
+        )
+        critic_opt_state = _select_array_tree(
+            critic_update_is_finite,
+            candidate_critic_opt_state,
+            critic_opt_state,
+        )
+    else:
+        model = candidate_model
+        critic = candidate_critic
+        opt_state = candidate_opt_state
+        critic_opt_state = candidate_critic_opt_state
+    update_flags = model_update_flags
+    update_stats = _update_stats(
+        grads=model_grads,
+        updates=model_updates,
+        model=candidate_model,
+    )
+    critic_stats = jnp.stack(
+        [
+            diagnostics[2],
+            critic_grad_norm,
+            critic_update_is_finite.astype(jnp.float32),
+            diagnostics[5],
+            diagnostics[6],
+            diagnostics[7],
+            diagnostics[3],
+            diagnostics[4],
+        ]
+    )
+    return (
+        model,
+        critic,
+        opt_state,
+        critic_opt_state,
+        diagnostics[0],
+        diagnostics[1],
+        update_flags,
+        update_stats,
+        gradient_group_norms,
+        critic_stats,
     )
 
 
@@ -4452,7 +6281,9 @@ def resolve_closed_loop_caps(
         floor=1.0,
     )
     cop_cap = float(config.hp_cop_cap)
-    if config.hp_energy_cap_wh_m2 > 0.0:
+    if config.hp_buffer_capacity_mode == "physical_volume":
+        energy_cap_wh_m2 = 0.0
+    elif config.hp_energy_cap_wh_m2 > 0.0:
         energy_cap_wh_m2 = float(config.hp_energy_cap_wh_m2)
     else:
         cop_for_energy = cop_cap if cop_cap > 0.0 else max(config.hp_cop_floor, 6.0)
@@ -4466,7 +6297,14 @@ def resolve_closed_loop_caps(
 
 def run_closed_loop_training(
     config: TrainConfig,
+    *,
+    epoch_observer: Callable[[int, Path], bool] | None = None,
 ) -> ClosedLoopHPEmulator | ContractingClosedLoopHPEmulator | ProbabilisticClosedLoopModel:
+    # Observers run outside JIT after a complete checkpoint. Returning True
+    # ends training normally, retaining the best model and live optimizer
+    # throughout any validation pause. Default training is unchanged.
+    if epoch_observer is not None and config.save_model_every_epochs != 1:
+        raise ValueError("Epoch observers require a saved checkpoint every epoch")
     is_probabilistic = config.model_kind in (
         "closed_loop_hp_probabilistic",
         "closed_loop_hp_contracting_probabilistic",
@@ -4476,6 +6314,42 @@ def run_closed_loop_training(
         "closed_loop_hp_contracting_probabilistic",
     )
     is_contracting_probabilistic = config.model_kind == "closed_loop_hp_contracting_probabilistic"
+    plant_supervision_enabled = (
+        config.prob_plant_source_loss_weight > 0 or config.prob_plant_delivery_loss_weight > 0
+        or config.prob_dhw_mode_loss_weight > 0
+        or config.prob_tank_temperature_loss_weight > 0
+    )
+    if any(not np.isfinite(weight) or weight < 0 for weight in (
+        config.prob_plant_source_loss_weight, config.prob_plant_delivery_loss_weight,
+        config.prob_dhw_mode_loss_weight,
+        config.prob_tank_temperature_loss_weight,
+    )):
+        raise ValueError("Plant supervision weights must be nonnegative")
+    if (plant_supervision_enabled or config.hp_whole_building_accounting) and not is_contracting_probabilistic:
+        raise ValueError("Plant accounting is supported only by the probabilistic contracting model")
+    if config.hp_whole_building_accounting and config.prob_plant_delivery_loss_weight <= 0:
+        raise ValueError("Whole-building accounting requires a positive delivery supervision weight")
+    if config.prob_dhw_recovery_state != (config.prob_dhw_mode_loss_weight > 0):
+        raise ValueError("DHW recovery and its positive supervised mode loss must be enabled together")
+    if config.prob_dhw_recovery_state and config.closed_loop_stability_weight > 0:
+        raise ValueError("Local stability penalties do not yet include the separate DHW recovery state")
+    if config.prob_tank_temperature_state != (config.prob_tank_temperature_loss_weight > 0):
+        raise ValueError("Tank states and their positive supervision weight must be enabled together")
+    if config.prob_tank_temperature_state and (
+        config.prob_dhw_recovery_state or config.closed_loop_stability_weight > 0
+        or config.hp_whole_building_accounting
+    ):
+        raise ValueError("Tank states replace the separate buffer/DHW mechanism; incompatible accounting or stability options")
+    if plant_supervision_enabled and config.prob_training_backend != "backprop":
+        raise ValueError("Plant supervision currently requires the backprop training backend")
+    plant_block_steps = (
+        tuple(int(round(hours / config.hp_dt_hours)) for hours in config.prob_plant_block_hours)
+        if plant_supervision_enabled and config.hp_dt_hours > 0 else (16, 96)
+    )
+    if plant_supervision_enabled and (not plant_block_steps or any(
+        step < 1 or step > config.sequence_length for step in plant_block_steps
+    )):
+        raise ValueError("Plant supervision block horizons must fit the training window")
     if config.target_mode != "absolute":
         raise ValueError(f"--model-kind {config.model_kind} requires --target-mode absolute")
     if config.target_alignment != "same_time":
@@ -4545,6 +6419,30 @@ def run_closed_loop_training(
         raise ValueError("hp_energy_cap_wh_m2 must be non-negative; use 0 for an automatic cap")
     if config.hp_energy_cap_hours <= 0.0:
         raise ValueError("hp_energy_cap_hours must be positive")
+    if config.hp_buffer_capacity_mode not in ("global", "physical_volume"):
+        raise ValueError(
+            "hp_buffer_capacity_mode must be 'global' or 'physical_volume'"
+        )
+    if config.hp_buffer_capacity_mode == "physical_volume":
+        if not is_contracting_probabilistic:
+            raise ValueError(
+                "physical-volume buffer capacity currently requires "
+                "closed_loop_hp_contracting_probabilistic"
+            )
+        if not (
+            0.0
+            < config.hp_buffer_delta_t_min_k
+            < config.hp_buffer_delta_t_usable_init_k
+            < config.hp_buffer_delta_t_max_k
+        ):
+            raise ValueError(
+                "physical buffer delta-T values must satisfy "
+                "0 < min < initial < max"
+            )
+        if config.hp_buffer_water_heat_capacity_wh_m3_k <= 0.0:
+            raise ValueError(
+                "hp_buffer_water_heat_capacity_wh_m3_k must be positive"
+            )
     if config.hp_cap_factor <= 0.0:
         raise ValueError("hp_cap_factor must be positive")
     if len(config.closed_loop_trajectory_output_weights) != len(CLOSED_LOOP_TARGET_COLUMNS):
@@ -4640,6 +6538,63 @@ def run_closed_loop_training(
                 "contracting_thermal_architecture must be 'bounded_mlp' or "
                 "'metadata_fixed_ss'"
             )
+        if config.contracting_metadata_fixed_state_update not in (
+            "linear",
+            "bounded_tanh",
+        ):
+            raise ValueError(
+                "contracting_metadata_fixed_state_update must be 'linear' or "
+                "'bounded_tanh'"
+            )
+        if config.contracting_metadata_fixed_pole_parameterization not in (
+            "rho",
+            "time_constant",
+        ):
+            raise ValueError(
+                "contracting_metadata_fixed_pole_parameterization must be 'rho' "
+                "or 'time_constant'"
+            )
+        if config.contracting_metadata_fixed_time_constant_min_hours <= 0.0:
+            raise ValueError(
+                "contracting_metadata_fixed_time_constant_min_hours must be positive"
+            )
+        if (
+            config.contracting_metadata_fixed_time_constant_max_hours
+            <= config.contracting_metadata_fixed_time_constant_min_hours
+        ):
+            raise ValueError(
+                "contracting metadata-fixed time-constant bounds must satisfy "
+                "0 < min < max"
+            )
+        if config.contracting_ventilation_model not in (
+            "learned_gain",
+            "physical_air_mixing",
+        ):
+            raise ValueError(
+                "contracting_ventilation_model must be 'learned_gain' or "
+                "'physical_air_mixing'"
+            )
+        if config.contracting_ventilation_gain_max_per_hour_m3_s <= 0.0:
+            raise ValueError("contracting ventilation gain maximum must be positive")
+        if not (
+            0.0
+            < config.contracting_ventilation_gain_initial_per_hour_m3_s
+            < config.contracting_ventilation_gain_max_per_hour_m3_s
+        ):
+            raise ValueError(
+                "contracting initial ventilation gain must lie strictly between "
+                "zero and its maximum"
+            )
+        if config.contracting_ventilation_delta_max_c <= 0.0:
+            raise ValueError("contracting ventilation delta maximum must be positive")
+        if not (
+            0.0
+            < config.contracting_ventilation_capacity_factor_min
+            < config.contracting_ventilation_capacity_factor_max
+        ):
+            raise ValueError(
+                "contracting ventilation capacity-factor bounds must satisfy 0 < min < max"
+            )
         if (
             config.contracting_thermal_architecture == "metadata_fixed_ss"
             and config.contracting_q_to_t_mode != "unconstrained"
@@ -4727,6 +6682,56 @@ def run_closed_loop_training(
             config.prob_persistent_xi_pathways
         ):
             raise ValueError("prob_persistent_xi_pathways values must be unique")
+        if config.prob_persistent_xi_routing not in (
+            "shared",
+            "physical",
+            "soft_physical",
+        ):
+            raise ValueError(
+                "prob_persistent_xi_routing must be 'shared', 'physical', or "
+                "'soft_physical'"
+            )
+        if (
+            config.prob_persistent_xi_routing in ("physical", "soft_physical")
+            and config.prob_latent_dim != 4
+        ):
+            raise ValueError(
+                "physical and soft_physical routing require prob_latent_dim=4"
+            )
+        if config.prob_metadata_xi_mean_cap < 0.0:
+            raise ValueError("prob_metadata_xi_mean_cap must be non-negative")
+        if config.prob_metadata_xi_scale_cap <= 0.0:
+            raise ValueError("prob_metadata_xi_scale_cap must be positive")
+        if any(
+            value <= 0.0
+            for value in config.prob_colored_latent_timescales_hours
+        ):
+            raise ValueError(
+                "prob_colored_latent_timescales_hours values must be positive"
+            )
+        if len(set(config.prob_colored_latent_timescales_hours)) != len(
+            config.prob_colored_latent_timescales_hours
+        ):
+            raise ValueError(
+                "prob_colored_latent_timescales_hours values must be unique"
+            )
+        allowed_colored_pathways = {"thermal", "q_to_t", "hp"}
+        unknown_colored_pathways = (
+            set(config.prob_colored_latent_pathways) - allowed_colored_pathways
+        )
+        if unknown_colored_pathways:
+            raise ValueError(
+                "prob_colored_latent_pathways contains unknown values: "
+                f"{sorted(unknown_colored_pathways)}"
+            )
+        if len(set(config.prob_colored_latent_pathways)) != len(
+            config.prob_colored_latent_pathways
+        ):
+            raise ValueError("prob_colored_latent_pathways values must be unique")
+        if config.prob_colored_latent_state_scale_cap <= 0.0:
+            raise ValueError("prob_colored_latent_state_scale_cap must be positive")
+        if config.prob_colored_latent_xi_scale_cap <= 0.0:
+            raise ValueError("prob_colored_latent_xi_scale_cap must be positive")
         if config.prob_process_noise not in ("none", "constant", "heteroscedastic"):
             raise ValueError("prob_process_noise must be 'none', 'constant', or 'heteroscedastic'")
         if config.prob_hp_scenario_mode not in ("expected", "bernoulli"):
@@ -4737,11 +6742,91 @@ def run_closed_loop_training(
             "expected",
             "straight_through",
             "hard_expected_grad",
+            "score_function",
         ):
             raise ValueError(
                 "prob_hp_training_mode must be 'expected', 'straight_through', "
-                "or 'hard_expected_grad'"
+                "'hard_expected_grad', or 'score_function'"
             )
+        if config.prob_training_backend not in (
+            "backprop",
+            "trajectory_actor_critic",
+        ):
+            raise ValueError(
+                "prob_training_backend must be 'backprop' or "
+                "'trajectory_actor_critic'"
+            )
+        if (
+            config.prob_hp_training_mode == "score_function"
+            and config.prob_training_backend != "trajectory_actor_critic"
+        ):
+            raise ValueError(
+                "--prob-hp-training-mode score_function requires "
+                "--prob-training-backend trajectory_actor_critic"
+            )
+        if config.prob_training_backend == "trajectory_actor_critic":
+            if config.trajectory_critic_chunk_steps < 1:
+                raise ValueError("trajectory_critic_chunk_steps must be positive")
+            if config.trajectory_critic_chunk_steps > config.sequence_length:
+                raise ValueError(
+                    "trajectory_critic_chunk_steps cannot exceed sequence_length"
+                )
+            if (
+                config.bptt_truncate_steps > 0
+                and config.trajectory_critic_chunk_steps
+                != config.bptt_truncate_steps
+            ):
+                raise ValueError(
+                    "trajectory_critic_chunk_steps must equal bptt_truncate_steps "
+                    "so continuation values are applied at the actual detach boundaries"
+                )
+            if config.trajectory_critic_hidden_dim < 1:
+                raise ValueError("trajectory_critic_hidden_dim must be positive")
+            if config.trajectory_critic_depth < 1:
+                raise ValueError("trajectory_critic_depth must be positive")
+            if config.trajectory_critic_learning_rate <= 0.0:
+                raise ValueError("trajectory_critic_learning_rate must be positive")
+            if config.trajectory_critic_loss_weight < 0.0:
+                raise ValueError("trajectory_critic_loss_weight must be non-negative")
+            if config.trajectory_critic_continuation_weight < 0.0:
+                raise ValueError(
+                    "trajectory_critic_continuation_weight must be non-negative"
+                )
+            if config.trajectory_score_function_weight < 0.0:
+                raise ValueError(
+                    "trajectory_score_function_weight must be non-negative"
+                )
+            if (
+                config.prob_hp_training_mode == "score_function"
+                and config.prob_qroom_activation_model != "continuous"
+            ):
+                raise ValueError(
+                    "score_function currently requires "
+                    "prob_qroom_activation_model='continuous'; a discrete hydronic "
+                    "mode would require its own likelihood-ratio term"
+                )
+            unsupported_losses = {
+                "prob_block_energy_weight": config.prob_block_energy_weight,
+                "prob_softopt_weight": config.prob_softopt_weight,
+                "prob_variogram_weight": config.prob_variogram_weight,
+                "prob_ires_weight": config.prob_ires_weight,
+                "prob_flex_kpi_crps_weight": config.prob_flex_kpi_crps_weight,
+                "hp_mode_loss_weight": config.hp_mode_loss_weight,
+                "qroom_mode_loss_weight": config.qroom_mode_loss_weight,
+                "hp_active_power_nll_weight": config.hp_active_power_nll_weight,
+                "hp_inactive_leakage_weight": config.hp_inactive_leakage_weight,
+                "prob_physics_weight": config.prob_physics_weight,
+                "closed_loop_stability_weight": config.closed_loop_stability_weight,
+            }
+            enabled_unsupported = [
+                name for name, value in unsupported_losses.items() if value > 0.0
+            ]
+            if enabled_unsupported:
+                raise ValueError(
+                    "trajectory_actor_critic currently preserves exactly the trace, "
+                    "increment, and event energy-score objective; set these unsupported "
+                    f"loss weights to zero: {', '.join(enabled_unsupported)}"
+                )
         if config.prob_hp_concrete_temperature <= 0.0:
             raise ValueError("prob_hp_concrete_temperature must be positive")
         if config.prob_hp_activation_model not in (
@@ -4838,6 +6923,62 @@ def run_closed_loop_training(
             raise ValueError("prob_softopt_temperature must be positive")
         if config.prob_variogram_weight < 0.0:
             raise ValueError("prob_variogram_weight must be non-negative")
+        if config.prob_increment_energy_weight < 0.0:
+            raise ValueError("prob_increment_energy_weight must be non-negative")
+        if any(lag < 1 for lag in config.prob_increment_energy_lags):
+            raise ValueError("prob_increment_energy_lags must be positive")
+        if config.prob_increment_energy_lags_per_batch < 1:
+            raise ValueError("prob_increment_energy_lags_per_batch must be positive")
+        if len(config.prob_increment_energy_output_weights) != len(CLOSED_LOOP_TARGET_COLUMNS):
+            raise ValueError(
+                "prob_increment_energy_output_weights must contain Tin, Qroom, and Pel_SH"
+            )
+        if any(weight < 0.0 for weight in config.prob_increment_energy_output_weights):
+            raise ValueError("prob_increment_energy_output_weights must be non-negative")
+        if sum(config.prob_increment_energy_output_weights) <= 0.0:
+            raise ValueError(
+                "prob_increment_energy_output_weights must contain at least one positive value"
+            )
+        if config.prob_increment_energy_setpoint_threshold_c < 0.0:
+            raise ValueError(
+                "prob_increment_energy_setpoint_threshold_c must be non-negative"
+            )
+        if config.prob_event_energy_weight < 0.0:
+            raise ValueError("prob_event_energy_weight must be non-negative")
+        if config.prob_event_energy_include_force_off and config.prob_training_backend != "backprop":
+            raise ValueError("Force-off response scoring currently requires the backprop backend")
+        if any(horizon <= 0.0 for horizon in config.prob_event_energy_horizons_hours):
+            raise ValueError("prob_event_energy_horizons_hours must contain positive durations")
+        if config.prob_event_energy_events_per_profile < 1:
+            raise ValueError("prob_event_energy_events_per_profile must be positive")
+        if len(config.prob_event_energy_output_weights) != len(CLOSED_LOOP_TARGET_COLUMNS):
+            raise ValueError(
+                "prob_event_energy_output_weights must contain Tin, Qroom, and Pel_SH"
+            )
+        if any(weight < 0.0 for weight in config.prob_event_energy_output_weights):
+            raise ValueError("prob_event_energy_output_weights must be non-negative")
+        if sum(config.prob_event_energy_output_weights) <= 0.0:
+            raise ValueError(
+                "prob_event_energy_output_weights must contain at least one positive value"
+            )
+        if config.prob_event_energy_setpoint_threshold_c < 0.0:
+            raise ValueError("prob_event_energy_setpoint_threshold_c must be non-negative")
+        if config.prob_block_energy_weight < 0.0:
+            raise ValueError("prob_block_energy_weight must be non-negative")
+        if any(horizon <= 0.0 for horizon in config.prob_block_energy_horizons_hours):
+            raise ValueError("prob_block_energy_horizons_hours must contain positive durations")
+        if config.prob_block_energy_horizons_per_batch < 1:
+            raise ValueError("prob_block_energy_horizons_per_batch must be positive")
+        if len(config.prob_block_energy_output_weights) != len(CLOSED_LOOP_TARGET_COLUMNS):
+            raise ValueError(
+                "prob_block_energy_output_weights must contain Tin, Qroom, and Pel_SH"
+            )
+        if any(weight < 0.0 for weight in config.prob_block_energy_output_weights):
+            raise ValueError("prob_block_energy_output_weights must be non-negative")
+        if sum(config.prob_block_energy_output_weights) <= 0.0:
+            raise ValueError(
+                "prob_block_energy_output_weights must contain at least one positive value"
+            )
         if config.prob_variogram_power <= 0.0:
             raise ValueError("prob_variogram_power must be positive")
         if config.prob_variogram_output_weights:
@@ -4874,6 +7015,48 @@ def run_closed_loop_training(
             raise ValueError("prob_flex_kpi_crps_ridge must be positive")
         if config.prob_flex_kpi_crps_controls not in ("none", "weather", "full"):
             raise ValueError("prob_flex_kpi_crps_controls must be 'none', 'weather', or 'full'")
+        if config.prob_targeted_flex_energy_weight < 0.0:
+            raise ValueError("prob_targeted_flex_energy_weight must be non-negative")
+        if config.prob_targeted_flex_short_horizon_hours <= 0.0:
+            raise ValueError(
+                "prob_targeted_flex_short_horizon_hours must be positive"
+            )
+        if config.prob_targeted_flex_long_horizon_hours <= 0.0:
+            raise ValueError(
+                "prob_targeted_flex_long_horizon_hours must be positive"
+            )
+        if (
+            config.prob_targeted_flex_long_horizon_hours
+            <= config.prob_targeted_flex_short_horizon_hours
+        ):
+            raise ValueError(
+                "prob_targeted_flex_long_horizon_hours must exceed the short horizon"
+            )
+        targeted_coordinate_count = len(config.prob_targeted_flex_coordinate_center)
+        if targeted_coordinate_count not in (3, 8):
+            raise ValueError(
+                "prob_targeted_flex_coordinate_center must contain 3 or 8 values"
+            )
+        if len(config.prob_targeted_flex_coordinate_scale) != targeted_coordinate_count or any(
+            value <= 0.0 for value in config.prob_targeted_flex_coordinate_scale
+        ):
+            raise ValueError(
+                "prob_targeted_flex_coordinate_scale must match the center and be positive"
+            )
+        if targeted_coordinate_count == 8 and not any(
+            abs(horizon - 2.0) < 1e-6
+            for horizon in config.prob_flex_kpi_crps_horizons_hours
+        ):
+            raise ValueError(
+                "8-D targeted flexibility geometry requires a 2 h CRPS horizon"
+            )
+        if (
+            config.prob_targeted_flex_energy_weight > 0.0
+            and config.prob_training_backend != "backprop"
+        ):
+            raise ValueError(
+                "targeted flexibility energy training currently requires backprop"
+            )
         if config.prob_physics_weight < 0.0:
             raise ValueError("prob_physics_weight must be non-negative")
         if config.prob_horizon_weight_power < 0.0:
@@ -4945,8 +7128,16 @@ def run_closed_loop_training(
         heat_input_normalization="per_floor_area",
         hp_power_area_normalization=config.hp_power_area_normalization,
         input_feature_mode="base",
+        include_plant_targets=plant_supervision_enabled,
+        include_plant_metadata=config.hp_plant_metadata or config.prob_dhw_recovery_state,
+        include_dhw_metadata=config.hp_dhw_metadata or config.prob_tank_temperature_state,
+        include_tank_targets=config.prob_tank_temperature_state,
     )
-    splits = load_closed_loop_result_splits(split_config)
+    splits, train_profiles, test_profiles = load_closed_loop_training_profiles(split_config)
+    if config.prob_tank_temperature_state:
+        print("tank_temperature_state=SH,DHW labels=interval_means auxiliary_indices=3,4 "
+              "legacy_buffer_energy=replaced_by_SH_temperature latent_initialization=predicted "
+              "observed_future_tanks=never loss=CRPS scale_c=10 warmup_hours=4")
     availability_input_index = list(splits.input_columns).index(
         SPACE_HEATING_AVAILABILITY_COLUMN
     )
@@ -4994,22 +7185,6 @@ def run_closed_loop_training(
         stride=config.stride,
         target_alignment="same_time",
     )
-    train_profiles = to_closed_loop_profiles(
-        splits.train,
-        include_hp_force_off=hp_force_off_input_index >= 0,
-        hp_power_area_normalization=splits.hp_power_area_normalization,
-        metadata_columns=splits.metadata_columns,
-    )
-    test_profiles = (
-        to_closed_loop_profiles(
-            splits.test,
-            include_hp_force_off=hp_force_off_input_index >= 0,
-            hp_power_area_normalization=splits.hp_power_area_normalization,
-            metadata_columns=splits.metadata_columns,
-        )
-        if splits.test_ids
-        else []
-    )
     raw_train_windows = make_closed_loop_windows(train_profiles, window_config)
     raw_test_windows = (
         make_closed_loop_windows(test_profiles, window_config) if splits.test_ids else None
@@ -5037,10 +7212,105 @@ def run_closed_loop_training(
     scalers = fit_window_scalers(raw_train_windows)  # type: ignore[arg-type]
     input_mean = tuple(float(value) for value in np.asarray(scalers.inputs.mean, dtype=np.float32).reshape(-1))
     input_scale = tuple(float(value) for value in np.asarray(scalers.inputs.scale, dtype=np.float32).reshape(-1))
+    metadata_mean = tuple(
+        float(value)
+        for value in np.asarray(scalers.metadata.mean, dtype=np.float32).reshape(-1)
+    )
+    metadata_scale = tuple(
+        float(value)
+        for value in np.asarray(scalers.metadata.scale, dtype=np.float32).reshape(-1)
+    )
+    ventilation_volume_metadata_index = list(splits.metadata_columns).index("volume")
+    ventilation_capacity_metadata_index = list(splits.metadata_columns).index(
+        "thermal_mass_class"
+    )
+    hp_buffer_volume_metadata_index = (
+        list(splits.metadata_columns).index(SH_VOLUME_PER_HEATED_AREA_COLUMN)
+        if SH_VOLUME_PER_HEATED_AREA_COLUMN in splits.metadata_columns
+        else -1
+    )
     target_mean_np = np.asarray(scalers.target.mean, dtype=np.float32).reshape(-1)
     target_scale_np = np.asarray(scalers.target.scale, dtype=np.float32).reshape(-1)
     target_mean = jnp.asarray(target_mean_np, dtype=jnp.float32)
     target_scale = jnp.asarray(target_scale_np, dtype=jnp.float32)
+    normalized_feature_targets = (
+        (np.asarray(raw_train_windows.targets, dtype=np.float32) - target_mean_np)
+        / target_scale_np
+    ).astype(np.float32)
+    prob_increment_energy_feature_scales = jnp.asarray(
+        estimate_increment_energy_scales(
+            normalized_feature_targets,
+            np.asarray(raw_train_windows.inputs, dtype=np.float32),
+            lags=config.prob_increment_energy_lags,
+            constant_setpoint_only=config.prob_increment_energy_constant_setpoint_only,
+            setpoint_delta_threshold=config.prob_increment_energy_setpoint_threshold_c,
+        ),
+        dtype=jnp.float32,
+    )
+    prob_increment_energy_setpoint_threshold_norm = (
+        float(config.prob_increment_energy_setpoint_threshold_c)
+        / max(float(input_scale[0]), 1e-6)
+    )
+    prob_event_energy_horizon_steps = tuple(
+        sorted(
+            set(
+                max(1, int(round(float(horizon) / config.hp_dt_hours)))
+                for horizon in config.prob_event_energy_horizons_hours
+            )
+        )
+    )
+    if is_probabilistic and config.prob_event_energy_weight > 0.0:
+        valid_event_steps = [
+            step for step in prob_event_energy_horizon_steps
+            if 2 * step <= config.sequence_length
+        ]
+        if not valid_event_steps:
+            raise ValueError(
+                "prob_event_energy_horizons_hours has no valid horizons for the selected "
+                "sequence_length; each horizon needs equally long pre and post windows."
+            )
+    event_inputs_physical = ()
+    event_inputs_normalized = ()
+    if config.prob_event_energy_include_force_off:
+        if hp_force_off_input_index < 0:
+            raise ValueError("Force-off response scoring requires the explicit command input")
+        event_inputs_physical = ((hp_force_off_input_index, 0.5),)
+        event_inputs_normalized = (
+            (hp_force_off_input_index, 0.5 / max(float(input_scale[hp_force_off_input_index]), 1e-6)),
+        )
+    prob_event_energy_feature_scales = jnp.asarray(
+        estimate_event_response_energy_scales(
+            normalized_feature_targets,
+            np.asarray(raw_train_windows.inputs, dtype=np.float32),
+            horizon_steps=prob_event_energy_horizon_steps,
+            setpoint_delta_threshold=config.prob_event_energy_setpoint_threshold_c,
+            additional_event_inputs=event_inputs_physical,
+        ),
+        dtype=jnp.float32,
+    )
+    prob_event_energy_setpoint_threshold_norm = (
+        float(config.prob_event_energy_setpoint_threshold_c)
+        / max(float(input_scale[0]), 1e-6)
+    )
+    prob_block_energy_horizon_steps = tuple(
+        sorted(
+            set(
+                max(1, int(round(float(horizon) / config.hp_dt_hours)))
+                for horizon in config.prob_block_energy_horizons_hours
+            )
+        )
+    )
+    if is_probabilistic and config.prob_block_energy_weight > 0.0:
+        valid_block_steps = [
+            step
+            for step in prob_block_energy_horizon_steps
+            if step <= config.sequence_length
+        ]
+        if not valid_block_steps:
+            raise ValueError(
+                "prob_block_energy_horizons_hours has no valid horizons for the selected "
+                "sequence_length"
+            )
     prob_ires_horizon_steps = tuple(
         sorted(
             set(
@@ -5071,6 +7341,42 @@ def run_closed_loop_training(
     prob_flex_kpi_crps_horizons_hours = tuple(
         float(step * config.hp_dt_hours) for step in prob_flex_kpi_crps_horizon_steps
     )
+    targeted_flex_short_horizon_steps = max(
+        1,
+        int(
+            round(
+                config.prob_targeted_flex_short_horizon_hours
+                / config.hp_dt_hours
+            )
+        ),
+    )
+    targeted_flex_long_horizon_steps = max(
+        1,
+        int(
+            round(
+                config.prob_targeted_flex_long_horizon_hours
+                / config.hp_dt_hours
+            )
+        ),
+    )
+    targeted_flex_short_horizon_hours = float(
+        targeted_flex_short_horizon_steps * config.hp_dt_hours
+    )
+    targeted_flex_long_horizon_hours = float(
+        targeted_flex_long_horizon_steps * config.hp_dt_hours
+    )
+    if (
+        is_probabilistic
+        and config.prob_targeted_flex_energy_weight > 0.0
+        and 2 * targeted_flex_long_horizon_steps > config.sequence_length
+    ):
+        raise ValueError(
+            "The targeted flexibility long horizon requires equally long pre and "
+            "post windows inside sequence_length"
+        )
+    targeted_flex_physical_kpi_scale = float(target_scale_np[2]) / max(
+        float(input_scale[0]), 1e-6
+    )
     if is_probabilistic and config.prob_flex_kpi_crps_weight > 0.0:
         valid_flex_kpi_steps = [
             step
@@ -5081,6 +7387,41 @@ def run_closed_loop_training(
             raise ValueError(
                 "prob_flex_kpi_crps_horizons_hours has no valid horizons for the selected "
                 "sequence_length; each horizon needs equally long pre and post windows."
+            )
+    if config.prob_flex_kpi_crps_windows_per_profile < 1:
+        raise ValueError("prob_flex_kpi_crps_windows_per_profile must be positive")
+    if config.prob_flex_kpi_crps_aux_every_steps < 0:
+        raise ValueError("prob_flex_kpi_crps_aux_every_steps cannot be negative")
+    if config.prob_flex_kpi_crps_aux_buildings < 1:
+        raise ValueError("prob_flex_kpi_crps_aux_buildings must be positive")
+    if (
+        config.prob_flex_kpi_crps_aux_every_steps > 0
+        and config.prob_flex_kpi_crps_windows_per_profile < 2
+    ):
+        raise ValueError(
+            "Auxiliary flexibility training requires at least two windows per profile"
+        )
+    if config.prob_flex_kpi_crps_windows_per_profile > 1:
+        if not is_probabilistic or config.prob_flex_kpi_crps_weight <= 0.0:
+            raise ValueError(
+                "Grouped flexibility training requires a probabilistic model and a positive "
+                "--prob-flex-kpi-crps-weight"
+            )
+        if config.prob_flex_kpi_crps_estimator != "direct_ratio":
+            raise ValueError(
+                "Grouped flexibility training currently supports only "
+                "--prob-flex-kpi-crps-estimator direct_ratio"
+            )
+        if config.prob_training_backend != "backprop":
+            raise ValueError(
+                "Grouped flexibility training currently supports only the backprop backend"
+            )
+        if (
+            config.prob_flex_kpi_crps_aux_every_steps == 0
+            and config.prob_flex_kpi_crps_windows_per_profile > config.batch_size
+        ):
+            raise ValueError(
+                "prob_flex_kpi_crps_windows_per_profile cannot exceed batch_size"
             )
     prob_flex_kpi_crps_setpoint_threshold_norm = (
         float(config.prob_flex_kpi_crps_setpoint_threshold_c)
@@ -5130,7 +7471,19 @@ def run_closed_loop_training(
                     event_mask & (setpoint_delta < 0.0),
                     axis=1,
                 )
-            eligible_counts.append(int(np.sum(eligible)))
+            if config.prob_flex_kpi_crps_windows_per_profile > 1:
+                profile_eligible = []
+                for profile_id in np.unique(raw_train_windows.profile_ids):
+                    profile_rows = raw_train_windows.profile_ids == profile_id
+                    profile_event_mask = event_mask[profile_rows]
+                    profile_eligible.append(
+                        np.sum(profile_event_mask) >= flex_kpi_crps_required_events
+                        and np.any(profile_event_mask & (setpoint_delta[profile_rows] > 0.0))
+                        and np.any(profile_event_mask & (setpoint_delta[profile_rows] < 0.0))
+                    )
+                eligible_counts.append(int(np.sum(profile_eligible)))
+            else:
+                eligible_counts.append(int(np.sum(eligible)))
         flex_kpi_crps_eligible_windows = tuple(eligible_counts)
         if not any(flex_kpi_crps_eligible_windows):
             raise ValueError(
@@ -5172,6 +7525,18 @@ def run_closed_loop_training(
             controller_state_dim=config.hp_controller_state_dim,
             latent_dim=config.prob_latent_dim,
             persistent_xi_pathways=config.prob_persistent_xi_pathways,
+            persistent_xi_routing=config.prob_persistent_xi_routing,
+            metadata_conditioned_xi=config.prob_metadata_conditioned_xi,
+            metadata_xi_mean_cap=config.prob_metadata_xi_mean_cap,
+            metadata_xi_scale_cap=config.prob_metadata_xi_scale_cap,
+            colored_latent_timescales_hours=(
+                config.prob_colored_latent_timescales_hours
+            ),
+            colored_latent_pathways=config.prob_colored_latent_pathways,
+            colored_latent_state_scale_cap=(
+                config.prob_colored_latent_state_scale_cap
+            ),
+            colored_latent_xi_scale_cap=config.prob_colored_latent_xi_scale_cap,
             hidden_dim=config.hidden_dim,
             depth=config.depth,
             input_encoder_dim=config.input_encoder_dim,
@@ -5207,6 +7572,35 @@ def run_closed_loop_training(
             ),
             transition_conditioning=config.contracting_transition_conditioning,
             thermal_architecture=config.contracting_thermal_architecture,
+            metadata_fixed_state_update=(
+                config.contracting_metadata_fixed_state_update
+            ),
+            metadata_fixed_pole_parameterization=(
+                config.contracting_metadata_fixed_pole_parameterization
+            ),
+            metadata_fixed_time_constant_min_hours=(
+                config.contracting_metadata_fixed_time_constant_min_hours
+            ),
+            metadata_fixed_time_constant_max_hours=(
+                config.contracting_metadata_fixed_time_constant_max_hours
+            ),
+            causal_ventilation=config.contracting_causal_ventilation,
+            ventilation_model=config.contracting_ventilation_model,
+            ventilation_gain_max_per_hour_m3_s=(
+                config.contracting_ventilation_gain_max_per_hour_m3_s
+            ),
+            ventilation_gain_initial_per_hour_m3_s=(
+                config.contracting_ventilation_gain_initial_per_hour_m3_s
+            ),
+            ventilation_delta_max_c=config.contracting_ventilation_delta_max_c,
+            ventilation_capacity_factor_min=(
+                config.contracting_ventilation_capacity_factor_min
+            ),
+            ventilation_capacity_factor_max=(
+                config.contracting_ventilation_capacity_factor_max
+            ),
+            ventilation_volume_metadata_index=ventilation_volume_metadata_index,
+            ventilation_capacity_metadata_index=ventilation_capacity_metadata_index,
             additive_feedback_gain_bound=(
                 config.contracting_additive_feedback_gain_bound
             ),
@@ -5216,10 +7610,30 @@ def run_closed_loop_training(
             hp_pel_cap_w_m2=hp_pel_cap_w_m2,
             hp_qroom_cap_w_m2=hp_qroom_cap_w_m2,
             hp_energy_cap_wh_m2=hp_energy_cap_wh_m2,
+            hp_buffer_capacity_mode=config.hp_buffer_capacity_mode,
+            hp_buffer_delta_t_usable_init_k=(
+                config.hp_buffer_delta_t_usable_init_k
+            ),
+            hp_buffer_delta_t_min_k=config.hp_buffer_delta_t_min_k,
+            hp_buffer_delta_t_max_k=config.hp_buffer_delta_t_max_k,
+            hp_buffer_water_heat_capacity_wh_m3_k=(
+                config.hp_buffer_water_heat_capacity_wh_m3_k
+            ),
+            hp_buffer_volume_metadata_index=hp_buffer_volume_metadata_index,
+            hp_whole_building_accounting=config.hp_whole_building_accounting,
+            dhw_recovery_enabled=config.prob_dhw_recovery_state,
+            tank_temperatures_enabled=config.prob_tank_temperature_state,
+            dhw_request_input_index=dhw_request_input_index,
+            dhw_volume_metadata_index=(list(splits.metadata_columns).index(DHW_VOLUME_PER_HEATED_AREA_COLUMN)
+                                       if config.prob_dhw_recovery_state or config.prob_tank_temperature_state else -1),
+            dhw_recovery_metadata_index=(list(splits.metadata_columns).index(DHW_RECOVERY_PER_HEATED_AREA_COLUMN)
+                                         if config.prob_dhw_recovery_state or config.prob_tank_temperature_state else -1),
             input_mean=input_mean,
             input_scale=input_scale,
             target_mean=tuple(float(value) for value in target_mean_np),
             target_scale=tuple(float(value) for value in target_scale_np),
+            metadata_mean=metadata_mean,
+            metadata_scale=metadata_scale,
             availability_input_index=availability_input_index,
             hp_force_off_input_index=hp_force_off_input_index,
             bptt_truncate_steps=config.bptt_truncate_steps,
@@ -5306,6 +7720,35 @@ def run_closed_loop_training(
             ),
             transition_conditioning=config.contracting_transition_conditioning,
             thermal_architecture=config.contracting_thermal_architecture,
+            metadata_fixed_state_update=(
+                config.contracting_metadata_fixed_state_update
+            ),
+            metadata_fixed_pole_parameterization=(
+                config.contracting_metadata_fixed_pole_parameterization
+            ),
+            metadata_fixed_time_constant_min_hours=(
+                config.contracting_metadata_fixed_time_constant_min_hours
+            ),
+            metadata_fixed_time_constant_max_hours=(
+                config.contracting_metadata_fixed_time_constant_max_hours
+            ),
+            causal_ventilation=config.contracting_causal_ventilation,
+            ventilation_model=config.contracting_ventilation_model,
+            ventilation_gain_max_per_hour_m3_s=(
+                config.contracting_ventilation_gain_max_per_hour_m3_s
+            ),
+            ventilation_gain_initial_per_hour_m3_s=(
+                config.contracting_ventilation_gain_initial_per_hour_m3_s
+            ),
+            ventilation_delta_max_c=config.contracting_ventilation_delta_max_c,
+            ventilation_capacity_factor_min=(
+                config.contracting_ventilation_capacity_factor_min
+            ),
+            ventilation_capacity_factor_max=(
+                config.contracting_ventilation_capacity_factor_max
+            ),
+            ventilation_volume_metadata_index=ventilation_volume_metadata_index,
+            ventilation_capacity_metadata_index=ventilation_capacity_metadata_index,
             additive_feedback_gain_bound=(
                 config.contracting_additive_feedback_gain_bound
             ),
@@ -5319,6 +7762,8 @@ def run_closed_loop_training(
             input_scale=input_scale,
             target_mean=tuple(float(value) for value in target_mean_np),
             target_scale=tuple(float(value) for value in target_scale_np),
+            metadata_mean=metadata_mean,
+            metadata_scale=metadata_scale,
             availability_input_index=availability_input_index,
             hp_force_off_input_index=hp_force_off_input_index,
             bptt_truncate_steps=config.bptt_truncate_steps,
@@ -5367,6 +7812,26 @@ def run_closed_loop_training(
         )
     optimizer = build_optimizer(config)
     opt_state = optimizer.init(eqx.filter(model, eqx.is_array))
+    critic: ParticleContinuationCritic | None = None
+    critic_optimizer: optax.GradientTransformation | None = None
+    critic_opt_state: optax.OptState | None = None
+    if config.prob_training_backend == "trajectory_actor_critic":
+        if not is_probabilistic:
+            raise ValueError(
+                "trajectory_actor_critic requires a probabilistic closed-loop model"
+            )
+        key, critic_key = jax.random.split(key)
+        critic = ParticleContinuationCritic(
+            particle_feature_dim=config.state_dim + config.prob_latent_dim + 7,
+            context_feature_dim=metadata_dim + input_dim + 7,
+            hidden_dim=config.trajectory_critic_hidden_dim,
+            depth=config.trajectory_critic_depth,
+            key=critic_key,
+        )
+        critic_optimizer = build_optimizer(
+            replace(config, learning_rate=config.trajectory_critic_learning_rate)
+        )
+        critic_opt_state = critic_optimizer.init(eqx.filter(critic, eqx.is_array))
     rng = np.random.default_rng(config.seed)
     model_checkpoint_dir = config.model_checkpoint_dir or config.output_dir / "model_checkpoints"
     model_artifact_dir = model_checkpoint_dir / config.model_kind
@@ -5376,6 +7841,19 @@ def run_closed_loop_training(
     )
 
     print(f"model_kind={config.model_kind}")
+    if config.prob_training_backend == "trajectory_actor_critic":
+        print(
+            "prob_training_backend="
+            f"{config.prob_training_backend} "
+            f"critic_chunk_steps={config.trajectory_critic_chunk_steps} "
+            f"critic_hidden_dim={config.trajectory_critic_hidden_dim} "
+            f"critic_depth={config.trajectory_critic_depth} "
+            f"critic_learning_rate={config.trajectory_critic_learning_rate} "
+            f"critic_loss_weight={config.trajectory_critic_loss_weight} "
+            f"critic_continuation_weight="
+            f"{config.trajectory_critic_continuation_weight} "
+            f"score_function_weight={config.trajectory_score_function_weight}"
+        )
     if config.init_from_deterministic_artifact is not None:
         print(
             "probabilistic_initialization=deterministic "
@@ -5469,11 +7947,29 @@ def run_closed_loop_training(
             f"temperature_feedback_gradient_scale="
             f"{config.contracting_temperature_feedback_gradient_scale} "
             f"thermal_architecture={config.contracting_thermal_architecture} "
+            f"metadata_fixed_state_update="
+            f"{config.contracting_metadata_fixed_state_update} "
+            f"metadata_fixed_pole_parameterization="
+            f"{config.contracting_metadata_fixed_pole_parameterization} "
+            f"metadata_fixed_time_constant_hours="
+            f"[{config.contracting_metadata_fixed_time_constant_min_hours},"
+            f"{config.contracting_metadata_fixed_time_constant_max_hours}] "
+            f"causal_ventilation={config.contracting_causal_ventilation} "
+            f"ventilation_model={config.contracting_ventilation_model} "
+            f"ventilation_gain_per_hour_m3_s="
+            f"[{config.contracting_ventilation_gain_initial_per_hour_m3_s},"
+            f"{config.contracting_ventilation_gain_max_per_hour_m3_s}] "
+            f"ventilation_delta_max_c="
+            f"{config.contracting_ventilation_delta_max_c} "
+            f"ventilation_capacity_factor_bounds="
+            f"[{config.contracting_ventilation_capacity_factor_min},"
+            f"{config.contracting_ventilation_capacity_factor_max}] "
             f"transition_conditioning={config.contracting_transition_conditioning} "
             f"additive_feedback_gain_bound="
             f"{config.contracting_additive_feedback_gain_bound} "
             f"thermal_matrix={'metadata_fixed' if config.contracting_thermal_architecture == 'metadata_fixed_ss' else 'time_varying'} "
-            "pointwise_matrix_guarantee=spectral_radius<gamma"
+            f"pointwise_matrix_guarantee="
+            f"{'spectral_radius<1' if config.contracting_metadata_fixed_pole_parameterization == 'time_constant' else 'spectral_radius<gamma'}"
         )
         print(
             "closed_loop_hp_contracting_causal_structure="
@@ -5598,6 +8094,10 @@ def run_closed_loop_training(
             f"qroom_cap_w_m2={hp_qroom_cap_w_m2:.6g} "
             f"cop_cap={hp_cop_cap:.6g} "
             f"energy_cap_wh_m2={hp_energy_cap_wh_m2:.6g} "
+            f"buffer_capacity_mode={config.hp_buffer_capacity_mode} "
+            f"buffer_delta_t_init_k={config.hp_buffer_delta_t_usable_init_k:.6g} "
+            f"buffer_delta_t_bounds_k=[{config.hp_buffer_delta_t_min_k:.6g},"
+            f"{config.hp_buffer_delta_t_max_k:.6g}] "
             f"auto_cap_factor={config.hp_cap_factor:.6g}"
         )
     else:
@@ -5622,6 +8122,19 @@ def run_closed_loop_training(
             f"plot_particles={config.prob_plot_particles} "
             f"latent_dim={config.prob_latent_dim} "
             f"persistent_xi_pathways={list(config.prob_persistent_xi_pathways)} "
+            f"persistent_xi_routing={config.prob_persistent_xi_routing} "
+            "physical_xi_routes=[envelope,hp,controller,operation] "
+            "operation_ventilation_gain_cap=4.0 "
+            f"metadata_conditioned_xi={config.prob_metadata_conditioned_xi} "
+            f"metadata_xi_mean_cap={config.prob_metadata_xi_mean_cap} "
+            f"metadata_xi_scale_cap={config.prob_metadata_xi_scale_cap} "
+            "colored_latent_timescales_hours="
+            f"{list(config.prob_colored_latent_timescales_hours)} "
+            f"colored_latent_pathways={list(config.prob_colored_latent_pathways)} "
+            "colored_latent_state_scale_cap="
+            f"{config.prob_colored_latent_state_scale_cap} "
+            "colored_latent_xi_scale_cap="
+            f"{config.prob_colored_latent_xi_scale_cap} "
             f"process_noise={config.prob_process_noise} "
             f"hp_scenario_mode={config.prob_hp_scenario_mode} "
             f"hp_emission_mode={config.prob_hp_emission_mode} "
@@ -5642,6 +8155,28 @@ def run_closed_loop_training(
             "probabilistic_closed_loop_loss "
             "energy_score_weight=1.0 "
             f"trajectory_output_weights={list(config.closed_loop_trajectory_output_weights)} "
+            f"increment_energy_weight={config.prob_increment_energy_weight} "
+            f"increment_energy_lags={list(config.prob_increment_energy_lags)} "
+            f"increment_energy_lags_per_batch={config.prob_increment_energy_lags_per_batch} "
+            f"increment_energy_output_weights={list(config.prob_increment_energy_output_weights)} "
+            "increment_energy_constant_setpoint_only="
+            f"{config.prob_increment_energy_constant_setpoint_only} "
+            "increment_energy_feature_scales="
+            f"{np.asarray(prob_increment_energy_feature_scales).tolist()} "
+            f"event_energy_weight={config.prob_event_energy_weight} "
+            f"event_energy_horizons_hours={list(config.prob_event_energy_horizons_hours)} "
+            f"event_energy_horizon_steps={list(prob_event_energy_horizon_steps)} "
+            f"event_energy_events_per_profile={config.prob_event_energy_events_per_profile} "
+            f"event_energy_additional_inputs={event_inputs_normalized} "
+            f"event_energy_output_weights={list(config.prob_event_energy_output_weights)} "
+            "event_energy_feature_scales="
+            f"{np.asarray(prob_event_energy_feature_scales).tolist()} "
+            f"block_energy_weight={config.prob_block_energy_weight} "
+            f"block_energy_horizons_hours={list(config.prob_block_energy_horizons_hours)} "
+            f"block_energy_horizon_steps={list(prob_block_energy_horizon_steps)} "
+            "block_energy_horizons_per_batch="
+            f"{config.prob_block_energy_horizons_per_batch} "
+            f"block_energy_output_weights={list(config.prob_block_energy_output_weights)} "
             f"variogram_weight={config.prob_variogram_weight} "
             f"variogram_lags={list(config.prob_variogram_lags)} "
             f"variogram_power={config.prob_variogram_power} "
@@ -5662,10 +8197,24 @@ def run_closed_loop_training(
             f"flex_kpi_crps_estimator={config.prob_flex_kpi_crps_estimator} "
             f"flex_kpi_crps_ridge={config.prob_flex_kpi_crps_ridge} "
             f"flex_kpi_crps_controls={config.prob_flex_kpi_crps_controls} "
+            "flex_kpi_crps_windows_per_profile="
+            f"{config.prob_flex_kpi_crps_windows_per_profile} "
+            f"flex_kpi_crps_aux_every_steps={config.prob_flex_kpi_crps_aux_every_steps} "
+            f"flex_kpi_crps_aux_buildings={config.prob_flex_kpi_crps_aux_buildings} "
             f"flex_kpi_crps_design_dim={flex_kpi_crps_design_dim} "
             f"flex_kpi_crps_required_events={flex_kpi_crps_required_events} "
             f"flex_kpi_crps_eligible_train_windows="
             f"{list(flex_kpi_crps_eligible_windows)} "
+            f"targeted_flex_energy_weight={config.prob_targeted_flex_energy_weight} "
+            f"targeted_flex_coordinates="
+            f"{'joint_direct_regression_with_curvature' if len(config.prob_targeted_flex_coordinate_center) == 8 else 'direct_short_asym_slope'} "
+            "targeted_flex_horizons_hours="
+            f"[{targeted_flex_short_horizon_hours},"
+            f"{targeted_flex_long_horizon_hours}] "
+            "targeted_flex_coordinate_center="
+            f"{list(config.prob_targeted_flex_coordinate_center)} "
+            "targeted_flex_coordinate_scale="
+            f"{list(config.prob_targeted_flex_coordinate_scale)} "
             f"softopt_weight={config.prob_softopt_weight} "
             f"softopt_temperature={config.prob_softopt_temperature} "
             f"physics_weight={config.prob_physics_weight} "
@@ -5748,6 +8297,7 @@ def run_closed_loop_training(
         print(f"save_model_every_epochs={config.save_model_every_epochs}")
 
     best_model = model
+    best_critic = critic
     best_epoch = 0
     best_metric = float("inf")
     best_train_eval: dict[str, float] | None = None
@@ -5777,101 +8327,254 @@ def run_closed_loop_training(
         assert epoch_train_windows is not None
         losses = []
         prob_loss_components = []
+        aux_flex_losses: list[float] = []
+        aux_flex_update_batches = 0
+        aux_flex_skipped_update_batches = 0
+        aux_flex_update_stats_values: list[np.ndarray] = []
+        aux_flex_gradient_group_norm_values: list[np.ndarray] = []
+        trajectory_critic_stats_values = []
         update_stats_values = []
         gradient_group_norm_values = []
         skipped_update_batches = 0
         stability_penalty_batches = 0
         first_skipped_update_batch: int | None = None
         skipped_update_failure_counts = np.zeros((len(UPDATE_FINITE_FLAG_NAMES),), dtype=np.int64)
-        for batch_idx, (metadata, inputs, initial_temperature, targets) in enumerate(
-            minibatches(epoch_train_windows, batch_size=config.batch_size, rng=rng, shuffle=True),
+        aux_flex_enabled = (
+            is_probabilistic and config.prob_flex_kpi_crps_aux_every_steps > 0
+        )
+        if (
+            is_probabilistic
+            and config.prob_flex_kpi_crps_windows_per_profile > 1
+            and not aux_flex_enabled
+        ):
+            batch_iterator = grouped_profile_minibatches(
+                epoch_train_windows,
+                batch_size=config.batch_size,
+                windows_per_profile=config.prob_flex_kpi_crps_windows_per_profile,
+                rng=rng,
+                shuffle=True,
+                include_plant_targets=plant_supervision_enabled,
+            )
+        else:
+            batch_iterator = minibatches(
+                epoch_train_windows,
+                batch_size=config.batch_size,
+                rng=rng,
+                shuffle=True,
+                include_plant_targets=plant_supervision_enabled,
+            )
+        aux_flex_batch_iterator = None
+        if aux_flex_enabled:
+            aux_flex_batch_iterator = iter(
+                grouped_profile_minibatches(
+                    epoch_train_windows,
+                    batch_size=(
+                        config.prob_flex_kpi_crps_aux_buildings
+                        * config.prob_flex_kpi_crps_windows_per_profile
+                    ),
+                    windows_per_profile=config.prob_flex_kpi_crps_windows_per_profile,
+                    rng=rng,
+                    shuffle=True,
+                    require_setpoint_events=True,
+                    setpoint_delta_threshold=prob_flex_kpi_crps_setpoint_threshold_norm,
+                )
+            )
+        for batch_idx, batch in enumerate(
+            batch_iterator,
             start=1,
         ):
+            metadata, inputs, initial_temperature, targets = batch[:4]
+            plant_targets = jnp.asarray(batch[4]) if plant_supervision_enabled else None
             if is_probabilistic:
                 assert isinstance(
                     model,
                     (ProbabilisticClosedLoopHPEmulator, ProbabilisticContractingClosedLoopHPEmulator),
                 )
                 key, step_key = jax.random.split(key)
-                apply_stability_penalty = (
-                    config.closed_loop_stability_weight > 0.0
-                    and optimizer_step % config.closed_loop_stability_every_steps == 0
-                )
-                stability_weight = (
-                    config.closed_loop_stability_weight
-                    if apply_stability_penalty
-                    else 0.0
-                )
-                if apply_stability_penalty:
-                    stability_penalty_batches += 1
-                (
-                    model,
-                    opt_state,
-                    loss,
-                    components,
-                    update_flags,
-                    update_stats,
-                    gradient_group_norms,
-                ) = (
-                    probabilistic_closed_loop_train_step(
-                    model,
-                    opt_state,
-                    optimizer,
-                    jnp.asarray(metadata),
-                    jnp.asarray(inputs),
-                    jnp.asarray(initial_temperature),
-                    jnp.asarray(targets),
-                    step_key,
-                    config.prob_particles,
-                    config.prob_hp_training_mode,
-                    jnp.asarray(config.prob_hp_concrete_temperature, dtype=jnp.float32),
-                    config.prob_hp_activation_model,
-                    target_mean,
-                    target_scale,
-                    config.hp_mode_loss_weight,
-                    config.heat_on_threshold,
-                    config.qroom_mode_loss_weight,
-                    config.qroom_on_threshold_w_m2,
-                    config.hp_active_power_nll_weight,
-                    config.hp_inactive_leakage_weight,
-                    config.prob_softopt_weight,
-                    config.prob_softopt_temperature,
-                    config.closed_loop_trajectory_output_weights,
-                    config.prob_variogram_weight,
-                    config.prob_variogram_lags,
-                    config.prob_variogram_power,
-                    config.prob_variogram_output_weights,
-                    config.prob_variogram_constant_setpoint_only,
-                    prob_variogram_setpoint_threshold_norm,
-                    config.prob_ires_weight,
-                    prob_ires_horizon_steps,
-                    prob_ires_horizons_hours,
-                    prob_ires_setpoint_threshold_norm,
-                    config.prob_flex_kpi_crps_weight,
-                    prob_flex_kpi_crps_horizon_steps,
-                    prob_flex_kpi_crps_horizons_hours,
-                    prob_flex_kpi_crps_setpoint_threshold_norm,
-                    config.prob_flex_kpi_crps_min_events,
-                    config.prob_flex_kpi_crps_estimator,
-                    config.prob_flex_kpi_crps_ridge,
-                    config.prob_flex_kpi_crps_controls,
-                    config.prob_physics_weight,
-                    config.prob_horizon_weight_power,
-                    stability_weight,
-                    config.closed_loop_stability_gamma,
-                    config.closed_loop_stability_samples,
-                    config.closed_loop_stability_aggregation,
-                    config.closed_loop_stability_method,
-                    config.closed_loop_stability_power_iterations,
-                    config.skip_nonfinite_updates,
-                    config.validate_candidate_updates,
-                    config.skip_grad_norm_above,
-                )
-                )
-                prob_loss_components.append(np.asarray(components))
-                gradient_group_norm_values.append(
-                    np.asarray(gradient_group_norms, dtype=float)
-                )
+                if config.prob_training_backend == "trajectory_actor_critic":
+                    assert critic is not None
+                    assert critic_optimizer is not None
+                    assert critic_opt_state is not None
+                    (
+                        model,
+                        critic,
+                        opt_state,
+                        critic_opt_state,
+                        loss,
+                        components,
+                        update_flags,
+                        update_stats,
+                        gradient_group_norms,
+                        critic_stats,
+                    ) = trajectory_actor_critic_train_step(
+                        model,
+                        critic,
+                        opt_state,
+                        critic_opt_state,
+                        optimizer,
+                        critic_optimizer,
+                        jnp.asarray(metadata),
+                        jnp.asarray(inputs),
+                        jnp.asarray(initial_temperature),
+                        jnp.asarray(targets),
+                        step_key,
+                        config.prob_particles,
+                        config.prob_hp_training_mode,
+                        jnp.asarray(
+                            config.prob_hp_concrete_temperature,
+                            dtype=jnp.float32,
+                        ),
+                        config.closed_loop_trajectory_output_weights,
+                        config.prob_increment_energy_weight,
+                        config.prob_increment_energy_lags,
+                        config.prob_increment_energy_lags_per_batch,
+                        config.prob_increment_energy_output_weights,
+                        config.prob_increment_energy_constant_setpoint_only,
+                        prob_increment_energy_setpoint_threshold_norm,
+                        prob_increment_energy_feature_scales,
+                        config.prob_event_energy_weight,
+                        prob_event_energy_horizon_steps,
+                        config.prob_event_energy_events_per_profile,
+                        config.prob_event_energy_output_weights,
+                        prob_event_energy_setpoint_threshold_norm,
+                        prob_event_energy_feature_scales,
+                        config.trajectory_critic_chunk_steps,
+                        config.trajectory_critic_loss_weight,
+                        config.trajectory_critic_continuation_weight,
+                        config.trajectory_score_function_weight,
+                        config.skip_nonfinite_updates,
+                        config.skip_grad_norm_above,
+                    )
+                    trajectory_critic_stats_values.append(
+                        np.asarray(critic_stats, dtype=float)
+                    )
+                    prob_loss_components.append(np.asarray(components))
+                    gradient_group_norm_values.append(
+                        np.asarray(gradient_group_norms, dtype=float)
+                    )
+                    apply_stability_penalty = False
+                    stability_weight = 0.0
+                else:
+                    apply_stability_penalty = (
+                        config.closed_loop_stability_weight > 0.0
+                        and optimizer_step % config.closed_loop_stability_every_steps == 0
+                    )
+                    stability_weight = (
+                        config.closed_loop_stability_weight
+                        if apply_stability_penalty
+                        else 0.0
+                    )
+                    if apply_stability_penalty:
+                        stability_penalty_batches += 1
+                    (
+                        model,
+                        opt_state,
+                        loss,
+                        components,
+                        update_flags,
+                        update_stats,
+                        gradient_group_norms,
+                    ) = (
+                        probabilistic_closed_loop_train_step(
+                        model,
+                        opt_state,
+                        optimizer,
+                        jnp.asarray(metadata),
+                        jnp.asarray(inputs),
+                        jnp.asarray(initial_temperature),
+                        jnp.asarray(targets),
+                        step_key,
+                        config.prob_particles,
+                        config.prob_hp_training_mode,
+                        jnp.asarray(config.prob_hp_concrete_temperature, dtype=jnp.float32),
+                        config.prob_hp_activation_model,
+                        target_mean,
+                        target_scale,
+                        config.hp_mode_loss_weight,
+                        config.heat_on_threshold,
+                        config.qroom_mode_loss_weight,
+                        config.qroom_on_threshold_w_m2,
+                        config.hp_active_power_nll_weight,
+                        config.hp_inactive_leakage_weight,
+                        config.prob_softopt_weight,
+                        config.prob_softopt_temperature,
+                        config.closed_loop_trajectory_output_weights,
+                        config.prob_increment_energy_weight,
+                        config.prob_increment_energy_lags,
+                        config.prob_increment_energy_lags_per_batch,
+                        config.prob_increment_energy_output_weights,
+                        config.prob_increment_energy_constant_setpoint_only,
+                        prob_increment_energy_setpoint_threshold_norm,
+                        prob_increment_energy_feature_scales,
+                        config.prob_event_energy_weight,
+                        prob_event_energy_horizon_steps,
+                        config.prob_event_energy_events_per_profile,
+                        config.prob_event_energy_output_weights,
+                        prob_event_energy_setpoint_threshold_norm,
+                        prob_event_energy_feature_scales,
+                        config.prob_block_energy_weight,
+                        prob_block_energy_horizon_steps,
+                        config.prob_block_energy_horizons_per_batch,
+                        config.prob_block_energy_output_weights,
+                        config.prob_variogram_weight,
+                        config.prob_variogram_lags,
+                        config.prob_variogram_power,
+                        config.prob_variogram_output_weights,
+                        config.prob_variogram_constant_setpoint_only,
+                        prob_variogram_setpoint_threshold_norm,
+                        config.prob_ires_weight,
+                        prob_ires_horizon_steps,
+                        prob_ires_horizons_hours,
+                        prob_ires_setpoint_threshold_norm,
+                        (
+                            0.0
+                            if aux_flex_enabled
+                            else config.prob_flex_kpi_crps_weight
+                        ),
+                        prob_flex_kpi_crps_horizon_steps,
+                        prob_flex_kpi_crps_horizons_hours,
+                        prob_flex_kpi_crps_setpoint_threshold_norm,
+                        config.prob_flex_kpi_crps_min_events,
+                        config.prob_flex_kpi_crps_estimator,
+                        config.prob_flex_kpi_crps_ridge,
+                        config.prob_flex_kpi_crps_controls,
+                        (
+                            1
+                            if aux_flex_enabled
+                            else config.prob_flex_kpi_crps_windows_per_profile
+                        ),
+                        config.prob_targeted_flex_energy_weight,
+                        targeted_flex_short_horizon_steps,
+                        targeted_flex_short_horizon_hours,
+                        targeted_flex_long_horizon_steps,
+                        targeted_flex_long_horizon_hours,
+                        config.prob_targeted_flex_coordinate_center,
+                        config.prob_targeted_flex_coordinate_scale,
+                        targeted_flex_physical_kpi_scale,
+                        config.prob_physics_weight,
+                        config.prob_horizon_weight_power,
+                        stability_weight,
+                        config.closed_loop_stability_gamma,
+                        config.closed_loop_stability_samples,
+                        config.closed_loop_stability_aggregation,
+                        config.closed_loop_stability_method,
+                        config.closed_loop_stability_power_iterations,
+                        config.skip_nonfinite_updates,
+                        config.validate_candidate_updates,
+                        config.skip_grad_norm_above,
+                        plant_targets=plant_targets,
+                        plant_source_loss_weight=config.prob_plant_source_loss_weight,
+                        plant_delivery_loss_weight=config.prob_plant_delivery_loss_weight,
+                        plant_block_steps=plant_block_steps,
+                        dhw_mode_loss_weight=config.prob_dhw_mode_loss_weight,
+                        tank_temperature_loss_weight=config.prob_tank_temperature_loss_weight,
+                        event_energy_additional_inputs=event_inputs_normalized,
+                    )
+                    )
+                    prob_loss_components.append(np.asarray(components))
+                    gradient_group_norm_values.append(
+                        np.asarray(gradient_group_norms, dtype=float)
+                    )
             else:
                 model, opt_state, loss, update_flags, update_stats = closed_loop_train_step(
                     model,
@@ -5898,7 +8601,104 @@ def run_closed_loop_training(
                     first_skipped_update_batch = batch_idx
                 skipped_update_failure_counts += (~update_flags_np).astype(np.int64)
             losses.append(float(loss))
+            if (
+                aux_flex_enabled
+                and batch_idx % config.prob_flex_kpi_crps_aux_every_steps == 0
+            ):
+                assert aux_flex_batch_iterator is not None
+                try:
+                    (
+                        aux_metadata,
+                        aux_inputs,
+                        aux_initial_temperature,
+                        aux_targets,
+                    ) = next(aux_flex_batch_iterator)
+                except StopIteration:
+                    aux_flex_batch_iterator = iter(
+                        grouped_profile_minibatches(
+                            epoch_train_windows,
+                            batch_size=(
+                                config.prob_flex_kpi_crps_aux_buildings
+                                * config.prob_flex_kpi_crps_windows_per_profile
+                            ),
+                            windows_per_profile=(
+                                config.prob_flex_kpi_crps_windows_per_profile
+                            ),
+                            rng=rng,
+                            shuffle=True,
+                            require_setpoint_events=True,
+                            setpoint_delta_threshold=(
+                                prob_flex_kpi_crps_setpoint_threshold_norm
+                            ),
+                        )
+                    )
+                    (
+                        aux_metadata,
+                        aux_inputs,
+                        aux_initial_temperature,
+                        aux_targets,
+                    ) = next(aux_flex_batch_iterator)
+                key, aux_step_key = jax.random.split(key)
+                (
+                    model,
+                    opt_state,
+                    aux_flex_loss,
+                    aux_update_flags,
+                    aux_update_stats,
+                    aux_gradient_group_norms,
+                ) = probabilistic_closed_loop_aux_flex_train_step(
+                    model,
+                    opt_state,
+                    optimizer,
+                    jnp.asarray(aux_metadata),
+                    jnp.asarray(aux_inputs),
+                    jnp.asarray(aux_initial_temperature),
+                    jnp.asarray(aux_targets),
+                    aux_step_key,
+                    config.prob_particles,
+                    config.prob_hp_training_mode,
+                    jnp.asarray(
+                        config.prob_hp_concrete_temperature,
+                        dtype=jnp.float32,
+                    ),
+                    config.prob_flex_kpi_crps_weight,
+                    prob_flex_kpi_crps_horizon_steps,
+                    prob_flex_kpi_crps_horizons_hours,
+                    prob_flex_kpi_crps_setpoint_threshold_norm,
+                    config.prob_flex_kpi_crps_min_events,
+                    config.prob_flex_kpi_crps_windows_per_profile,
+                    config.skip_nonfinite_updates,
+                    config.validate_candidate_updates,
+                    config.skip_grad_norm_above,
+                )
+                aux_flex_update_batches += 1
+                aux_flex_losses.append(float(aux_flex_loss))
+                update_stats_values.append(np.asarray(aux_update_stats, dtype=float))
+                aux_flex_update_stats_values.append(
+                    np.asarray(aux_update_stats, dtype=float)
+                )
+                gradient_group_norm_values.append(
+                    np.asarray(aux_gradient_group_norms, dtype=float)
+                )
+                aux_flex_gradient_group_norm_values.append(
+                    np.asarray(aux_gradient_group_norms, dtype=float)
+                )
+                aux_update_flags_np = np.asarray(aux_update_flags, dtype=bool)
+                if config.skip_nonfinite_updates and not bool(
+                    np.all(aux_update_flags_np)
+                ):
+                    skipped_update_batches += 1
+                    aux_flex_skipped_update_batches += 1
+                    if first_skipped_update_batch is None:
+                        first_skipped_update_batch = batch_idx
+                    skipped_update_failure_counts += (
+                        ~aux_update_flags_np
+                    ).astype(np.int64)
             optimizer_step += 1
+            if epoch_observer is not None and (batch_idx == 1 or batch_idx % 10 == 0):
+                print(f"batch_progress epoch={epoch} batch={batch_idx} "
+                      f"loss={losses[-1]:.6g} skipped_updates={skipped_update_batches} "
+                      f"elapsed_min={(time.perf_counter()-epoch_started_at)/60:.2f}", flush=True)
             if config.max_train_batches is not None and batch_idx >= config.max_train_batches:
                 break
 
@@ -5947,6 +8747,9 @@ def run_closed_loop_training(
                     batch_size=config.batch_size,
                 )
         train_loss_mean, nonfinite_train_batches = finite_mean(losses)
+        aux_flex_loss_mean = (
+            finite_mean(aux_flex_losses)[0] if aux_flex_losses else float("nan")
+        )
         rho_max = sample_spectral_radius(model, epoch_train_windows)
         message = (
             f"epoch={epoch:03d} train_loss={train_loss_mean:.6f} "
@@ -5970,6 +8773,12 @@ def run_closed_loop_training(
             message += f" nonfinite_train_batches={nonfinite_train_batches}"
         if is_probabilistic and config.closed_loop_stability_weight > 0.0:
             message += f" stability_penalty_batches={stability_penalty_batches}"
+        if aux_flex_enabled:
+            message += (
+                f" aux_flex_update_batches={aux_flex_update_batches}"
+                f" aux_flex_skipped_update_batches={aux_flex_skipped_update_batches}"
+                f" train_loss_aux_flex_kpi_crps={aux_flex_loss_mean:.6f}"
+            )
         skipped_update_reason_counts = {
             name: int(count)
             for name, count in zip(UPDATE_FINITE_FLAG_NAMES, skipped_update_failure_counts)
@@ -5999,6 +8808,22 @@ def run_closed_loop_training(
                     f"max_{name}={value:.6g}"
                     for name, value in zip(UPDATE_STAT_NAMES, max_stats)
                 )
+        aux_flex_update_stat_maxima = {
+            f"aux_flex_max_{name}": np.nan for name in UPDATE_STAT_NAMES
+        }
+        if aux_flex_update_stats_values:
+            aux_stats_array = np.asarray(aux_flex_update_stats_values, dtype=float)
+            finite_aux_rows = np.all(np.isfinite(aux_stats_array), axis=1)
+            if finite_aux_rows.any():
+                max_aux_stats = np.nanmax(aux_stats_array[finite_aux_rows], axis=0)
+                aux_flex_update_stat_maxima = {
+                    f"aux_flex_max_{name}": float(value)
+                    for name, value in zip(UPDATE_STAT_NAMES, max_aux_stats)
+                }
+                message += " " + " ".join(
+                    f"aux_flex_max_{name}={value:.6g}"
+                    for name, value in zip(UPDATE_STAT_NAMES, max_aux_stats)
+                )
         gradient_group_maxima = {
             f"max_grad_{name}": np.nan
             for name in PROB_CLOSED_LOOP_GRADIENT_GROUP_NAMES
@@ -6022,7 +8847,30 @@ def run_closed_loop_training(
                         PROB_CLOSED_LOOP_GRADIENT_GROUP_NAMES, max_group_norms
                     )
                 )
+        aux_flex_gradient_group_maxima = {
+            f"aux_flex_max_grad_{name}": np.nan
+            for name in PROB_CLOSED_LOOP_GRADIENT_GROUP_NAMES
+        }
+        if aux_flex_gradient_group_norm_values:
+            aux_group_array = np.asarray(
+                aux_flex_gradient_group_norm_values,
+                dtype=float,
+            )
+            finite_aux_group_rows = np.all(np.isfinite(aux_group_array), axis=1)
+            if finite_aux_group_rows.any():
+                max_aux_group_norms = np.nanmax(
+                    aux_group_array[finite_aux_group_rows],
+                    axis=0,
+                )
+                aux_flex_gradient_group_maxima = {
+                    f"aux_flex_max_grad_{name}": float(value)
+                    for name, value in zip(
+                        PROB_CLOSED_LOOP_GRADIENT_GROUP_NAMES,
+                        max_aux_group_norms,
+                    )
+                }
         component_means: np.ndarray | None = None
+        critic_stat_means: np.ndarray | None = None
         nonfinite_component_batches = 0
         if is_probabilistic and prob_loss_components:
             component_means, nonfinite_component_batches = finite_column_means(prob_loss_components)
@@ -6053,6 +8901,18 @@ def run_closed_loop_training(
                 f" train_particle_pred_range_c=[{train_eval['particle_min_pred_c']:.4f},"
                 f"{train_eval['particle_max_pred_c']:.4f}]"
             )
+        if trajectory_critic_stats_values:
+            critic_stat_means, _ = finite_column_means(
+                trajectory_critic_stats_values
+            )
+            if critic_stat_means is not None:
+                message += " " + " ".join(
+                    f"train_critic_{name}={value:.6f}"
+                    for name, value in zip(
+                        TRAJECTORY_CRITIC_STAT_NAMES,
+                        critic_stat_means,
+                    )
+                )
         test_eval: dict[str, float] | None = None
         if test_windows is not None:
             if is_probabilistic:
@@ -6123,6 +8983,7 @@ def run_closed_loop_training(
         checkpoint_is_best = metric_value < best_metric - config.early_stopping_min_delta
         if metric_value < best_metric - config.early_stopping_min_delta:
             best_model = model
+            best_critic = critic
             best_epoch = epoch
             best_metric = metric_value
             best_train_eval = train_eval
@@ -6147,6 +9008,11 @@ def run_closed_loop_training(
             "best_metric_so_far": best_metric,
             "skipped_update_batches": skipped_update_batches,
             "first_skipped_update_batch": first_skipped_update_batch,
+            "aux_flex_update_batches": aux_flex_update_batches,
+            "aux_flex_skipped_update_batches": aux_flex_skipped_update_batches,
+            "train_loss_aux_flex_kpi_crps": (
+                aux_flex_loss_mean if aux_flex_losses else ""
+            ),
             "learning_rate": config.learning_rate,
             "gradient_clip_norm": config.gradient_clip_norm,
             "skip_nonfinite_updates": config.skip_nonfinite_updates,
@@ -6155,6 +9021,15 @@ def run_closed_loop_training(
             "prob_particles": config.prob_particles if is_probabilistic else "",
             "prob_eval_particles": config.prob_eval_particles if is_probabilistic else "",
             "prob_process_noise": config.prob_process_noise if is_probabilistic else "",
+            "prob_metadata_conditioned_xi": (
+                config.prob_metadata_conditioned_xi if is_probabilistic else ""
+            ),
+            "prob_metadata_xi_mean_cap": (
+                config.prob_metadata_xi_mean_cap if is_probabilistic else ""
+            ),
+            "prob_metadata_xi_scale_cap": (
+                config.prob_metadata_xi_scale_cap if is_probabilistic else ""
+            ),
             "prob_hp_emission_mode": config.prob_hp_emission_mode if is_probabilistic else "",
             "prob_hp_training_mode": config.prob_hp_training_mode if is_probabilistic else "",
             "prob_hp_activation_model": (
@@ -6216,7 +9091,9 @@ def run_closed_loop_training(
                 }
             )
         diagnostics_row.update(update_stat_maxima)
+        diagnostics_row.update(aux_flex_update_stat_maxima)
         diagnostics_row.update(gradient_group_maxima)
+        diagnostics_row.update(aux_flex_gradient_group_maxima)
         diagnostics_row.update(
             {
                 f"skipped_update_reason_{name}": count
@@ -6237,6 +9114,16 @@ def run_closed_loop_training(
                     for name in PROB_CLOSED_LOOP_LOSS_COMPONENT_NAMES
                 }
             )
+        diagnostics_row.update(
+            {
+                f"train_critic_{name}": (
+                    ""
+                    if critic_stat_means is None
+                    else float(critic_stat_means[index])
+                )
+                for index, name in enumerate(TRAJECTORY_CRITIC_STAT_NAMES)
+            }
+        )
         for prefix, metrics in (("train", train_eval), ("test", test_eval or {})):
             for key_name in (
                 "median_rmse_c",
@@ -6287,6 +9174,11 @@ def run_closed_loop_training(
                 train_metrics=train_eval,
                 test_metrics=test_eval,
             )
+            if critic is not None:
+                eqx.tree_serialise_leaves(
+                    artifact_path / "trajectory_critic.eqx",
+                    critic,
+                )
             print(f"saved_epoch_model={artifact_path}")
 
         epoch_elapsed_min = (time.perf_counter() - epoch_started_at) / 60.0
@@ -6299,6 +9191,12 @@ def run_closed_loop_training(
         diagnostics_row["total_elapsed_min"] = total_elapsed_min
         append_epoch_diagnostics(diagnostics_path, diagnostics_row)
         print(message)
+
+        if epoch_observer is not None and epoch_observer(
+            epoch, model_artifact_dir / f"epoch_{epoch:03d}"
+        ):
+            print(f"observer_stopped epoch={epoch} best_epoch={best_epoch}", flush=True)
+            break
 
         if (
             config.early_stopping_patience is not None
@@ -6313,6 +9211,7 @@ def run_closed_loop_training(
             break
 
     model = best_model
+    critic = best_critic
     print(
         "selected_checkpoint "
         f"epoch={best_epoch} "
@@ -6349,6 +9248,11 @@ def run_closed_loop_training(
             train_metrics=best_train_eval,
             test_metrics=best_test_eval,
         )
+        if critic is not None:
+            eqx.tree_serialise_leaves(
+                artifact_path / "trajectory_critic.eqx",
+                critic,
+            )
         print(f"saved_selected_model={artifact_path}")
 
     if test_windows is not None:
@@ -7468,6 +10372,67 @@ def parse_args() -> TrainConfig:
         ),
     )
     parser.add_argument(
+        "--prob-persistent-xi-routing",
+        choices=("shared", "physical", "soft_physical"),
+        default="shared",
+        help=(
+            "Use the full xi draw on every enabled pathway, or assign its four "
+            "coordinates to envelope, HP, controller, and operation routes."
+        ),
+    )
+    parser.add_argument(
+        "--prob-metadata-conditioned-xi",
+        action="store_true",
+        help=(
+            "Sample persistent xi from a metadata-conditioned diagonal Gaussian "
+            "prior instead of a global standard normal prior."
+        ),
+    )
+    parser.add_argument(
+        "--prob-metadata-xi-mean-cap",
+        type=float,
+        default=1.0,
+        help="Absolute tanh cap for the metadata-conditioned xi prior mean.",
+    )
+    parser.add_argument(
+        "--prob-metadata-xi-scale-cap",
+        type=float,
+        default=2.0,
+        help=(
+            "Upper sigmoid cap for the metadata-conditioned xi prior scale. "
+            "A zero-initialized prior starts at half this value."
+        ),
+    )
+    parser.add_argument(
+        "--prob-colored-latent-timescales-hours",
+        nargs="*",
+        type=float,
+        default=(),
+        help=(
+            "Fixed OU timescales for persistent within-trajectory uncertainty. "
+            "An empty list disables colored latent uncertainty."
+        ),
+    )
+    parser.add_argument(
+        "--prob-colored-latent-pathways",
+        nargs="+",
+        choices=("thermal", "q_to_t", "hp"),
+        default=("thermal", "q_to_t", "hp"),
+        help="Model pathways receiving metadata-conditioned colored latent modes.",
+    )
+    parser.add_argument(
+        "--prob-colored-latent-state-scale-cap",
+        type=float,
+        default=0.02,
+        help="Absolute cap on colored-mode loadings into thermal-state innovations.",
+    )
+    parser.add_argument(
+        "--prob-colored-latent-xi-scale-cap",
+        type=float,
+        default=0.5,
+        help="Absolute cap on colored-mode loadings into q-to-T and HP latents.",
+    )
+    parser.add_argument(
         "--prob-process-noise",
         choices=("none", "constant", "heteroscedastic"),
         default="constant",
@@ -7478,6 +10443,39 @@ def parse_args() -> TrainConfig:
         type=float,
         default=-6.0,
         help="Initial raw process-noise scale; softplus(raw) is used.",
+    )
+    parser.add_argument(
+        "--prob-training-backend",
+        choices=("backprop", "trajectory_actor_critic"),
+        default="backprop",
+        help=(
+            "Training gradient backend for probabilistic closed-loop models. "
+            "The actor-critic backend keeps the emulator rollout unchanged and "
+            "adds a training-only continuation critic across TBPTT boundaries."
+        ),
+    )
+    parser.add_argument("--trajectory-critic-chunk-steps", type=int, default=32)
+    parser.add_argument("--trajectory-critic-hidden-dim", type=int, default=128)
+    parser.add_argument("--trajectory-critic-depth", type=int, default=2)
+    parser.add_argument(
+        "--trajectory-critic-learning-rate",
+        type=float,
+        default=3e-4,
+    )
+    parser.add_argument("--trajectory-critic-loss-weight", type=float, default=1.0)
+    parser.add_argument(
+        "--trajectory-critic-continuation-weight",
+        type=float,
+        default=1.0,
+    )
+    parser.add_argument(
+        "--trajectory-score-function-weight",
+        type=float,
+        default=1.0,
+        help=(
+            "Weight of the likelihood-ratio gradient for hard Bernoulli HP "
+            "samples in score_function training mode."
+        ),
     )
     parser.add_argument(
         "--prob-softopt-weight",
@@ -7503,6 +10501,123 @@ def parse_args() -> TrainConfig:
             "use 1 1 0 to remove pointwise Pel trajectory matching while retaining HP "
             "mode, active-power, IRES, and flexibility losses."
         ),
+    )
+    parser.add_argument(
+        "--prob-increment-energy-weight",
+        type=float,
+        default=0.0,
+        help="Weight for the proper energy score on signed lagged T/Q/P increments.",
+    )
+    parser.add_argument(
+        "--prob-increment-energy-lags",
+        nargs="+",
+        type=int,
+        default=[1, 2, 4, 8],
+        help="Timestep lags represented by the increment energy score.",
+    )
+    parser.add_argument(
+        "--prob-increment-energy-lags-per-batch",
+        type=int,
+        default=1,
+        help=(
+            "Number of increment lags sampled without replacement per minibatch. "
+            "One is an unbiased, lower-cost estimate of the configured lag average."
+        ),
+    )
+    parser.add_argument(
+        "--prob-increment-energy-output-weights",
+        nargs=3,
+        type=float,
+        default=[1.0, 1.0, 1.0],
+        metavar=("TIN", "QROOM", "PEL"),
+        help="Per-output weights for the joint increment energy score.",
+    )
+    parser.add_argument(
+        "--prob-increment-energy-constant-setpoint-only",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Exclude increments crossing thermostat setpoint interventions.",
+    )
+    parser.add_argument(
+        "--prob-increment-energy-setpoint-threshold-c",
+        type=float,
+        default=0.05,
+        help="Setpoint-jump threshold used by the increment energy-score mask.",
+    )
+    parser.add_argument(
+        "--prob-event-energy-weight",
+        type=float,
+        default=0.0,
+        help=(
+            "Weight for the joint T/Q/P energy score on average pre/post responses "
+            "to thermostat interventions."
+        ),
+    )
+    parser.add_argument(
+        "--prob-event-energy-horizons-hours",
+        nargs="+",
+        type=float,
+        default=[0.5, 1.0, 2.0, 3.0],
+        help="Pre/post averaging horizons used by the joint event energy score.",
+    )
+    parser.add_argument(
+        "--prob-event-energy-events-per-profile",
+        type=int,
+        default=4,
+        help=(
+            "Number of qualifying interventions sampled per profile and horizon in "
+            "each minibatch. Sampling keeps the pairwise particle score affordable."
+        ),
+    )
+    parser.add_argument(
+        "--prob-event-energy-output-weights",
+        nargs=3,
+        type=float,
+        default=[1.0, 1.0, 1.0],
+        metavar=("TIN", "QROOM", "PEL"),
+        help="Per-output weights for the joint intervention-response energy score.",
+    )
+    parser.add_argument(
+        "--prob-event-energy-setpoint-threshold-c",
+        type=float,
+        default=0.05,
+        help="Minimum absolute setpoint jump counted by the event energy score.",
+    )
+    parser.add_argument(
+        "--prob-event-energy-include-force-off",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Also score responses at explicit HP force-off command onset and release.",
+    )
+    parser.add_argument(
+        "--prob-block-energy-weight",
+        type=float,
+        default=0.0,
+        help="Weight for the energy score on multiscale block-average T/Q/P trajectories.",
+    )
+    parser.add_argument(
+        "--prob-block-energy-horizons-hours",
+        nargs="+",
+        type=float,
+        default=[6.0, 24.0, 72.0],
+        help="Non-overlapping averaging horizons used by the block energy score.",
+    )
+    parser.add_argument(
+        "--prob-block-energy-horizons-per-batch",
+        type=int,
+        default=1,
+        help=(
+            "Number of block-average horizons sampled without replacement per minibatch. "
+            "One is an unbiased, lower-cost estimate of the configured horizon average."
+        ),
+    )
+    parser.add_argument(
+        "--prob-block-energy-output-weights",
+        nargs=3,
+        type=float,
+        default=[1.0, 1.0, 1.0],
+        metavar=("TIN", "QROOM", "PEL"),
+        help="Per-output weights for the joint block-average trajectory energy score.",
     )
     parser.add_argument(
         "--prob-variogram-weight",
@@ -7598,6 +10713,31 @@ def parse_args() -> TrainConfig:
         help="Minimum intervention count required to score one training-window KPI estimate.",
     )
     parser.add_argument(
+        "--prob-flex-kpi-crps-windows-per-profile",
+        type=int,
+        default=1,
+        help=(
+            "Number of seasonally separated windows from one building that share each "
+            "persistent xi draw and are pooled before direct-F CRPS is evaluated. "
+            "One preserves independent-window training."
+        ),
+    )
+    parser.add_argument(
+        "--prob-flex-kpi-crps-aux-every-steps",
+        type=int,
+        default=0,
+        help=(
+            "Run a separate grouped direct-F optimizer update after every N ordinary "
+            "minibatches. Zero keeps grouped scoring inside the main minibatch."
+        ),
+    )
+    parser.add_argument(
+        "--prob-flex-kpi-crps-aux-buildings",
+        type=int,
+        default=4,
+        help="Number of setpoint-policy buildings in each grouped auxiliary F update.",
+    )
+    parser.add_argument(
         "--prob-flex-kpi-crps-estimator",
         choices=("direct_ratio", "regression"),
         default="regression",
@@ -7621,6 +10761,27 @@ def parse_args() -> TrainConfig:
             "Regression controls used by the flexibility-coefficient CRPS. Full uses fixed "
             "observed pre-event power/temperature plus weather and calendar controls."
         ),
+    )
+    parser.add_argument("--prob-targeted-flex-energy-weight", type=float, default=0.0)
+    parser.add_argument(
+        "--prob-targeted-flex-short-horizon-hours", type=float, default=0.5
+    )
+    parser.add_argument(
+        "--prob-targeted-flex-long-horizon-hours", type=float, default=3.0
+    )
+    parser.add_argument(
+        "--prob-targeted-flex-coordinate-center",
+        type=float,
+        nargs="+",
+        default=(0.0, 0.0, 0.0),
+        metavar="VALUE",
+    )
+    parser.add_argument(
+        "--prob-targeted-flex-coordinate-scale",
+        type=float,
+        nargs="+",
+        default=(1.0, 1.0, 1.0),
+        metavar="VALUE",
     )
     parser.add_argument(
         "--prob-physics-weight",
@@ -7819,6 +10980,81 @@ def parse_args() -> TrainConfig:
         ),
     )
     parser.add_argument(
+        "--contracting-metadata-fixed-state-update",
+        choices=("linear", "bounded_tanh"),
+        default="linear",
+        help=(
+            "State update used by metadata_fixed_ss. 'linear' preserves its "
+            "linear recurrence; 'bounded_tanh' applies "
+            "state_bound*tanh(raw_next/state_bound), retaining the local map "
+            "while bounding every latent-state component."
+        ),
+    )
+    parser.add_argument(
+        "--contracting-metadata-fixed-pole-parameterization",
+        choices=("rho", "time_constant"),
+        default="rho",
+        help=(
+            "Diagonal-pole parameterization used by metadata_fixed_ss. "
+            "'rho' preserves the legacy gamma-bounded mapping; 'time_constant' "
+            "learns log-spaced physical time constants and maps rho=exp(-dt/tau)."
+        ),
+    )
+    parser.add_argument(
+        "--contracting-metadata-fixed-time-constant-min-hours",
+        type=float,
+        default=0.1,
+    )
+    parser.add_argument(
+        "--contracting-metadata-fixed-time-constant-max-hours",
+        type=float,
+        default=24.0 * 21.0,
+    )
+    parser.add_argument(
+        "--contracting-causal-ventilation",
+        action="store_true",
+        help=(
+            "Route ventilation through a sign-constrained air-exchange term and "
+            "mask it from unconstrained neural encoders."
+        ),
+    )
+    parser.add_argument(
+        "--contracting-ventilation-model",
+        choices=("learned_gain", "physical_air_mixing"),
+        default="learned_gain",
+        help=(
+            "Thermal response used after causal ventilation is enabled. "
+            "'physical_air_mixing' converts flow to ACH using zone volume and "
+            "applies exponential air mixing with the EnergyPlus zone-capacitance "
+            "multiplier."
+        ),
+    )
+    parser.add_argument(
+        "--contracting-ventilation-gain-max-per-hour-m3-s",
+        type=float,
+        default=4.0,
+    )
+    parser.add_argument(
+        "--contracting-ventilation-gain-initial-per-hour-m3-s",
+        type=float,
+        default=1.0,
+    )
+    parser.add_argument(
+        "--contracting-ventilation-delta-max-c",
+        type=float,
+        default=2.0,
+    )
+    parser.add_argument(
+        "--contracting-ventilation-capacity-factor-min",
+        type=float,
+        default=0.25,
+    )
+    parser.add_argument(
+        "--contracting-ventilation-capacity-factor-max",
+        type=float,
+        default=4.0,
+    )
+    parser.add_argument(
         "--contracting-transition-conditioning",
         choices=(
             "state_feedback",
@@ -7921,14 +11157,20 @@ def parse_args() -> TrainConfig:
     )
     parser.add_argument(
         "--prob-hp-training-mode",
-        choices=("expected", "straight_through", "hard_expected_grad"),
+        choices=(
+            "expected",
+            "straight_through",
+            "hard_expected_grad",
+            "score_function",
+        ),
         default="expected",
         help=(
             "HP path used by probabilistic closed-loop training. 'expected' preserves the "
             "deterministic expected-power path; 'straight_through' samples hard HP on/off "
             "events and active power, using a Binary Concrete surrogate gradient for mode "
             "logits; 'hard_expected_grad' uses a hard Bernoulli forward draw and propagates "
-            "the exact activation-probability gradient backward."
+            "the exact activation-probability gradient backward; 'score_function' "
+            "uses hard Bernoulli draws with the trajectory critic as a baseline."
         ),
     )
     parser.add_argument(
@@ -8154,6 +11396,35 @@ def parse_args() -> TrainConfig:
         help="Automatic energy cap duration: Emax=max(this * Qcap, dt * COPcap * Pelcap).",
     )
     parser.add_argument(
+        "--hp-buffer-capacity-mode",
+        choices=("global", "physical_volume"),
+        default="global",
+        help=(
+            "Use the global energy cap or derive a per-building cap from SH tank "
+            "volume and a learned bounded usable temperature span."
+        ),
+    )
+    parser.add_argument(
+        "--hp-buffer-delta-t-usable-init-k",
+        type=float,
+        default=5.0,
+    )
+    parser.add_argument(
+        "--hp-buffer-delta-t-min-k",
+        type=float,
+        default=1.0,
+    )
+    parser.add_argument(
+        "--hp-buffer-delta-t-max-k",
+        type=float,
+        default=15.0,
+    )
+    parser.add_argument(
+        "--hp-buffer-water-heat-capacity-wh-m3-k",
+        type=float,
+        default=1163.0,
+    )
+    parser.add_argument(
         "--hp-cap-factor",
         type=float,
         default=1.25,
@@ -8249,12 +11520,64 @@ def parse_args() -> TrainConfig:
         prob_plot_particles=args.prob_plot_particles,
         prob_latent_dim=args.prob_latent_dim,
         prob_persistent_xi_pathways=tuple(args.prob_persistent_xi_pathways),
+        prob_persistent_xi_routing=args.prob_persistent_xi_routing,
+        prob_metadata_conditioned_xi=args.prob_metadata_conditioned_xi,
+        prob_metadata_xi_mean_cap=args.prob_metadata_xi_mean_cap,
+        prob_metadata_xi_scale_cap=args.prob_metadata_xi_scale_cap,
+        prob_colored_latent_timescales_hours=tuple(
+            args.prob_colored_latent_timescales_hours
+        ),
+        prob_colored_latent_pathways=tuple(args.prob_colored_latent_pathways),
+        prob_colored_latent_state_scale_cap=(
+            args.prob_colored_latent_state_scale_cap
+        ),
+        prob_colored_latent_xi_scale_cap=args.prob_colored_latent_xi_scale_cap,
         prob_process_noise=args.prob_process_noise,
         prob_process_noise_init=args.prob_process_noise_init,
+        prob_training_backend=args.prob_training_backend,
+        trajectory_critic_chunk_steps=args.trajectory_critic_chunk_steps,
+        trajectory_critic_hidden_dim=args.trajectory_critic_hidden_dim,
+        trajectory_critic_depth=args.trajectory_critic_depth,
+        trajectory_critic_learning_rate=args.trajectory_critic_learning_rate,
+        trajectory_critic_loss_weight=args.trajectory_critic_loss_weight,
+        trajectory_critic_continuation_weight=(
+            args.trajectory_critic_continuation_weight
+        ),
+        trajectory_score_function_weight=args.trajectory_score_function_weight,
         prob_softopt_weight=args.prob_softopt_weight,
         prob_softopt_temperature=args.prob_softopt_temperature,
         closed_loop_trajectory_output_weights=tuple(
             args.closed_loop_trajectory_output_weights
+        ),
+        prob_increment_energy_weight=args.prob_increment_energy_weight,
+        prob_increment_energy_lags=tuple(args.prob_increment_energy_lags),
+        prob_increment_energy_lags_per_batch=args.prob_increment_energy_lags_per_batch,
+        prob_increment_energy_output_weights=tuple(
+            args.prob_increment_energy_output_weights
+        ),
+        prob_increment_energy_constant_setpoint_only=(
+            args.prob_increment_energy_constant_setpoint_only
+        ),
+        prob_increment_energy_setpoint_threshold_c=(
+            args.prob_increment_energy_setpoint_threshold_c
+        ),
+        prob_event_energy_weight=args.prob_event_energy_weight,
+        prob_event_energy_horizons_hours=tuple(args.prob_event_energy_horizons_hours),
+        prob_event_energy_events_per_profile=args.prob_event_energy_events_per_profile,
+        prob_event_energy_output_weights=tuple(args.prob_event_energy_output_weights),
+        prob_event_energy_setpoint_threshold_c=(
+            args.prob_event_energy_setpoint_threshold_c
+        ),
+        prob_event_energy_include_force_off=args.prob_event_energy_include_force_off,
+        prob_block_energy_weight=args.prob_block_energy_weight,
+        prob_block_energy_horizons_hours=tuple(
+            args.prob_block_energy_horizons_hours
+        ),
+        prob_block_energy_horizons_per_batch=(
+            args.prob_block_energy_horizons_per_batch
+        ),
+        prob_block_energy_output_weights=tuple(
+            args.prob_block_energy_output_weights
         ),
         prob_variogram_weight=args.prob_variogram_weight,
         prob_variogram_lags=tuple(args.prob_variogram_lags),
@@ -8272,6 +11595,26 @@ def parse_args() -> TrainConfig:
         prob_flex_kpi_crps_estimator=args.prob_flex_kpi_crps_estimator,
         prob_flex_kpi_crps_ridge=args.prob_flex_kpi_crps_ridge,
         prob_flex_kpi_crps_controls=args.prob_flex_kpi_crps_controls,
+        prob_flex_kpi_crps_windows_per_profile=(
+            args.prob_flex_kpi_crps_windows_per_profile
+        ),
+        prob_flex_kpi_crps_aux_every_steps=(
+            args.prob_flex_kpi_crps_aux_every_steps
+        ),
+        prob_flex_kpi_crps_aux_buildings=args.prob_flex_kpi_crps_aux_buildings,
+        prob_targeted_flex_energy_weight=args.prob_targeted_flex_energy_weight,
+        prob_targeted_flex_short_horizon_hours=(
+            args.prob_targeted_flex_short_horizon_hours
+        ),
+        prob_targeted_flex_long_horizon_hours=(
+            args.prob_targeted_flex_long_horizon_hours
+        ),
+        prob_targeted_flex_coordinate_center=tuple(
+            args.prob_targeted_flex_coordinate_center
+        ),
+        prob_targeted_flex_coordinate_scale=tuple(
+            args.prob_targeted_flex_coordinate_scale
+        ),
         prob_physics_weight=args.prob_physics_weight,
         prob_horizon_weight_power=args.prob_horizon_weight_power,
         prob_hp_scenario_mode=args.prob_hp_scenario_mode,
@@ -8307,6 +11650,15 @@ def parse_args() -> TrainConfig:
         hp_qroom_cap_w_m2=args.hp_qroom_cap_w_m2,
         hp_energy_cap_wh_m2=args.hp_energy_cap_wh_m2,
         hp_energy_cap_hours=args.hp_energy_cap_hours,
+        hp_buffer_capacity_mode=args.hp_buffer_capacity_mode,
+        hp_buffer_delta_t_usable_init_k=(
+            args.hp_buffer_delta_t_usable_init_k
+        ),
+        hp_buffer_delta_t_min_k=args.hp_buffer_delta_t_min_k,
+        hp_buffer_delta_t_max_k=args.hp_buffer_delta_t_max_k,
+        hp_buffer_water_heat_capacity_wh_m3_k=(
+            args.hp_buffer_water_heat_capacity_wh_m3_k
+        ),
         hp_cap_factor=args.hp_cap_factor,
         closed_loop_stability_weight=args.closed_loop_stability_weight,
         closed_loop_stability_gamma=args.closed_loop_stability_gamma,
@@ -8335,6 +11687,35 @@ def parse_args() -> TrainConfig:
             args.contracting_transition_conditioning
         ),
         contracting_thermal_architecture=args.contracting_thermal_architecture,
+        contracting_metadata_fixed_state_update=(
+            args.contracting_metadata_fixed_state_update
+        ),
+        contracting_metadata_fixed_pole_parameterization=(
+            args.contracting_metadata_fixed_pole_parameterization
+        ),
+        contracting_metadata_fixed_time_constant_min_hours=(
+            args.contracting_metadata_fixed_time_constant_min_hours
+        ),
+        contracting_metadata_fixed_time_constant_max_hours=(
+            args.contracting_metadata_fixed_time_constant_max_hours
+        ),
+        contracting_causal_ventilation=args.contracting_causal_ventilation,
+        contracting_ventilation_model=args.contracting_ventilation_model,
+        contracting_ventilation_gain_max_per_hour_m3_s=(
+            args.contracting_ventilation_gain_max_per_hour_m3_s
+        ),
+        contracting_ventilation_gain_initial_per_hour_m3_s=(
+            args.contracting_ventilation_gain_initial_per_hour_m3_s
+        ),
+        contracting_ventilation_delta_max_c=(
+            args.contracting_ventilation_delta_max_c
+        ),
+        contracting_ventilation_capacity_factor_min=(
+            args.contracting_ventilation_capacity_factor_min
+        ),
+        contracting_ventilation_capacity_factor_max=(
+            args.contracting_ventilation_capacity_factor_max
+        ),
         contracting_additive_feedback_gain_bound=(
             args.contracting_additive_feedback_gain_bound
         ),

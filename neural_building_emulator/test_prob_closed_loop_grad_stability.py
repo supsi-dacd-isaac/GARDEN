@@ -63,7 +63,10 @@ from neural_building_emulator.train import (
     _array_tree_global_norm,
     _array_tree_max_abs,
     _physical_target_component,
+    block_average_energy_score,
     energy_score,
+    event_response_energy_score,
+    increment_energy_score,
     intervention_response_energy_score,
     predict_probabilistic_closed_loop_batch_with_aux,
     smooth_abs_power,
@@ -92,6 +95,7 @@ MODULE_NAMES = (
     "qroom_transition_net",
     "temperature_net",
     "temperature_alpha_net",
+    "colored_latent_net",
     "process_noise_net",
 )
 COMPONENT_ORDER = ("energy", "variogram", "ires", "hp_bce", "hp_active_nll")
@@ -1382,6 +1386,99 @@ class IsolatedScoringTests(unittest.TestCase):
             )
         )(predictions)
         self.assertTrue(np.isfinite(loss))
+        self.assertTrue(bool(np.all(np.isfinite(grad))))
+
+    def test_increment_energy_score_prefers_matching_signed_dynamics(self) -> None:
+        horizon = 32
+        target_time = jnp.arange(horizon, dtype=jnp.float32)
+        targets = jnp.stack(
+            [0.1 * target_time, jnp.sin(target_time / 4.0), jnp.cos(target_time / 3.0)],
+            axis=-1,
+        )[jnp.newaxis, ...]
+        perfect = jnp.broadcast_to(targets[:, jnp.newaxis, :, :], (1, 4, horizon, 3))
+        flat = jnp.zeros_like(perfect)
+        inputs = jnp.zeros((1, horizon, 8), dtype=jnp.float32)
+        kwargs = dict(
+            lags=(1, 2, 4),
+            feature_scales=jnp.ones((3, 3), dtype=jnp.float32),
+            lags_per_batch=3,
+            output_weights=(1.0, 1.0, 1.0),
+            constant_setpoint_only=True,
+            setpoint_delta_threshold=0.05,
+        )
+        perfect_loss = increment_energy_score(
+            perfect, targets, inputs, jax.random.PRNGKey(10), **kwargs
+        )
+        flat_loss = increment_energy_score(
+            flat, targets, inputs, jax.random.PRNGKey(10), **kwargs
+        )
+        self.assertLess(float(perfect_loss), float(flat_loss))
+        grad = jax.grad(
+            lambda x: increment_energy_score(
+                x, targets, inputs, jax.random.PRNGKey(10), **kwargs
+            )
+        )(flat)
+        self.assertTrue(bool(np.all(np.isfinite(grad))))
+
+    def test_event_energy_score_prefers_joint_tqp_response(self) -> None:
+        horizon = 48
+        targets = jnp.zeros((1, horizon, 3), dtype=jnp.float32)
+        targets = targets.at[:, 24:, :].set(jnp.asarray([0.5, 2.0, 3.0]))
+        perfect = jnp.broadcast_to(targets[:, jnp.newaxis, :, :], (1, 4, horizon, 3))
+        wrong = -perfect
+        inputs = jnp.zeros((1, horizon, 8), dtype=jnp.float32)
+        inputs = inputs.at[:, 24:, 0].set(1.0)
+        kwargs = dict(
+            horizon_steps=(2, 4, 8),
+            feature_scales=jnp.ones((3, 3), dtype=jnp.float32),
+            events_per_profile=2,
+            setpoint_delta_threshold=0.05,
+            output_weights=(1.0, 1.0, 1.0),
+        )
+        perfect_loss = event_response_energy_score(
+            perfect, targets, inputs, jax.random.PRNGKey(11), **kwargs
+        )
+        wrong_loss = event_response_energy_score(
+            wrong, targets, inputs, jax.random.PRNGKey(11), **kwargs
+        )
+        self.assertLess(float(perfect_loss), float(wrong_loss))
+        grad = jax.grad(
+            lambda x: event_response_energy_score(
+                x, targets, inputs, jax.random.PRNGKey(11), **kwargs
+            )
+        )(wrong)
+        self.assertTrue(bool(np.all(np.isfinite(grad))))
+
+    def test_block_energy_score_prefers_matching_low_frequency_trajectory(self) -> None:
+        horizon = 48
+        target_time = jnp.arange(horizon, dtype=jnp.float32)
+        targets = jnp.stack(
+            [
+                jnp.sin(target_time / 12.0),
+                0.1 * target_time,
+                jnp.cos(target_time / 8.0),
+            ],
+            axis=-1,
+        )[jnp.newaxis, ...]
+        perfect = jnp.broadcast_to(targets[:, jnp.newaxis, :, :], (1, 4, horizon, 3))
+        biased = perfect + jnp.asarray([0.5, -1.0, 0.75], dtype=jnp.float32)
+        kwargs = dict(
+            block_steps=(4, 12, 24),
+            horizons_per_batch=3,
+            output_weights=(1.0, 1.0, 1.0),
+        )
+        perfect_loss = block_average_energy_score(
+            perfect, targets, jax.random.PRNGKey(12), **kwargs
+        )
+        biased_loss = block_average_energy_score(
+            biased, targets, jax.random.PRNGKey(12), **kwargs
+        )
+        self.assertLess(float(perfect_loss), float(biased_loss))
+        grad = jax.grad(
+            lambda x: block_average_energy_score(
+                x, targets, jax.random.PRNGKey(12), **kwargs
+            )
+        )(biased)
         self.assertTrue(bool(np.all(np.isfinite(grad))))
 
     def test_hp_active_nll_at_sigma_floor_is_large_but_finite(self) -> None:

@@ -11,15 +11,19 @@ from typing import Any
 
 import equinox as eqx
 import jax
+import jax.numpy as jnp
 import numpy as np
 
 from .columns import (
+    DHW_VOLUME_PER_HEATED_AREA_COLUMN,
+    DHW_RECOVERY_PER_HEATED_AREA_COLUMN,
     CLOSED_LOOP_CALENDAR_COLUMNS,
     DHW_MIXED_WATER_PER_HEATED_AREA_COLUMN,
     DISTURBANCE_COLUMNS,
     INTERNAL_GAIN_PER_FLOOR_AREA_COLUMN,
     HP_FORCE_OFF_REQUESTED_COLUMN,
     OCCUPANTS_PER_FLOOR_AREA_COLUMN,
+    SH_VOLUME_PER_HEATED_AREA_COLUMN,
     SPACE_HEATING_AVAILABILITY_COLUMN,
 )
 from .models import (
@@ -301,6 +305,28 @@ def _build_model_skeleton(
     feedback_scaler_kwargs = _input_encoder_feedback_scaler_kwargs(metadata, scalers)
     switching_scaler_kwargs = _switching_dynamics_scaler_kwargs(metadata, scalers)
     input_columns = list(metadata.get("input_columns", []))
+    metadata_columns = list(metadata.get("metadata_columns", []))
+    metadata_mean = tuple(
+        float(value)
+        for value in np.asarray(scalers.metadata.mean, dtype=np.float32).reshape(-1)
+    )
+    metadata_scale = tuple(
+        float(value)
+        for value in np.asarray(scalers.metadata.scale, dtype=np.float32).reshape(-1)
+    )
+    ventilation_volume_metadata_index = (
+        metadata_columns.index("volume") if "volume" in metadata_columns else -1
+    )
+    ventilation_capacity_metadata_index = (
+        metadata_columns.index("thermal_mass_class")
+        if "thermal_mass_class" in metadata_columns
+        else -1
+    )
+    hp_buffer_volume_metadata_index = (
+        metadata_columns.index(SH_VOLUME_PER_HEATED_AREA_COLUMN)
+        if SH_VOLUME_PER_HEATED_AREA_COLUMN in metadata_columns
+        else -1
+    )
     availability_input_index = (
         input_columns.index(SPACE_HEATING_AVAILABILITY_COLUMN)
         if SPACE_HEATING_AVAILABILITY_COLUMN in input_columns
@@ -459,6 +485,43 @@ def _build_model_skeleton(
             thermal_architecture=config.get(
                 "contracting_thermal_architecture", "bounded_mlp"
             ),
+            metadata_fixed_state_update=config.get(
+                "contracting_metadata_fixed_state_update", "linear"
+            ),
+            metadata_fixed_pole_parameterization=config.get(
+                "contracting_metadata_fixed_pole_parameterization", "rho"
+            ),
+            metadata_fixed_time_constant_min_hours=float(
+                config.get("contracting_metadata_fixed_time_constant_min_hours", 0.1)
+            ),
+            metadata_fixed_time_constant_max_hours=float(
+                config.get(
+                    "contracting_metadata_fixed_time_constant_max_hours", 24.0 * 21.0
+                )
+            ),
+            causal_ventilation=bool(
+                config.get("contracting_causal_ventilation", False)
+            ),
+            ventilation_model=config.get(
+                "contracting_ventilation_model", "learned_gain"
+            ),
+            ventilation_gain_max_per_hour_m3_s=float(
+                config.get("contracting_ventilation_gain_max_per_hour_m3_s", 4.0)
+            ),
+            ventilation_gain_initial_per_hour_m3_s=float(
+                config.get("contracting_ventilation_gain_initial_per_hour_m3_s", 1.0)
+            ),
+            ventilation_delta_max_c=float(
+                config.get("contracting_ventilation_delta_max_c", 2.0)
+            ),
+            ventilation_capacity_factor_min=float(
+                config.get("contracting_ventilation_capacity_factor_min", 0.25)
+            ),
+            ventilation_capacity_factor_max=float(
+                config.get("contracting_ventilation_capacity_factor_max", 4.0)
+            ),
+            ventilation_volume_metadata_index=ventilation_volume_metadata_index,
+            ventilation_capacity_metadata_index=ventilation_capacity_metadata_index,
             additive_feedback_gain_bound=float(
                 config.get("contracting_additive_feedback_gain_bound", 1.0)
             ),
@@ -472,6 +535,8 @@ def _build_model_skeleton(
             input_scale=input_scale,
             target_mean=target_mean,
             target_scale=target_scale,
+            metadata_mean=metadata_mean,
+            metadata_scale=metadata_scale,
             availability_input_index=availability_input_index,
             hp_force_off_input_index=hp_force_off_input_index,
             bptt_truncate_steps=int(config.get("bptt_truncate_steps", 0)),
@@ -518,6 +583,36 @@ def _build_model_skeleton(
                     "prob_persistent_xi_pathways",
                     ("initial", "thermal", "q_to_t", "hp"),
                 )
+            ),
+            persistent_xi_routing=config.get(
+                "prob_persistent_xi_routing", "shared"
+            ),
+            metadata_conditioned_xi=bool(
+                config.get("prob_metadata_conditioned_xi", False)
+            ),
+            metadata_xi_mean_cap=float(
+                config.get("prob_metadata_xi_mean_cap", 1.0)
+            ),
+            metadata_xi_scale_cap=float(
+                config.get("prob_metadata_xi_scale_cap", 2.0)
+            ),
+            colored_latent_timescales_hours=tuple(
+                float(value)
+                for value in config.get(
+                    "prob_colored_latent_timescales_hours", ()
+                )
+            ),
+            colored_latent_pathways=tuple(
+                config.get(
+                    "prob_colored_latent_pathways",
+                    ("thermal", "q_to_t", "hp"),
+                )
+            ),
+            colored_latent_state_scale_cap=float(
+                config.get("prob_colored_latent_state_scale_cap", 0.02)
+            ),
+            colored_latent_xi_scale_cap=float(
+                config.get("prob_colored_latent_xi_scale_cap", 0.5)
             ),
             hidden_dim=int(config["hidden_dim"]),
             depth=int(config["depth"]),
@@ -568,6 +663,43 @@ def _build_model_skeleton(
             thermal_architecture=config.get(
                 "contracting_thermal_architecture", "bounded_mlp"
             ),
+            metadata_fixed_state_update=config.get(
+                "contracting_metadata_fixed_state_update", "linear"
+            ),
+            metadata_fixed_pole_parameterization=config.get(
+                "contracting_metadata_fixed_pole_parameterization", "rho"
+            ),
+            metadata_fixed_time_constant_min_hours=float(
+                config.get("contracting_metadata_fixed_time_constant_min_hours", 0.1)
+            ),
+            metadata_fixed_time_constant_max_hours=float(
+                config.get(
+                    "contracting_metadata_fixed_time_constant_max_hours", 24.0 * 21.0
+                )
+            ),
+            causal_ventilation=bool(
+                config.get("contracting_causal_ventilation", False)
+            ),
+            ventilation_model=config.get(
+                "contracting_ventilation_model", "learned_gain"
+            ),
+            ventilation_gain_max_per_hour_m3_s=float(
+                config.get("contracting_ventilation_gain_max_per_hour_m3_s", 4.0)
+            ),
+            ventilation_gain_initial_per_hour_m3_s=float(
+                config.get("contracting_ventilation_gain_initial_per_hour_m3_s", 1.0)
+            ),
+            ventilation_delta_max_c=float(
+                config.get("contracting_ventilation_delta_max_c", 2.0)
+            ),
+            ventilation_capacity_factor_min=float(
+                config.get("contracting_ventilation_capacity_factor_min", 0.25)
+            ),
+            ventilation_capacity_factor_max=float(
+                config.get("contracting_ventilation_capacity_factor_max", 4.0)
+            ),
+            ventilation_volume_metadata_index=ventilation_volume_metadata_index,
+            ventilation_capacity_metadata_index=ventilation_capacity_metadata_index,
             additive_feedback_gain_bound=float(
                 config.get("contracting_additive_feedback_gain_bound", 1.0)
             ),
@@ -577,10 +709,39 @@ def _build_model_skeleton(
             hp_pel_cap_w_m2=float(config.get("hp_pel_cap_w_m2", 0.0)),
             hp_qroom_cap_w_m2=float(config.get("hp_qroom_cap_w_m2", 0.0)),
             hp_energy_cap_wh_m2=float(config.get("hp_energy_cap_wh_m2", 0.0)),
+            hp_buffer_capacity_mode=config.get(
+                "hp_buffer_capacity_mode", "global"
+            ),
+            hp_buffer_delta_t_usable_init_k=float(
+                config.get("hp_buffer_delta_t_usable_init_k", 5.0)
+            ),
+            hp_buffer_delta_t_min_k=float(
+                config.get("hp_buffer_delta_t_min_k", 1.0)
+            ),
+            hp_buffer_delta_t_max_k=float(
+                config.get("hp_buffer_delta_t_max_k", 15.0)
+            ),
+            hp_buffer_water_heat_capacity_wh_m3_k=float(
+                config.get(
+                    "hp_buffer_water_heat_capacity_wh_m3_k", 1163.0
+                )
+            ),
+            hp_buffer_volume_metadata_index=hp_buffer_volume_metadata_index,
+            hp_whole_building_accounting=bool(config.get("hp_whole_building_accounting", False)),
+            dhw_recovery_enabled=bool(config.get("prob_dhw_recovery_state", False)),
+            tank_temperatures_enabled=bool(config.get("prob_tank_temperature_state", False)),
+            dhw_request_input_index=(input_columns.index(DHW_MIXED_WATER_PER_HEATED_AREA_COLUMN)
+                                     if DHW_MIXED_WATER_PER_HEATED_AREA_COLUMN in input_columns else -1),
+            dhw_volume_metadata_index=(metadata_columns.index(DHW_VOLUME_PER_HEATED_AREA_COLUMN)
+                                       if DHW_VOLUME_PER_HEATED_AREA_COLUMN in metadata_columns else -1),
+            dhw_recovery_metadata_index=(metadata_columns.index(DHW_RECOVERY_PER_HEATED_AREA_COLUMN)
+                                         if DHW_RECOVERY_PER_HEATED_AREA_COLUMN in metadata_columns else -1),
             input_mean=input_mean,
             input_scale=input_scale,
             target_mean=target_mean,
             target_scale=target_scale,
+            metadata_mean=metadata_mean,
+            metadata_scale=metadata_scale,
             availability_input_index=availability_input_index,
             hp_force_off_input_index=hp_force_off_input_index,
             bptt_truncate_steps=int(config.get("bptt_truncate_steps", 0)),
@@ -677,5 +838,49 @@ def load_training_artifact(
         metadata["train_config"] = train_config
     scalers = _load_scalers(artifact_dir / metadata["scalers_file"])
     skeleton = _build_model_skeleton(metadata, scalers)
-    model = eqx.tree_deserialise_leaves(artifact_dir / metadata["model_file"], skeleton)
+    model_path = artifact_dir / metadata["model_file"]
+    try:
+        model = eqx.tree_deserialise_leaves(model_path, skeleton)
+    except Exception as error:
+        # ``metadata_fixed_base_parameters`` was added after the original
+        # bounded-MLP contracting artifacts were written. It is unused by that
+        # architecture, but its extra leaf shifts the Equinox stream. Preserve
+        # a zero placeholder and consume only the leaves that existed then.
+        config = metadata.get("train_config", {})
+        is_legacy_bounded_mlp = (
+            hasattr(skeleton, "metadata_fixed_base_parameters")
+            and config.get("contracting_thermal_architecture", "bounded_mlp")
+            == "bounded_mlp"
+            and "contracting_thermal_architecture" not in config
+        )
+        if not is_legacy_bounded_mlp:
+            raise
+        skeleton = eqx.tree_at(
+            lambda model: model.metadata_fixed_base_parameters,
+            skeleton,
+            jnp.zeros_like(skeleton.metadata_fixed_base_parameters),
+        )
+        path_leaves, tree_def = jax.tree_util.tree_flatten_with_path(skeleton)
+
+        def keep_skeleton_leaf(file, value):
+            del file
+            return value
+
+        filter_spec = tree_def.unflatten(
+            keep_skeleton_leaf
+            if any(
+                getattr(key, "name", None) == "metadata_fixed_base_parameters"
+                for key in path
+            )
+            else eqx.default_deserialise_filter_spec
+            for path, _ in path_leaves
+        )
+        try:
+            model = eqx.tree_deserialise_leaves(
+                model_path,
+                skeleton,
+                filter_spec=filter_spec,
+            )
+        except Exception:
+            raise error
     return SavedModelArtifact(model=model, scalers=scalers, metadata=metadata)

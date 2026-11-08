@@ -55,6 +55,12 @@ fingerprint are stored in `split_manifest.json`. Every model is checked against
 that manifest. This prevents checkpoint selection, uncertainty calibration,
 and final reporting from silently sharing buildings.
 
+`resolved_recipe.json` distinguishes the requested recipe from what was
+actually evaluated. `requested_recipe` preserves config and CLI inputs, while
+`recipe` replaces each model section with the selected artifact's authoritative
+training configuration. The `artifacts` section records paths, configuration
+sources and SHA-256 hashes, checkpoints, and saved train/validation IDs.
+
 ## LightGBM And Calibration
 
 Separate metadata-only LightGBM quantile regressors are fitted for every
@@ -110,6 +116,60 @@ score distribution. All quantiles therefore come from one ordered empirical
 CDF and cannot cross. RNS changes scalar KPI distributions only; it does not
 alter annual `Tin`, `Qroom`, or `Pel` trajectories.
 
+## Persistent-Latent Variance Decomposition
+
+The optional `variance_decomposition` stage diagnoses the raw structured
+probabilistic emulator before any RNS calibration. For each held-out building,
+it crosses `S` fixed annual latent draws with `R` repeated draws of every other
+stochastic source and evaluates both regression-based and direct-F KPIs:
+
+```text
+Cov(K) = Cov_xi(E[K | xi]) + E_xi(Cov(K | xi)).
+```
+
+The implementation uses population covariance estimators, so this identity
+closes exactly for the finite balanced `S x R` design. Common fast random
+numbers are reused across annual latent draws by default to reduce Monte Carlo
+noise. Estimation is always performed per building; cross-building summaries
+are formed only after each building has been decomposed. The decomposition does
+not use the EnergyPlus KPI target and does not calibrate emulator output. Its
+companion native-calibration table uses the fixed target only to report raw PIT,
+central coverage, errors, and variance normalized by the squared target
+magnitude.
+
+Enable it on an existing benchmark without retraining or rescoring models:
+
+```bash
+caffeinate .venv/bin/python -m neural_building_emulator_refactor.calibrated_model_benchmark \
+  --output-dir output/neural_building_emulator_refactor/your_run \
+  --stages variance_decomposition \
+  --evaluate-variance-decomposition \
+  --variance-xi-draws 32 \
+  --variance-fast-rollouts 8
+```
+
+Outputs under `diagnostics/kpi_variance_decomposition/` include the nested KPI
+samples, conditional means, absolute and normalized scalar variance shares,
+native PIT/coverage, full KPI covariance decomposition, covariance/correlation
+effective-rank summaries, and an HTML dashboard. `building_diagnostics.csv`
+joins those results to conditioned latent means/scales, HP load and on-fraction,
+setpoint-event counts, equipment capacity, and recorded plus EnergyPlus-rule
+ventilation-active fractions. Use
+`--variance-max-profiles` for a smaller screening run.
+
+The diagnostic also separates the held-out standardized residual mean from its
+cross-building covariance. Residuals use the same median/IQR definition and
+calibration-cohort scale floors as RNS, but are not used to transform emulator
+samples. Their covariance is estimated with OAS shrinkage and a building-level
+bootstrap, then compared with the persistent covariance
+`Cov_xi(E[K | xi])` after applying the same per-building KPI scales. The main
+outputs are `residual_location_bias.csv`,
+`residual_xi_covariance_summary.csv`, `residual_xi_covariance_modes.csv`, and
+`residual_covariance.html`. A low persistent-latent effective rank is not by
+itself an architectural defect: it supports adding separately routed latent
+factors only when the held-out residual covariance has additional stable modes
+that the persistent covariance does not capture.
+
 ## Reported Metrics
 
 Annual autonomous rollouts report:
@@ -164,11 +224,16 @@ caffeinate .venv/bin/python -m neural_building_emulator_refactor.calibrated_mode
 All four neural arms receive both policy trajectories and retain a common
 building-level split. Annual reliability, flexibility KPIs, and LightGBM are
 evaluated on the primary randomized-setpoint dataset. The same run evaluates
-calibration and test cohorts from the force-off dataset under
-`force_off_policy/<split>/`. The sequential policy-transfer dashboard remains
-at `force_off_policy/test/force_off_policy_dashboard.html`; LightGBM does not
+the test cohort from the force-off dataset under `force_off_policy/test/`.
+Force-off evaluation is raw-only by default: it does not rerun the calibration
+cohort and does not generate the obsolete structured-ungated counterfactual.
+Pass `--no-force-off-raw-only` only for a final benchmark that needs
+residual-normalized force-off calibration; that opt-in evaluates both
+`force_off_policy/calibration/` and `force_off_policy/test/`. The sequential
+policy-transfer dashboard remains at
+`force_off_policy/test/force_off_policy_dashboard.html`; LightGBM does not
 produce time series, but its direct and regression-adjusted force-off KPI
-distributions are included in scalar-KPI calibration.
+distributions are included in scalar-KPI reporting.
 
 The benchmark selects three held-out setpoint-policy buildings and three
 different force-off-policy buildings when the test split is large enough. For
@@ -188,13 +253,28 @@ structured-versus-LSTM temporal reliability and ensemble-rank dashboards in
 `reports/setpoint_temporal_trace_calibration.html` and
 `reports/force_off_temporal_trace_calibration.html`.
 
+The standard recipes additionally enable a frozen transfer evaluation on the
+poorly excited `data/control=setpoint` dataset. It preserves the benchmark's
+calibration/test building IDs and does not refit the neural models or LightGBM.
+The target-policy calibration cohort is used only for the separately reported
+RNS rows. Results live under `poor_excitation_policy/` and include direct-F and
+regression-based parity plots, raw/RNS KPI reliability and CRPS, Tin/Qroom/Pel
+temporal calibration, Pel dynamics tables, annual signal metrics, and three
+example annual traces per probabilistic model. Disable or resize it with
+`--no-evaluate-poor-excitation`, `--poor-excitation-num-scenarios`, and
+`--poor-excitation-num-profile-plots`.
+
 The stages are independently resumable:
 
 ```bash
 .venv/bin/python -m neural_building_emulator_refactor.calibrated_model_benchmark \
   --output-dir output/neural_building_emulator_refactor/calibrated_four_model_benchmark \
-  --stages score lightgbm force_off calibrate report
+  --stages score lightgbm force_off calibrate poor_excitation report
 ```
+
+Add `--no-force-off-raw-only` when force-off RNS calibration is required.
+Otherwise the force-off stage retains every held-out test building and the
+configured scenario count while avoiding the separate calibration rollout.
 
 Use `--no-resume` to replace completed work. Existing artifacts can be supplied
 with the four `--*-artifact-dir` options. The runner still checks their split
@@ -212,6 +292,9 @@ is shown in `calibration/kpi_calibration.html`; force-off calibration is shown
 separately in `calibration/force_off_kpi_calibration.html` so unlike units are
 not mixed. Arm-specific annual plots and diagnostic HTML files remain under
 `scoring/test/<arm>/` for detailed inspection.
+The poor-excitation entry point is
+`poor_excitation_policy/reports/transfer_dashboard.html`, and its annual traces
+are also added to the benchmark-wide `reports/full_year_traces.html` index.
 
 New LSTM runs also write `artifacts/<model>/gradient_updates_*.csv` under each
 arm's training output. Each minibatch row contains the pre-clipping gradient

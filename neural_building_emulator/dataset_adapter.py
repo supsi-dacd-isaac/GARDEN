@@ -54,6 +54,8 @@ HP_EFFECTIVE_MODE_COLUMN = "hp_effective_mode"
 
 # canonical column -> (preferred entity, source column)
 _DYNAMIC_SOURCES: dict[str, tuple[str, str]] = {
+    "sh_tank_mean_temperature_c": (TECHNICAL_ROOM_ENTITY, "sh_tank_measured_temperature_c"),
+    "dhw_tank_mean_temperature_c": (TECHNICAL_ROOM_ENTITY, "dhw_tank_mean_temperature_c"),
     SH_STORAGE_CHARGE_COLUMN: (TECHNICAL_ROOM_ENTITY, SH_STORAGE_CHARGE_COLUMN),
     BUILDING_THERMAL_HEATING_POWER_COLUMN: ("*", ZONE_THERMAL_HEATING_POWER_COLUMN),
     TARGET_COLUMN: (MODELED_ZONE, "Zone Air Temperature"),

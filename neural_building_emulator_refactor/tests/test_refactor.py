@@ -6,6 +6,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+import equinox as eqx
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -26,6 +27,7 @@ from neural_building_emulator_refactor.artifacts import (
 from neural_building_emulator_refactor.config import (
     ExperimentConfig,
     LSTMConfig,
+    OptimizerConfig,
     ProbabilisticLSTMConfig,
 )
 from neural_building_emulator_refactor.deterministic_scaling_study import (
@@ -46,8 +48,13 @@ from neural_building_emulator_refactor.fair_probabilistic_lstm_comparison import
 )
 from neural_building_emulator_refactor.models import (
     AutoregressiveLSTM,
+    HurdleProbabilisticAutoregressiveLSTM,
     ProbabilisticAutoregressiveLSTM,
     VanillaProbabilisticAutoregressiveLSTM,
+)
+from neural_building_emulator_refactor.probabilistic_lstm_trainer import (
+    _make_train_step as make_probabilistic_lstm_train_step,
+    build_trajectory_energy_score_context,
 )
 from neural_building_emulator_refactor.optuna_deterministic_study import (
     ARCHITECTURE_FAMILIES,
@@ -68,6 +75,7 @@ from neural_building_emulator_refactor.train import (
     config_from_args,
     parse_args,
 )
+from neural_building_emulator_refactor.trainer import _build_optimizer
 
 
 class RegistryTests(unittest.TestCase):
@@ -85,6 +93,8 @@ class RegistryTests(unittest.TestCase):
                 "closed_loop_hp_lstm",
                 "closed_loop_hp_probabilistic_lstm",
                 "closed_loop_hp_vanilla_probabilistic_lstm",
+                "closed_loop_hp_hurdle_iid_probabilistic_lstm",
+                "closed_loop_hp_hurdle_markov_probabilistic_lstm",
             },
         )
 
@@ -130,6 +140,21 @@ class RegistryTests(unittest.TestCase):
                 "--prob-qroom-activation-model", "asymmetric_markov",
                 "--prob-hp-scenario-mode", "bernoulli",
                 "--prob-softopt-weight", "2",
+                "--prob-increment-energy-weight", "0.25",
+                "--prob-increment-energy-lags", "1", "2", "4", "8",
+                "--prob-increment-energy-lags-per-batch", "2",
+                "--prob-increment-energy-output-weights", "1", "1", "1",
+                "--prob-increment-energy-constant-setpoint-only",
+                "--prob-increment-energy-setpoint-threshold-c", "0.05",
+                "--prob-event-energy-weight", "0.5",
+                "--prob-event-energy-horizons-hours", "0.5", "1", "2", "3",
+                "--prob-event-energy-events-per-profile", "3",
+                "--prob-event-energy-output-weights", "1", "1", "1",
+                "--prob-event-energy-setpoint-threshold-c", "0.05",
+                "--prob-block-energy-weight", "0.1",
+                "--prob-block-energy-horizons-hours", "6", "24", "72",
+                "--prob-block-energy-horizons-per-batch", "1",
+                "--prob-block-energy-output-weights", "1", "1", "1",
                 "--prob-variogram-weight", "1",
                 "--prob-variogram-lags", "1", "2", "4", "8",
                 "--prob-variogram-output-weights", "1", "0", "0",
@@ -182,6 +207,21 @@ class RegistryTests(unittest.TestCase):
         self.assertTrue(config.prob_hydronic_innovation)
         self.assertEqual(config.prob_hydronic_innovation_cap_w_m2, 12.0)
         self.assertEqual(config.prob_hydronic_innovation_time_constant_hours, 1.0)
+        self.assertEqual(config.prob_increment_energy_weight, 0.25)
+        self.assertEqual(config.prob_increment_energy_lags, (1, 2, 4, 8))
+        self.assertEqual(config.prob_increment_energy_lags_per_batch, 2)
+        self.assertEqual(config.prob_event_energy_weight, 0.5)
+        self.assertEqual(config.prob_event_energy_events_per_profile, 3)
+        self.assertEqual(
+            config.prob_event_energy_horizons_hours,
+            (0.5, 1.0, 2.0, 3.0),
+        )
+        self.assertEqual(config.prob_block_energy_weight, 0.1)
+        self.assertEqual(
+            config.prob_block_energy_horizons_hours,
+            (6.0, 24.0, 72.0),
+        )
+        self.assertEqual(config.prob_block_energy_horizons_per_batch, 1)
         self.assertTrue(config.prob_variogram_constant_setpoint_only)
         self.assertTrue(config.log_update_diagnostics)
 
@@ -535,6 +575,293 @@ class LSTMTests(unittest.TestCase):
                 num_particles=4,
             )
             np.testing.assert_allclose(actual, expected)
+
+    def test_vanilla_probabilistic_lstm_three_energy_scores_smoke(self) -> None:
+        settings = ProbabilisticLSTMConfig(
+            hidden_dim=8,
+            metadata_hidden_dim=8,
+            metadata_depth=1,
+            bptt_truncate_steps=4,
+            latent_dim=2,
+            particles=3,
+            eval_particles=3,
+            plot_particles=3,
+            softopt_weight=0.0,
+            increment_energy_weight=0.25,
+            increment_energy_lags=(1, 2, 4),
+            increment_energy_lags_per_batch=2,
+            event_energy_weight=0.5,
+            event_energy_horizons_hours=(0.5, 1.0),
+            event_energy_events_per_profile=2,
+            variogram_weight=0.0,
+            setpoint_shock_timescales_hours=(),
+        )
+        config = ExperimentConfig(
+            model_name="closed_loop_hp_vanilla_probabilistic_lstm",
+            sequence_length=16,
+            optimizer=OptimizerConfig(
+                epochs=1,
+                batch_size=2,
+                learning_rate=1e-3,
+                gradient_clip_norm=1.0,
+            ),
+            probabilistic_lstm=settings,
+        )
+        model = VanillaProbabilisticAutoregressiveLSTM(
+            metadata_dim=3,
+            input_dim=4,
+            hidden_dim=8,
+            metadata_hidden_dim=8,
+            metadata_depth=1,
+            latent_dim=2,
+            process_noise_mode="heteroscedastic",
+            process_noise_init=-4.0,
+            bptt_truncate_steps=4,
+            setpoint_input_index=0,
+            input_scale=(1.0,) * 4,
+            key=jax.random.PRNGKey(31),
+        )
+        setpoint = np.asarray(
+            [0.0] * 4 + [1.0] * 4 + [-0.5] * 4 + [0.75] * 4,
+            dtype=np.float32,
+        )
+        inputs = np.zeros((2, 16, 4), dtype=np.float32)
+        inputs[0, :, 0] = setpoint
+        inputs[1, :, 0] = -setpoint
+        time = np.arange(16, dtype=np.float32)
+        targets = np.zeros((2, 16, 3), dtype=np.float32)
+        targets[:, :, 0] = 0.15 * inputs[:, :, 0] + 0.01 * time
+        targets[:, :, 1] = np.maximum(inputs[:, :, 0], 0.0) + 0.02 * time
+        targets[:, :, 2] = 0.5 * np.maximum(inputs[:, :, 0], 0.0)
+        score_context = build_trajectory_energy_score_context(
+            settings,
+            targets=targets,
+            inputs=inputs,
+            setpoint_input_scale=1.0,
+            sequence_length=16,
+        )
+        optimizer = _build_optimizer(config)
+        opt_state = optimizer.init(eqx.filter(model, eqx.is_inexact_array))
+        train_step = make_probabilistic_lstm_train_step(
+            optimizer,
+            config,
+            vanilla=True,
+            score_context=score_context,
+        )
+        metadata = jnp.zeros((2, 3), dtype=jnp.float32)
+        initial = jnp.zeros((2, 3), dtype=jnp.float32)
+        for batch_index in range(3):
+            model, opt_state, loss, components, grad_norm, accepted = train_step(
+                model,
+                opt_state,
+                metadata,
+                jnp.asarray(inputs),
+                initial,
+                jnp.asarray(targets),
+                jax.random.PRNGKey(100 + batch_index),
+            )
+            self.assertTrue(bool(jnp.isfinite(loss)))
+            self.assertTrue(bool(jnp.all(jnp.isfinite(components))))
+            self.assertGreater(float(components[1]), 0.0)
+            self.assertGreater(float(components[2]), 0.0)
+            self.assertTrue(bool(jnp.isfinite(grad_norm)))
+            self.assertTrue(bool(accepted))
+
+    def test_hurdle_lstm_modes_force_off_and_round_trip(self) -> None:
+        scalers = WindowScalers(
+            metadata=StandardScaler(
+                np.zeros(3, dtype=np.float32), np.ones(3, dtype=np.float32)
+            ),
+            inputs=StandardScaler(
+                np.zeros(5, dtype=np.float32), np.ones(5, dtype=np.float32)
+            ),
+            target=StandardScaler(
+                np.zeros(3, dtype=np.float32), np.ones(3, dtype=np.float32)
+            ),
+        )
+        metadata = jnp.zeros(3)
+        inputs = jnp.zeros((12, 5)).at[:, 3].set(1.0).at[6:, 4].set(1.0)
+        initial = jnp.zeros(3)
+
+        for offset, (model_name, activation_model) in enumerate(
+            (
+                ("closed_loop_hp_hurdle_iid_probabilistic_lstm", "iid"),
+                (
+                    "closed_loop_hp_hurdle_markov_probabilistic_lstm",
+                    "asymmetric_markov",
+                ),
+            )
+        ):
+            model = HurdleProbabilisticAutoregressiveLSTM(
+                metadata_dim=3,
+                input_dim=5,
+                hidden_dim=8,
+                metadata_hidden_dim=8,
+                metadata_depth=1,
+                latent_dim=2,
+                process_noise_mode="heteroscedastic",
+                process_noise_init=-4.0,
+                bptt_truncate_steps=4,
+                activation_model=activation_model,
+                availability_input_index=3,
+                force_off_input_index=4,
+                input_mean=(0.0,) * 5,
+                input_scale=(1.0,) * 5,
+                target_mean=(0.0,) * 3,
+                target_scale=(1.0,) * 3,
+                setpoint_input_index=0,
+                key=jax.random.PRNGKey(41 + offset),
+            )
+            key = jax.random.PRNGKey(51 + offset)
+            expected, aux = model.sample_with_aux(
+                metadata,
+                inputs,
+                initial,
+                key=key,
+                num_particles=4,
+                sample_process_noise=True,
+                hp_scenario_mode="bernoulli",
+            )
+            self.assertEqual(expected.shape, (4, 12, 3))
+            self.assertEqual(len(aux), 6)
+            self.assertTrue(bool(jnp.all(jnp.isfinite(expected))))
+            np.testing.assert_allclose(np.asarray(expected[:, 6:, 2]), 0.0)
+
+            config = ExperimentConfig(
+                model_name=model_name,
+                probabilistic_lstm=ProbabilisticLSTMConfig(
+                    hidden_dim=8,
+                    metadata_hidden_dim=8,
+                    metadata_depth=1,
+                    bptt_truncate_steps=4,
+                    latent_dim=2,
+                    particles=4,
+                    eval_particles=4,
+                    plot_particles=4,
+                    setpoint_shock_timescales_hours=(),
+                ),
+            )
+            with tempfile.TemporaryDirectory() as temporary:
+                path = Path(temporary)
+                save_probabilistic_lstm_artifact(
+                    path,
+                    model=model,
+                    scalers=scalers,
+                    spec=get_model_spec(model_name),
+                    experiment_config=config,
+                    input_columns=[
+                        "setpoint",
+                        "weather",
+                        "gains",
+                        "space_heating_available",
+                        "hp_force_off_requested",
+                    ],
+                    metadata_columns=["x", "y", "z"],
+                    target_columns=["temperature", "qroom", "pel"],
+                    selected_ids=[1, 2],
+                    train_ids=[1],
+                    test_ids=[2],
+                    checkpoint_epoch=1,
+                    checkpoint_metric_value=1.0,
+                    train_metrics={},
+                    test_metrics={},
+                )
+                loaded = load_artifact(path)
+                actual = loaded.model.sample(
+                    metadata,
+                    inputs,
+                    initial,
+                    key=key,
+                    num_particles=4,
+                    hp_scenario_mode="bernoulli",
+                )
+                np.testing.assert_allclose(actual, expected)
+
+    def test_hurdle_lstm_training_step_is_finite(self) -> None:
+        settings = ProbabilisticLSTMConfig(
+            hidden_dim=8,
+            metadata_hidden_dim=8,
+            metadata_depth=1,
+            bptt_truncate_steps=4,
+            latent_dim=2,
+            particles=3,
+            eval_particles=3,
+            plot_particles=3,
+            hp_mode_loss_weight=0.1,
+            hp_active_power_nll_weight=1.0,
+            hp_inactive_leakage_weight=0.0,
+            softopt_weight=0.0,
+            increment_energy_weight=0.0,
+            event_energy_weight=0.0,
+            variogram_weight=0.0,
+            setpoint_shock_timescales_hours=(),
+        )
+        config = ExperimentConfig(
+            model_name="closed_loop_hp_hurdle_markov_probabilistic_lstm",
+            sequence_length=16,
+            optimizer=OptimizerConfig(
+                epochs=1,
+                batch_size=2,
+                learning_rate=1e-3,
+                gradient_clip_norm=1.0,
+            ),
+            probabilistic_lstm=settings,
+        )
+        model = HurdleProbabilisticAutoregressiveLSTM(
+            metadata_dim=3,
+            input_dim=5,
+            hidden_dim=8,
+            metadata_hidden_dim=8,
+            metadata_depth=1,
+            latent_dim=2,
+            process_noise_mode="heteroscedastic",
+            process_noise_init=-4.0,
+            bptt_truncate_steps=4,
+            activation_model="asymmetric_markov",
+            availability_input_index=3,
+            force_off_input_index=4,
+            input_mean=(0.0,) * 5,
+            input_scale=(1.0,) * 5,
+            target_mean=(0.0,) * 3,
+            target_scale=(1.0,) * 3,
+            setpoint_input_index=0,
+            key=jax.random.PRNGKey(61),
+        )
+        inputs = np.zeros((2, 16, 5), dtype=np.float32)
+        inputs[:, :, 3] = 1.0
+        targets = np.zeros((2, 16, 3), dtype=np.float32)
+        targets[:, :, 0] = 0.1
+        targets[:, :, 1] = 0.2
+        targets[:, 4:10, 2] = 2.0
+        score_context = build_trajectory_energy_score_context(
+            settings,
+            targets=targets,
+            inputs=inputs,
+            setpoint_input_scale=1.0,
+            sequence_length=16,
+        )
+        optimizer = _build_optimizer(config)
+        opt_state = optimizer.init(eqx.filter(model, eqx.is_inexact_array))
+        train_step = make_probabilistic_lstm_train_step(
+            optimizer,
+            config,
+            vanilla=False,
+            score_context=score_context,
+        )
+        model, _, loss, components, grad_norm, accepted = train_step(
+            model,
+            opt_state,
+            jnp.zeros((2, 3), dtype=jnp.float32),
+            jnp.asarray(inputs),
+            jnp.zeros((2, 3), dtype=jnp.float32),
+            jnp.asarray(targets),
+            jax.random.PRNGKey(62),
+        )
+        self.assertTrue(bool(jnp.isfinite(loss)))
+        self.assertTrue(bool(jnp.all(jnp.isfinite(components))))
+        self.assertGreater(float(components[5]), 0.0)
+        self.assertTrue(bool(jnp.isfinite(grad_norm)))
+        self.assertTrue(bool(accepted))
 
 
 class FastKpiTests(unittest.TestCase):

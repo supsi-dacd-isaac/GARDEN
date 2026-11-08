@@ -90,6 +90,11 @@ def _tuple_fields(cls) -> set[str]:
         for field in fields(cls)
         if field.name
         in {
+            "increment_energy_lags",
+            "increment_energy_output_weights",
+            "event_energy_horizons_hours",
+            "event_energy_output_weights",
+            "flex_kpi_crps_horizons_hours",
             "variogram_lags",
             "variogram_output_weights",
             "setpoint_shock_timescales_hours",
@@ -140,6 +145,7 @@ def _experiment_configs(
         stride=int(recipe["stride"]),
         rotate_window_starts=bool(recipe["rotate_window_starts"]),
         hp_power_area_normalization=str(recipe["hp_power_area_normalization"]),
+        hp_dhw_metadata=bool(recipe.get("hp_dhw_metadata", False)),
         optimizer=OptimizerConfig(**optimizer_values),
     )
     deterministic_structured = ExperimentConfig(

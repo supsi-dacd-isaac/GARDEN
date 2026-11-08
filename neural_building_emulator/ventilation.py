@@ -1,4 +1,11 @@
-"""EnergyPlus-compatible natural-window ventilation for autonomous rollouts."""
+"""Autonomous replay of the dataset's EnergyPlus window-ventilation controller.
+
+The entity datasets were generated with ``ZoneVentilation:DesignFlowRate``.
+Their retained simulation metadata records a nominal 2.5 ACH flow and seasonal
+indoor-temperature offsets. This is deliberately separate from the older
+``ZoneVentilation:WindandStackOpenArea`` Jinja template still present elsewhere
+in the repository.
+"""
 
 from __future__ import annotations
 
@@ -84,11 +91,11 @@ def build_eplus_ventilation_schedule(
     no_heating_season_offset_c: float = DEFAULT_NO_HEATING_SEASON_OFFSET_C,
     minimum_indoor_outdoor_delta_c: float = DEFAULT_MINIMUM_INDOOR_OUTDOOR_DELTA_C,
 ) -> EPlusVentilationSchedule:
-    """Build the non-state-dependent inputs of the idf-builder ventilation rule.
+    """Build the non-state-dependent inputs of the dataset ventilation rule.
 
-    The IDF schedule is available overnight. Against the interval timestamps in
-    the exported data, ``time < 08:00 or time >= 20:00`` reproduces its boundary
-    convention: 08:00 is off and 20:00 is on.
+    The generated DesignFlowRate controller is available overnight. Against the
+    interval timestamps in the exported data, ``time < 08:00 or time >= 20:00``
+    reproduces its boundary convention: 08:00 is off and 20:00 is on.
     """
 
     if nominal_ach <= 0.0:

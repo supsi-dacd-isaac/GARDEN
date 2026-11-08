@@ -3,12 +3,14 @@
 The command freezes one building-level train/validation/calibration/test split,
 trains four matched models, scores autonomous annual rollouts, fits metadata-only
 LightGBM models for both flexibility KPIs, calibrates scalar KPI distributions,
-and writes one consolidated report. Expensive stages are resumable.
+optionally decomposes annual KPI uncertainty into persistent-latent and fast
+components, and writes one consolidated report. Expensive stages are resumable.
 """
 
 from __future__ import annotations
 
 import argparse
+import copy
 import hashlib
 import json
 import time
@@ -37,7 +39,7 @@ from neural_building_emulator.columns import (
 from neural_building_emulator.data import read_dataset_frame
 from neural_building_emulator.flexibility_event_study_kpis import EventStudyConfig
 
-from .artifacts import json_safe, load_artifact
+from .artifacts import LoadedArtifact, json_safe, load_artifact
 from .fair_probabilistic_lstm_comparison import (
     _check_matching_models,
     _check_matching_splits,
@@ -55,7 +57,13 @@ from .metadata_flexibility_lightgbm import (
     extract_metadata_kpis,
     regression_metrics,
 )
-from .probabilistic_calibration import calibrate_distribution_table
+from .probabilistic_calibration import (
+    GROUP_COLUMNS,
+    calibrate_distribution_table,
+    ecc_reorder,
+    summarize_joint_distribution_tables,
+    summarize_distributions,
+)
 from .profiles import load_profiles, saved_profile_ids
 from .scoring import score_artifact
 from .trainer import train
@@ -77,9 +85,11 @@ STAGES = (
     "split",
     "train",
     "score",
+    "variance_decomposition",
     "lightgbm",
     "force_off",
     "calibrate",
+    "poor_excitation",
     "report",
 )
 MODEL_COLORS = {
@@ -388,6 +398,110 @@ def _load_artifact_paths(args: argparse.Namespace) -> dict[str, Path]:
     return {arm: Path(values[arm]) for arm in ARM_ORDER}
 
 
+def _artifact_training_configuration(
+    artifact: LoadedArtifact,
+) -> tuple[dict[str, Any], str]:
+    """Return the configuration that actually produced a selected artifact."""
+    if artifact.backend == "legacy":
+        if artifact.legacy_artifact is not None:
+            train_config = artifact.legacy_artifact.metadata.get("train_config")
+            if isinstance(train_config, dict):
+                return copy.deepcopy(train_config), "legacy_metadata.train_config"
+        legacy_metadata = artifact.metadata.get("legacy_metadata", {})
+        if isinstance(legacy_metadata, dict):
+            train_config = legacy_metadata.get("train_config")
+            if isinstance(train_config, dict):
+                return copy.deepcopy(train_config), "manifest.legacy_metadata.train_config"
+        experiment = artifact.metadata.get("experiment_config", {})
+        if isinstance(experiment, dict):
+            overrides = experiment.get("legacy_overrides")
+            if isinstance(overrides, dict):
+                return copy.deepcopy(overrides), "manifest.experiment_config.legacy_overrides"
+    else:
+        key = "probabilistic_lstm_config" if artifact.spec.probabilistic else "lstm_config"
+        values = artifact.metadata.get(key)
+        if isinstance(values, dict):
+            return copy.deepcopy(values), f"manifest.{key}"
+    raise ValueError(
+        f"Artifact {artifact.artifact_dir} does not contain an authoritative "
+        "training configuration"
+    )
+
+
+def _resolved_recipe_payload(
+    *,
+    source: Path,
+    requested_recipe: dict[str, Any],
+    split: BenchmarkSplit,
+    artifact_dirs: dict[str, Path] | None,
+) -> dict[str, Any]:
+    """Build a resolved recipe whose model sections match selected artifacts."""
+    effective_recipe = copy.deepcopy(requested_recipe)
+    provenance: dict[str, dict[str, Any]] = {}
+    if artifact_dirs is not None:
+        for arm in ARM_ORDER:
+            artifact = load_artifact(artifact_dirs[arm])
+            configuration, configuration_source = _artifact_training_configuration(
+                artifact
+            )
+            safe_configuration = json_safe(configuration)
+            effective_recipe[arm] = safe_configuration
+            saved_metadata = (
+                artifact.legacy_artifact.metadata
+                if artifact.legacy_artifact is not None
+                else artifact.metadata
+            )
+            canonical = json.dumps(
+                safe_configuration,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+            provenance[arm] = {
+                "artifact_dir": str(artifact.artifact_dir.resolve()),
+                "backend": artifact.backend,
+                "model_name": artifact.spec.name,
+                "configuration_source": configuration_source,
+                "configuration_sha256": hashlib.sha256(canonical).hexdigest(),
+                "checkpoint_epoch": saved_metadata.get("checkpoint_epoch"),
+                "checkpoint_metric": saved_metadata.get("checkpoint_metric"),
+                "checkpoint_metric_value": saved_metadata.get(
+                    "checkpoint_metric_value"
+                ),
+                "train_ids": saved_metadata.get("train_ids", []),
+                "validation_ids": saved_metadata.get("test_ids", []),
+            }
+    return {
+        "source": str(source),
+        "resolution_status": (
+            "artifact_configs_authoritative"
+            if artifact_dirs is not None
+            else "requested_only_no_artifacts"
+        ),
+        "requested_recipe": requested_recipe,
+        "recipe": effective_recipe,
+        "artifacts": provenance,
+        "split": asdict(split),
+    }
+
+
+def _write_resolved_recipe(
+    path: Path,
+    *,
+    source: Path,
+    requested_recipe: dict[str, Any],
+    split: BenchmarkSplit,
+    artifact_dirs: dict[str, Path] | None,
+) -> dict[str, Any]:
+    payload = _resolved_recipe_payload(
+        source=source,
+        requested_recipe=requested_recipe,
+        split=split,
+        artifact_dirs=artifact_dirs,
+    )
+    path.write_text(json.dumps(json_safe(payload), indent=2, sort_keys=True) + "\n")
+    return payload["recipe"]
+
+
 def _score_models(
     args: argparse.Namespace,
     recipe: dict[str, Any],
@@ -475,7 +589,7 @@ def _score_models(
 
 
 def _force_off_dataset_path(recipe: dict[str, Any]) -> Path | None:
-    configured = recipe.get("force_off_evaluation", {}).get("dataset_path")
+    configured = (recipe.get("force_off_evaluation") or {}).get("dataset_path")
     if configured:
         return Path(configured)
     for value in recipe.get("additional_dataset_paths", ()):
@@ -483,6 +597,11 @@ def _force_off_dataset_path(recipe: dict[str, Any]) -> Path | None:
         if "force_off" in path.name.lower() or "force_off" in str(path).lower():
             return path
     return None
+
+
+def _force_off_raw_only(recipe: dict[str, Any]) -> bool:
+    """Use test-only force-off scoring unless calibration is explicitly requested."""
+    return bool((recipe.get("force_off_evaluation") or {}).get("raw_only", True))
 
 
 def _score_force_off_policy(
@@ -496,17 +615,23 @@ def _score_force_off_policy(
         print("benchmark_force_off=skipped reason=no_force_off_dataset")
         return
     evaluation = recipe["evaluation"]
-    force_off_config = recipe.get("force_off_evaluation", {})
+    force_off_config = recipe.get("force_off_evaluation") or {}
+    raw_only = _force_off_raw_only(recipe)
     profile_plot_count = int(evaluation.get("num_policy_profile_plots", 3))
     force_off_plot_ids = _policy_profile_ids(
         split.test_ids,
         policy="force_off",
         count=profile_plot_count,
     )
-    for split_name, profile_ids in (
-        ("calibration", split.calibration_ids),
-        ("test", split.test_ids),
-    ):
+    destinations = (
+        (("test", split.test_ids),)
+        if raw_only
+        else (
+            ("calibration", split.calibration_ids),
+            ("test", split.test_ids),
+        )
+    )
+    for split_name, profile_ids in destinations:
         output_dir = args.output_dir / "force_off_policy" / split_name
         request = {
             "dataset_path": str(dataset_path.resolve()),
@@ -521,6 +646,8 @@ def _score_force_off_policy(
                 recipe["probabilistic_structured"].get("prob_eval_particles", 16)
             ),
             "num_scenarios": int(evaluation["num_scenarios"]),
+            "raw_only": raw_only,
+            "evaluate_ungated": False,
             "hp_scenario_mode": str(
                 force_off_config.get("hp_scenario_mode", "bernoulli")
             ),
@@ -568,6 +695,7 @@ def _score_force_off_policy(
             kpi_min_events=request["kpi_min_events"],
             num_profile_plots=request["num_profile_plots"],
             profile_plot_ids=request.get("profile_plot_ids"),
+            evaluate_ungated=False,
             seed=request["seed"],
         )
         request_path.write_text(json.dumps(request, indent=2, sort_keys=True) + "\n")
@@ -695,16 +823,17 @@ def _force_off_metadata_target_table(
         *split.calibration_ids,
         *split.test_ids,
     )
-    profiles = load_profiles(
-        artifact,
-        dataset_path=dataset_path,
-        profile_ids=profile_ids,
-    )
-    force_off_by_id = _force_off_policy_traces(
-        dataset_path,
-        profiles,
-        HP_FORCE_OFF_REQUESTED_COLUMN,
-    )
+    def profile_batches():
+        for start in range(0, len(profile_ids), 16):
+            profiles = load_profiles(
+                artifact, dataset_path=dataset_path, profile_ids=profile_ids[start:start + 16],
+            )
+            force_off_by_id = _force_off_policy_traces(
+                dataset_path, profiles, HP_FORCE_OFF_REQUESTED_COLUMN,
+            )
+            for profile in profiles:
+                yield profile, force_off_by_id[profile.profile_id]
+
     availability_index = input_columns.index(SPACE_HEATING_AVAILABILITY_COLUMN)
     split_lookup = {
         **{value: "train" for value in split.train_ids},
@@ -713,7 +842,7 @@ def _force_off_metadata_target_table(
         **{value: "test" for value in split.test_ids},
     }
     rows: list[dict[str, Any]] = []
-    for profile in profiles:
+    for profile, force_off in profile_batches():
         row: dict[str, Any] = {
             "profile_id": int(profile.profile_id),
             "split": split_lookup[int(profile.profile_id)],
@@ -725,7 +854,7 @@ def _force_off_metadata_target_table(
         curve = estimate_force_off_flexibility_curve(
             profile,
             profile.targets,
-            force_off_by_id[profile.profile_id],
+            force_off,
             profile.inputs[:, availability_index] > np.float32(0.5),
             input_columns=input_columns,
             horizons_hours=horizons,
@@ -1094,6 +1223,124 @@ def _fit_force_off_lightgbm(
         request_path.write_text(json.dumps(request, indent=2, sort_keys=True) + "\n")
 
 
+def _evaluate_poor_excitation(
+    args: argparse.Namespace,
+    recipe: dict[str, Any],
+) -> Path | None:
+    config = recipe.get("poor_excitation_evaluation", {}) or {}
+    if not bool(config.get("enabled", False)):
+        print("benchmark_poor_excitation=disabled")
+        return None
+    dataset = Path(config.get("dataset_path", "data/control=setpoint"))
+    output_subdir = str(config.get("output_subdir", "poor_excitation_policy"))
+    from .kpi_policy_transfer import run as run_policy_transfer
+
+    transfer_args = argparse.Namespace(
+        benchmark_dir=args.output_dir,
+        dataset=dataset,
+        output_dir=args.output_dir / output_subdir,
+        num_scenarios=int(
+            config.get("num_scenarios", recipe["evaluation"]["num_scenarios"])
+        ),
+        num_profile_plots=int(
+            config.get(
+                "num_profile_plots",
+                recipe["evaluation"].get("num_policy_profile_plots", 3),
+            )
+        ),
+        stages=("all",),
+        resume=args.resume,
+    )
+    report = run_policy_transfer(transfer_args)
+    print(f"benchmark_poor_excitation_report={report}")
+    return report
+
+
+def _evaluate_kpi_variance_decomposition(
+    args: argparse.Namespace,
+    recipe: dict[str, Any],
+    split: BenchmarkSplit,
+    artifact_dirs: dict[str, Path],
+) -> Path | None:
+    config = recipe.get("variance_decomposition", {}) or {}
+    if not bool(config.get("enabled", False)):
+        print("benchmark_variance_decomposition=disabled")
+        return None
+    output_subdir = str(
+        config.get("output_subdir", "diagnostics/kpi_variance_decomposition")
+    )
+    output_dir = args.output_dir / output_subdir
+    dashboard = output_dir / "variance_decomposition.html"
+    required_outputs = (
+        output_dir / "summary.json",
+        dashboard,
+        output_dir / "residual_covariance.html",
+        output_dir / "building_diagnostics.csv",
+        output_dir / "native_calibration.csv",
+        output_dir / "native_calibration_summary.csv",
+        output_dir / "covariance_spectrum.csv",
+        output_dir / "covariance_spectrum_summary.csv",
+        output_dir / "residual_xi_covariance_summary.csv",
+    )
+    if args.resume and all(path.exists() for path in required_outputs):
+        print(f"benchmark_variance_decomposition=resumed path={dashboard}")
+        return dashboard
+
+    from .kpi_variance_decomposition import run as run_variance_decomposition
+
+    evaluation = recipe["evaluation"]
+    diagnostic_args = argparse.Namespace(
+        artifact_dir=artifact_dirs["probabilistic_structured"],
+        dataset=Path(recipe["dataset_path"]),
+        output_dir=output_dir,
+        profile_source="test",
+        profile_ids=tuple(int(value) for value in split.test_ids),
+        max_profiles=config.get("max_profiles"),
+        xi_draws=int(config.get("xi_draws", 32)),
+        fast_rollouts=int(config.get("fast_rollouts", 8)),
+        common_random_numbers=bool(config.get("common_random_numbers", True)),
+        write_samples=bool(config.get("write_samples", True)),
+        resume=bool(args.resume),
+        hp_scenario_mode=str(config.get("hp_scenario_mode", "bernoulli")),
+        ventilation_rollout_mode=str(
+            config.get(
+                "ventilation_rollout_mode",
+                evaluation.get("ventilation_rollout_mode", "eplus_rule"),
+            )
+        ),
+        horizons_hours=tuple(
+            float(value)
+            for value in config.get(
+                "horizons_hours",
+                evaluation.get("horizons_hours", (0.5, 1.0, 2.0, 3.0)),
+            )
+        ),
+        dt_hours=float(config.get("dt_hours", evaluation.get("dt_hours", 0.25))),
+        min_setpoint_change=float(
+            config.get(
+                "min_setpoint_change",
+                evaluation.get("min_setpoint_change", 0.05),
+            )
+        ),
+        min_events=int(config.get("min_events", evaluation.get("min_events", 20))),
+        controls=str(config.get("controls", evaluation.get("controls", "full"))),
+        scale_reference_dir=(
+            args.output_dir / "scoring" / "calibration" / "probabilistic_structured"
+        ),
+        minimum_scale=float(recipe["calibration"]["minimum_scale"]),
+        minimum_scale_fraction=float(
+            recipe["calibration"]["minimum_scale_fraction"]
+        ),
+        residual_bootstrap_samples=int(
+            config.get("residual_bootstrap_samples", 2000)
+        ),
+        seed=int(config.get("seed", recipe["seed"])),
+    )
+    report = run_variance_decomposition(diagnostic_args)
+    print(f"benchmark_variance_decomposition_report={report}")
+    return report
+
+
 def _boolean(values: pd.Series) -> pd.Series:
     if values.dtype == bool:
         return values
@@ -1168,9 +1415,36 @@ def _force_off_emulator_distribution(
     return values
 
 
+def _summarize_raw_distribution_table(
+    frame: pd.DataFrame,
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    metric_rows: list[dict[str, Any]] = []
+    reliability_rows: list[dict[str, Any]] = []
+    building_rows: list[dict[str, Any]] = []
+    for key, group in frame.groupby(
+        list(GROUP_COLUMNS), dropna=False, sort=False
+    ):
+        normalized_key = key if isinstance(key, tuple) else (key,)
+        labels = dict(zip(GROUP_COLUMNS, normalized_key))
+        metrics, reliability, buildings = summarize_distributions(group)
+        metric_rows.append({**labels, "calibration": "raw", **metrics})
+        reliability_rows.extend(
+            {**labels, "calibration": "raw", **row} for row in reliability
+        )
+        building_rows.extend(
+            {**labels, "calibration": "raw", **row} for row in buildings
+        )
+    return (
+        pd.DataFrame(metric_rows),
+        pd.DataFrame(reliability_rows),
+        pd.DataFrame(building_rows),
+    )
+
+
 def _calibrate(args: argparse.Namespace, recipe: dict[str, Any]) -> None:
     calibration_frames: list[pd.DataFrame] = []
     test_frames: list[pd.DataFrame] = []
+    raw_only_force_off_frames: list[pd.DataFrame] = []
     for kpi_kind in KPI_KINDS:
         calibration_frames.append(
             pd.read_csv(args.output_dir / "lightgbm" / kpi_kind / "distribution_calibration.csv")
@@ -1198,81 +1472,118 @@ def _calibrate(args: argparse.Namespace, recipe: dict[str, Any]) -> None:
             "calibration": args.output_dir / "force_off_policy" / "calibration",
             "test": args.output_dir / "force_off_policy" / "test",
         }
+        raw_only = _force_off_raw_only(recipe)
+        required_splits = ("test",) if raw_only else ("calibration", "test")
         missing = [
-            str(directory)
-            for directory in force_off_directories.values()
-            if not (directory / "force_off_flexibility_kpi_scenarios.csv").exists()
+            str(force_off_directories[split_name])
+            for split_name in required_splits
+            if not (
+                force_off_directories[split_name]
+                / "force_off_flexibility_kpi_scenarios.csv"
+            ).exists()
         ]
         if missing:
             raise FileNotFoundError(
-                "Force-off calibration requires policy scoring first. Missing: "
+                "Force-off scoring is required before calibration/reporting. Missing: "
                 + ", ".join(missing)
             )
         for estimator, kpi_kind in (
             ("direct_ratio", "force_off_f"),
             ("regression", "force_off_regression"),
         ):
-            calibration_frames.append(
-                pd.read_csv(
-                    args.output_dir
-                    / "lightgbm"
-                    / kpi_kind
-                    / "distribution_calibration.csv"
-                )
+            lightgbm_calibration = pd.read_csv(
+                args.output_dir
+                / "lightgbm"
+                / kpi_kind
+                / "distribution_calibration.csv"
             )
-            test_frames.append(
-                pd.read_csv(
-                    args.output_dir
-                    / "lightgbm"
-                    / kpi_kind
-                    / "distribution_test.csv"
-                )
+            lightgbm_test = pd.read_csv(
+                args.output_dir
+                / "lightgbm"
+                / kpi_kind
+                / "distribution_test.csv"
             )
+            if raw_only:
+                raw_only_force_off_frames.append(lightgbm_test)
+            else:
+                calibration_frames.append(lightgbm_calibration)
+                test_frames.append(lightgbm_test)
             for method, source_model in (
                 ("probabilistic_structured", "structured_gated"),
                 ("probabilistic_lstm", "unstructured"),
             ):
-                calibration_frames.append(
-                    _force_off_emulator_distribution(
-                        force_off_directories["calibration"],
-                        method=method,
-                        source_model=source_model,
-                        estimator=estimator,
-                        kpi_kind=kpi_kind,
-                    )
+                test_distribution = _force_off_emulator_distribution(
+                    force_off_directories["test"],
+                    method=method,
+                    source_model=source_model,
+                    estimator=estimator,
+                    kpi_kind=kpi_kind,
                 )
-                test_frames.append(
-                    _force_off_emulator_distribution(
-                        force_off_directories["test"],
-                        method=method,
-                        source_model=source_model,
-                        estimator=estimator,
-                        kpi_kind=kpi_kind,
+                if raw_only:
+                    raw_only_force_off_frames.append(test_distribution)
+                else:
+                    calibration_frames.append(
+                        _force_off_emulator_distribution(
+                            force_off_directories["calibration"],
+                            method=method,
+                            source_model=source_model,
+                            estimator=estimator,
+                            kpi_kind=kpi_kind,
+                        )
                     )
-                )
+                    test_frames.append(test_distribution)
     calibration = pd.concat(calibration_frames, ignore_index=True)
-    test = pd.concat(test_frames, ignore_index=True)
+    test = pd.concat([*test_frames, *raw_only_force_off_frames], ignore_index=True)
     destination = args.output_dir / "calibration"
     destination.mkdir(parents=True, exist_ok=True)
     calibration.to_csv(destination / "raw_calibration_distributions.csv", index=False)
     test.to_csv(destination / "raw_test_distributions.csv", index=False)
+    calibratable_test = pd.concat(test_frames, ignore_index=True)
     calibrated, metrics, reliability, buildings = calibrate_distribution_table(
         calibration,
-        test,
+        calibratable_test,
         minimum_scale=float(recipe["calibration"]["minimum_scale"]),
         minimum_scale_fraction=float(recipe["calibration"]["minimum_scale_fraction"]),
     )
+    ecc = ecc_reorder(calibratable_test, calibrated)
+    rns_metrics = metrics[metrics["calibration"].eq("rns")].copy()
+    rns_metrics["calibration"] = "rns_ecc"
+    rns_reliability = reliability[reliability["calibration"].eq("rns")].copy()
+    rns_reliability["calibration"] = "rns_ecc"
+    rns_buildings = buildings[buildings["calibration"].eq("rns")].copy()
+    rns_buildings["calibration"] = "rns_ecc"
+    metrics = pd.concat([metrics, rns_metrics], ignore_index=True)
+    reliability = pd.concat([reliability, rns_reliability], ignore_index=True)
+    buildings = pd.concat([buildings, rns_buildings], ignore_index=True)
+    joint_metrics = summarize_joint_distribution_tables(
+        calibration,
+        {"raw": calibratable_test, "rns": calibrated, "rns_ecc": ecc},
+        kpi_kinds=KPI_KINDS,
+    )
+    if raw_only_force_off_frames:
+        raw_metrics, raw_reliability, raw_buildings = (
+            _summarize_raw_distribution_table(
+                pd.concat(raw_only_force_off_frames, ignore_index=True)
+            )
+        )
+        metrics = pd.concat([metrics, raw_metrics], ignore_index=True)
+        reliability = pd.concat(
+            [reliability, raw_reliability], ignore_index=True
+        )
+        buildings = pd.concat([buildings, raw_buildings], ignore_index=True)
     calibrated.to_csv(destination / "rns_test_distributions.csv", index=False)
+    ecc.to_csv(destination / "rns_ecc_test_distributions.csv", index=False)
     metrics.to_csv(destination / "distribution_metrics.csv", index=False)
     reliability.to_csv(destination / "distribution_reliability.csv", index=False)
     buildings.to_csv(destination / "distribution_by_building.csv", index=False)
+    joint_metrics.to_csv(destination / "joint_distribution_metrics.csv", index=False)
     _write_calibration_dashboard(
         destination / "kpi_calibration.html",
         metrics[metrics["kpi_kind"].isin(KPI_KINDS)],
         reliability[reliability["kpi_kind"].isin(KPI_KINDS)],
         kpi_kinds=("f", "regression_based"),
         subplot_titles=("Direct F reliability", "Regression-based reliability"),
-        title="Raw and residual-normalized setpoint-flexibility calibration",
+        title="Raw, RNS, and RNS-ECC setpoint-flexibility calibration",
         unit="Wh/(m2 K)",
     )
     force_metrics = metrics[metrics["kpi_kind"].isin(FORCE_OFF_KPI_KINDS)]
@@ -1360,6 +1671,47 @@ def _write_calibration_dashboard(
         hoverlabel={"namelength": -1, "align": "left"},
     )
     figure.write_html(path)
+
+
+def _flexibility_calibration_summary(distribution: pd.DataFrame) -> pd.DataFrame:
+    """Macro-average calibration metrics over direction and response horizon."""
+    selected = distribution[distribution["kpi_kind"].isin(KPI_KINDS)].copy()
+    if selected.empty:
+        return pd.DataFrame()
+    metrics = ("calibration_mae", "crps", "coverage_90", "width_90")
+    grouped = (
+        selected.groupby(
+            ["method", "calibration", "kpi_kind"],
+            as_index=False,
+            sort=False,
+        )[list(metrics)]
+        .mean()
+    )
+    rows: list[dict[str, Any]] = []
+    method_order = (*PROBABILISTIC_ARMS, "lightgbm")
+    calibration_order = ("raw", "rns", "rns_ecc")
+    for method in method_order:
+        for calibration in calibration_order:
+            part = grouped[
+                grouped["method"].eq(method)
+                & grouped["calibration"].eq(calibration)
+            ]
+            if part.empty:
+                continue
+            row: dict[str, Any] = {
+                "method": method,
+                "calibration": calibration,
+            }
+            for kpi_kind in KPI_KINDS:
+                kpi_part = part[part["kpi_kind"].eq(kpi_kind)]
+                for metric in metrics:
+                    row[f"{kpi_kind}_{metric}"] = (
+                        float(kpi_part.iloc[0][metric])
+                        if not kpi_part.empty
+                        else np.nan
+                    )
+            rows.append(row)
+    return pd.DataFrame(rows)
 
 
 def _point_flexibility_metrics(
@@ -1884,7 +2236,149 @@ def _write_full_year_trace_index(
     )
 
 
-def _collect_reports(args: argparse.Namespace, artifact_dirs: dict[str, Path]) -> None:
+def _write_flexibility_point_scatter(
+    path: Path,
+    buildings: pd.DataFrame,
+    *,
+    kpi_kind: str,
+) -> bool:
+    """Write held-out EnergyPlus-versus-model KPI parity plots."""
+    methods = ("lightgbm", "probabilistic_lstm", "probabilistic_structured")
+    labels = {
+        "lightgbm": "LightGBM",
+        "probabilistic_lstm": "Unstructured LSTM",
+        "probabilistic_structured": "Structured",
+    }
+    titles = {
+        "f": "Direct F",
+        "regression_based": "Regression-based flexibility",
+    }
+    frame = buildings[
+        buildings["calibration"].eq("raw")
+        & buildings["kpi_kind"].eq(kpi_kind)
+        & buildings["method"].isin(methods)
+    ].copy()
+    if frame.empty:
+        return False
+    horizons = sorted(float(value) for value in frame["horizon_hours"].unique())
+    figure = make_subplots(
+        rows=len(horizons),
+        cols=2,
+        subplot_titles=[
+            f"{direction.title()}, {horizon:g} h"
+            for horizon in horizons
+            for direction in ("up", "down")
+        ],
+        horizontal_spacing=0.08,
+        vertical_spacing=max(0.04, 0.12 / max(len(horizons), 1)),
+    )
+    for row, horizon in enumerate(horizons, start=1):
+        for col, direction in enumerate(("up", "down"), start=1):
+            panel = frame[
+                np.isclose(frame["horizon_hours"], horizon)
+                & frame["direction"].eq(direction)
+            ]
+            finite = np.concatenate(
+                [
+                    panel["truth"].to_numpy(float),
+                    panel["mean"].to_numpy(float),
+                ]
+            )
+            finite = finite[np.isfinite(finite)]
+            if not len(finite):
+                continue
+            low = float(np.min(finite))
+            high = float(np.max(finite))
+            span = max(high - low, 1e-6)
+            bounds = [low - 0.04 * span, high + 0.04 * span]
+            figure.add_trace(
+                go.Scatter(
+                    x=bounds,
+                    y=bounds,
+                    mode="lines",
+                    line={"color": "#202124", "dash": "dash", "width": 1},
+                    name="Ideal",
+                    legendgroup="ideal",
+                    showlegend=row == 1 and col == 1,
+                    hoverinfo="skip",
+                ),
+                row=row,
+                col=col,
+            )
+            for method in methods:
+                values = panel[panel["method"].eq(method)].sort_values("profile_id")
+                if values.empty:
+                    continue
+                figure.add_trace(
+                    go.Scattergl(
+                        x=values["truth"],
+                        y=values["mean"],
+                        mode="markers",
+                        marker={
+                            "color": MODEL_COLORS[method],
+                            "opacity": 0.68,
+                            "size": 7,
+                        },
+                        customdata=np.asarray(
+                            list(
+                                zip(
+                                    values["profile_id"].astype(str),
+                                    (values["mean"] - values["truth"]).astype(float),
+                                )
+                            ),
+                            dtype=object,
+                        ),
+                        hovertemplate=(
+                            f"<b>{labels[method]}</b><br>"
+                            "profile=%{customdata[0]}<br>"
+                            "EnergyPlus=%{x:.3f}<br>"
+                            "prediction=%{y:.3f}<br>"
+                            "error=%{customdata[1]:.3f}<extra></extra>"
+                        ),
+                        name=labels[method],
+                        legendgroup=method,
+                        showlegend=row == 1 and col == 1,
+                    ),
+                    row=row,
+                    col=col,
+                )
+            figure.update_xaxes(
+                title_text="EnergyPlus [Wh/(m2 K)]",
+                range=bounds,
+                row=row,
+                col=col,
+            )
+            figure.update_yaxes(
+                title_text="Prediction [Wh/(m2 K)]",
+                range=bounds,
+                row=row,
+                col=col,
+            )
+    figure.update_layout(
+        title=(
+            f"{titles.get(kpi_kind, kpi_kind)}: held-out building point predictions"
+        ),
+        template="plotly_white",
+        height=max(720, 370 * len(horizons)),
+        width=1450,
+        legend={
+            "orientation": "h",
+            "yanchor": "bottom",
+            "y": 1.01,
+            "xanchor": "right",
+            "x": 1.0,
+        },
+        hoverlabel={"namelength": -1, "align": "left"},
+    )
+    figure.write_html(path)
+    return True
+
+
+def _collect_reports(
+    args: argparse.Namespace,
+    artifact_dirs: dict[str, Path],
+    recipe: dict[str, Any],
+) -> None:
     report_dir = args.output_dir / "reports"
     report_dir.mkdir(parents=True, exist_ok=True)
     training_times_path = args.output_dir / "training_times.json"
@@ -1966,10 +2460,22 @@ def _collect_reports(args: argparse.Namespace, artifact_dirs: dict[str, Path]) -
     temporal = pd.concat(temporal_frames, ignore_index=True) if temporal_frames else pd.DataFrame()
     flexibility = pd.DataFrame(flexibility_rows)
     distribution = pd.read_csv(args.output_dir / "calibration" / "distribution_metrics.csv")
+    joint_distribution = pd.read_csv(
+        args.output_dir / "calibration" / "joint_distribution_metrics.csv"
+    )
     reliability = pd.read_csv(args.output_dir / "calibration" / "distribution_reliability.csv")
     distribution_buildings = pd.read_csv(
         args.output_dir / "calibration" / "distribution_by_building.csv"
     )
+    point_scatter_paths: dict[str, str] = {}
+    for kpi_kind in KPI_KINDS:
+        filename = f"flexibility_point_scatter_{kpi_kind}.html"
+        if _write_flexibility_point_scatter(
+            report_dir / filename,
+            distribution_buildings,
+            kpi_kind=kpi_kind,
+        ):
+            point_scatter_paths[kpi_kind] = filename
     lightgbm_point = distribution[
         distribution["method"].eq("lightgbm")
         & distribution["calibration"].eq("raw")
@@ -2057,7 +2563,15 @@ def _collect_reports(args: argparse.Namespace, artifact_dirs: dict[str, Path]) -
         paired,
     )
     distribution.to_csv(report_dir / "flexibility_distribution_metrics.csv", index=False)
+    joint_distribution.to_csv(
+        report_dir / "flexibility_joint_distribution_metrics.csv", index=False
+    )
     reliability.to_csv(report_dir / "flexibility_distribution_reliability.csv", index=False)
+    calibration_summary = _flexibility_calibration_summary(distribution)
+    calibration_summary.to_csv(
+        report_dir / "flexibility_calibration_summary.csv",
+        index=False,
+    )
     intervention_point, intervention_scenarios = _unified_intervention_tables(
         args,
         artifact_dirs,
@@ -2076,6 +2590,7 @@ def _collect_reports(args: argparse.Namespace, artifact_dirs: dict[str, Path]) -
         temporal,
         flexibility,
         distribution[distribution["kpi_kind"].isin(KPI_KINDS)],
+        calibration_summary,
     )
     table_paths = {
         "annual_signal_metrics": "annual_signal_metrics.csv",
@@ -2092,10 +2607,18 @@ def _collect_reports(args: argparse.Namespace, artifact_dirs: dict[str, Path]) -
         "flexibility_point_by_building": "flexibility_point_by_building.csv",
         "paired_flexibility_comparisons": "paired_flexibility_comparisons.csv",
         "paired_flexibility_dashboard": "paired_flexibility_comparisons.html",
+        **{
+            f"flexibility_point_scatter_{kpi_kind}": filename
+            for kpi_kind, filename in point_scatter_paths.items()
+        },
         "flexibility_distribution_metrics": "flexibility_distribution_metrics.csv",
         "flexibility_distribution_reliability": (
             "flexibility_distribution_reliability.csv"
         ),
+        "flexibility_joint_distribution_metrics": (
+            "flexibility_joint_distribution_metrics.csv"
+        ),
+        "flexibility_calibration_summary": "flexibility_calibration_summary.csv",
         "setpoint_kpi_calibration_dashboard": "../calibration/kpi_calibration.html",
         "intervention_flexibility_kpis": "intervention_flexibility_kpis.csv",
         "intervention_flexibility_kpi_scenarios": (
@@ -2110,6 +2633,34 @@ def _collect_reports(args: argparse.Namespace, artifact_dirs: dict[str, Path]) -
     if (report_dir / "force_off_temporal_trace_calibration.html").exists():
         table_paths["force_off_temporal_trace_calibration"] = (
             "force_off_temporal_trace_calibration.html"
+        )
+    poor_excitation_config = recipe.get("poor_excitation_evaluation", {}) or {}
+    poor_excitation_subdir = str(
+        poor_excitation_config.get("output_subdir", "poor_excitation_policy")
+    )
+    poor_excitation_report = (
+        args.output_dir
+        / poor_excitation_subdir
+        / "reports"
+        / "transfer_dashboard.html"
+    )
+    if poor_excitation_report.exists():
+        table_paths["poor_excitation_transfer_dashboard"] = str(
+            Path("..") / poor_excitation_report.relative_to(args.output_dir)
+        )
+    variance_config = recipe.get("variance_decomposition", {}) or {}
+    variance_subdir = str(
+        variance_config.get(
+            "output_subdir",
+            "diagnostics/kpi_variance_decomposition",
+        )
+    )
+    variance_dashboard = (
+        args.output_dir / variance_subdir / "variance_decomposition.html"
+    )
+    if variance_dashboard.exists():
+        table_paths["kpi_variance_decomposition"] = str(
+            Path("..") / variance_dashboard.relative_to(args.output_dir)
         )
     trace_manifest: list[dict[str, str]] = []
     for arm in PROBABILISTIC_ARMS:
@@ -2137,6 +2688,19 @@ def _collect_reports(args: argparse.Namespace, artifact_dirs: dict[str, Path]) -
                 "path": str(path.relative_to(args.output_dir)),
             }
         )
+    poor_excitation_test_dir = (
+        args.output_dir / poor_excitation_subdir / "scoring" / "test"
+    )
+    for arm in PROBABILISTIC_ARMS:
+        for path in sorted((poor_excitation_test_dir / arm).glob("profile_*.html")):
+            trace_manifest.append(
+                {
+                    "policy": "poor_excitation_setpoint",
+                    "model": arm,
+                    "profile_id": path.stem.rsplit("_", 1)[-1],
+                    "path": str(path.relative_to(args.output_dir)),
+                }
+            )
     (report_dir / "full_year_trace_manifest.json").write_text(
         json.dumps(trace_manifest, indent=2) + "\n"
     )
@@ -2161,22 +2725,30 @@ def _write_benchmark_dashboard(
     temporal: pd.DataFrame,
     flexibility: pd.DataFrame,
     distribution: pd.DataFrame,
+    calibration_summary: pd.DataFrame,
 ) -> None:
     figure = make_subplots(
-        rows=3,
+        rows=4,
         cols=3,
-        specs=[[{"type": "table", "colspan": 3}, None, None], [{}, {}, {}], [{}, {}, {}]],
+        specs=[
+            [{"type": "table", "colspan": 3}, None, None],
+            [{"type": "table", "colspan": 3}, None, None],
+            [{}, {}, {}],
+            [{}, {}, {}],
+        ],
         subplot_titles=(
             "Annual autonomous-rollout summary",
+            "Flexibility calibration: macro-average over direction and horizon",
             "Signal RMSE",
             "Temporal structure",
-            "Flexibility point NRMSE",
+            "Flexibility point accuracy: macro-average over direction and horizon",
             "Single-signal reliability",
             "Flexibility calibration",
             "Flexibility CRPS",
         ),
-        vertical_spacing=0.12,
+        vertical_spacing=0.09,
         horizontal_spacing=0.08,
+        row_heights=(0.17, 0.19, 0.30, 0.34),
     )
     table_columns = [
         "arm", "temperature_c_rmse", "qroom_w_m2_rmse", "pel_w_m2_rmse",
@@ -2191,6 +2763,67 @@ def _write_benchmark_dashboard(
         row=1,
         col=1,
     )
+    calibration_columns = [
+        "method",
+        "calibration",
+        "f_calibration_mae",
+        "f_crps",
+        "f_coverage_90",
+        "f_width_90",
+        "regression_based_calibration_mae",
+        "regression_based_crps",
+        "regression_based_coverage_90",
+        "regression_based_width_90",
+    ]
+    calibration_headers = [
+        "Model",
+        "Calibration",
+        "Direct F<br>calib. MAE",
+        "Direct F<br>CRPS",
+        "Direct F<br>90% coverage",
+        "Direct F<br>90% width",
+        "Regression KPI<br>calib. MAE",
+        "Regression KPI<br>CRPS",
+        "Regression KPI<br>90% coverage",
+        "Regression KPI<br>90% width",
+    ]
+    calibration_display = calibration_summary.reindex(
+        columns=calibration_columns
+    ).copy()
+    if not calibration_display.empty:
+        calibration_display["method"] = calibration_display["method"].replace(
+            {
+                "probabilistic_structured": "Structured",
+                "probabilistic_lstm": "Unstructured LSTM",
+                "lightgbm": "LightGBM",
+            }
+        )
+        calibration_display["calibration"] = calibration_display[
+            "calibration"
+        ].str.upper()
+        for column in calibration_columns[2:]:
+            if column.endswith("coverage_90"):
+                calibration_display[column] = calibration_display[column].map(
+                    lambda value: f"{100.0 * value:.1f}%" if pd.notna(value) else ""
+                )
+            else:
+                calibration_display[column] = calibration_display[column].map(
+                    lambda value: f"{value:.3f}" if pd.notna(value) else ""
+                )
+    figure.add_trace(
+        go.Table(
+            columnwidth=[105, 65, 78, 70, 88, 78, 88, 78, 96, 84],
+            header={"values": calibration_headers, "fill_color": "#e8eef5"},
+            cells={
+                "values": [
+                    calibration_display[column] for column in calibration_columns
+                ],
+                "height": 27,
+            },
+        ),
+        row=2,
+        col=1,
+    )
     for row in signals.itertuples(index=False):
         figure.add_trace(
             go.Bar(
@@ -2199,7 +2832,7 @@ def _write_benchmark_dashboard(
                 name=row.arm,
                 marker_color=_model_color(row.arm),
             ),
-            row=2,
+            row=3,
             col=1,
         )
     temporal_columns = [column for column in dynamics if column.endswith("increment_spectral_js_mean")]
@@ -2212,43 +2845,79 @@ def _write_benchmark_dashboard(
                 showlegend=False,
                 marker_color=_model_color(row.arm),
             ),
-            row=2,
+            row=3,
             col=2,
         )
-    for (method, kind), part in flexibility.groupby(["method", "kpi_kind"], sort=False):
+    point_accuracy = (
+        flexibility[
+            flexibility["method"].isin((*PROBABILISTIC_ARMS, "lightgbm"))
+        ]
+        .groupby(["method", "kpi_kind"], as_index=False, sort=False)[
+            ["nrmse", "rmse", "mae"]
+        ]
+        .mean()
+    )
+    point_method_order = ("lightgbm", "probabilistic_lstm", "probabilistic_structured")
+    for kind, label, pattern in (
+        ("f", "Direct F", ""),
+        ("regression_based", "Regression-based", "/"),
+    ):
+        part = point_accuracy[point_accuracy["kpi_kind"].eq(kind)].copy()
+        part["method"] = pd.Categorical(
+            part["method"], categories=point_method_order, ordered=True
+        )
+        part = part.sort_values("method")
         figure.add_trace(
-            go.Scatter(
-                x=[f"{row.direction} {row.horizon_hours:g}h" for row in part.itertuples()],
+            go.Bar(
+                x=part["method"].astype(str),
                 y=part["nrmse"],
-                mode="lines+markers",
-                name=f"{method} {kind}",
-                line={"color": _model_color(str(method)), "dash": "solid" if kind == "f" else "dot"},
-                showlegend=False,
+                name=label,
+                marker={
+                    "color": [
+                        _model_color(str(method)) for method in part["method"]
+                    ],
+                    "pattern": {"shape": pattern},
+                },
+                customdata=part[["rmse", "mae"]].to_numpy(),
+                hovertemplate=(
+                    "%{x}<br>"
+                    + label
+                    + "<br>NRMSE: %{y:.3f}<br>RMSE: %{customdata[0]:.3f}"
+                    "<br>MAE: %{customdata[1]:.3f}<extra></extra>"
+                ),
             ),
-            row=2,
+            row=3,
             col=3,
         )
     if not temporal.empty:
         trace_summary = temporal.groupby(["arm", "signal"], as_index=False)["abs_calibration_error"].mean()
         for arm, part in trace_summary.groupby("arm", sort=False):
-            figure.add_trace(go.Bar(x=part["signal"], y=part["abs_calibration_error"], name=arm, marker_color=_model_color(str(arm)), showlegend=False), row=3, col=1)
-    calibration_summary = distribution.groupby(["method", "calibration"], as_index=False)[["calibration_mae", "crps"]].mean()
-    for calibration, dash in (("raw", "solid"), ("rns", "dot")):
-        part = calibration_summary[calibration_summary["calibration"] == calibration]
+            figure.add_trace(go.Bar(x=part["signal"], y=part["abs_calibration_error"], name=arm, marker_color=_model_color(str(arm)), showlegend=False), row=4, col=1)
+    calibration_plot_summary = distribution.groupby(
+        ["method", "calibration"], as_index=False
+    )[["calibration_mae", "crps"]].mean()
+    for calibration, dash in (
+        ("raw", "solid"),
+        ("rns", "dot"),
+        ("rns_ecc", "dash"),
+    ):
+        part = calibration_plot_summary[
+            calibration_plot_summary["calibration"] == calibration
+        ]
         colors = [_model_color(str(method)) for method in part["method"]]
         pattern = "" if calibration == "raw" else "/"
-        figure.add_trace(go.Bar(x=part["method"], y=part["calibration_mae"], marker={"color": colors, "pattern": {"shape": pattern}}, name=f"{calibration} calibration", hovertemplate="%{x}<br>Calibration MAE: %{y:.3f}<extra></extra>"), row=3, col=2)
-        figure.add_trace(go.Bar(x=part["method"], y=part["crps"], marker={"color": colors, "pattern": {"shape": pattern}}, name=f"{calibration} CRPS", opacity=0.75, hovertemplate="%{x}<br>CRPS: %{y:.3f}<extra></extra>"), row=3, col=3)
-    figure.update_yaxes(title_text="RMSE", row=2, col=1)
-    figure.update_yaxes(title_text="Spectral JS distance", row=2, col=2)
-    figure.update_yaxes(title_text="NRMSE", row=2, col=3)
-    figure.update_yaxes(title_text="Mean |rank CDF error|", row=3, col=1)
-    figure.update_yaxes(title_text="Mean |coverage - nominal|", row=3, col=2)
-    figure.update_yaxes(title_text="Wh/(m2 K)", row=3, col=3)
+        figure.add_trace(go.Bar(x=part["method"], y=part["calibration_mae"], marker={"color": colors, "pattern": {"shape": pattern}}, name=f"{calibration} calibration", hovertemplate="%{x}<br>Calibration MAE: %{y:.3f}<extra></extra>"), row=4, col=2)
+        figure.add_trace(go.Bar(x=part["method"], y=part["crps"], marker={"color": colors, "pattern": {"shape": pattern}}, name=f"{calibration} CRPS", opacity=0.75, hovertemplate="%{x}<br>CRPS: %{y:.3f}<extra></extra>"), row=4, col=3)
+    figure.update_yaxes(title_text="RMSE", row=3, col=1)
+    figure.update_yaxes(title_text="Spectral JS distance", row=3, col=2)
+    figure.update_yaxes(title_text="NRMSE", row=3, col=3)
+    figure.update_yaxes(title_text="Mean |rank CDF error|", row=4, col=1)
+    figure.update_yaxes(title_text="Mean |coverage - nominal|", row=4, col=2)
+    figure.update_yaxes(title_text="Wh/(m2 K)", row=4, col=3)
     figure.update_layout(
         title="Calibrated structured versus unstructured building-emulator benchmark",
         template="plotly_white",
-        height=1500,
+        height=1900,
         width=1750,
         barmode="group",
         legend={"orientation": "h", "y": -0.15},
@@ -2304,6 +2973,38 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help="Override only the probabilistic structured HP training emission mode.",
     )
     parser.add_argument(
+        "--probabilistic-structured-hp-energy-cap-hours",
+        type=float,
+        help=(
+            "Override the probabilistic structured buffer capacity duration. "
+            "This also clears hp_energy_cap_wh_m2 so the absolute cap is "
+            "recomputed from the resolved Qroom cap."
+        ),
+    )
+    parser.add_argument(
+        "--probabilistic-structured-buffer-capacity-mode",
+        choices=("global", "physical_volume"),
+        help=(
+            "Override the probabilistic structured buffer-capacity model. "
+            "physical_volume uses rho*cp*(V_SH/A)*DeltaT_usable."
+        ),
+    )
+    parser.add_argument(
+        "--probabilistic-structured-buffer-delta-t-usable-init-k",
+        type=float,
+        help="Initial usable buffer temperature span for physical_volume mode.",
+    )
+    parser.add_argument(
+        "--probabilistic-structured-buffer-delta-t-min-k",
+        type=float,
+        help="Lower bound for the learned usable buffer temperature span.",
+    )
+    parser.add_argument(
+        "--probabilistic-structured-buffer-delta-t-max-k",
+        type=float,
+        help="Upper bound for the learned usable buffer temperature span.",
+    )
+    parser.add_argument(
         "--contracting-temperature-feedback-gradient-scale",
         type=float,
         help=(
@@ -2311,13 +3012,89 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
             "arms. Use 0.05 to reproduce the current stable Option C recipe."
         ),
     )
+    parser.add_argument(
+        "--contracting-metadata-fixed-state-update",
+        choices=("linear", "bounded_tanh"),
+        help="Override the metadata-fixed latent-state update in both structured arms.",
+    )
     parser.add_argument("--resume", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument(
+        "--force-off-raw-only",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "Evaluate force-off only on the test split and report raw uncertainty "
+            "metrics. This is the default; use --no-force-off-raw-only only for "
+            "a final residual-normalized calibration benchmark."
+        ),
+    )
+    parser.add_argument(
+        "--evaluate-poor-excitation",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "Evaluate the frozen probabilistic emulators and fitted LightGBM "
+            "models on the configured low-excitation setpoint dataset."
+        ),
+    )
+    parser.add_argument(
+        "--evaluate-variance-decomposition",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "Run the per-building nested Monte Carlo decomposition of annual "
+            "flexibility-KPI uncertainty for the structured probabilistic arm."
+        ),
+    )
+    parser.add_argument("--variance-xi-draws", type=int)
+    parser.add_argument("--variance-fast-rollouts", type=int)
+    parser.add_argument("--variance-max-profiles", type=int)
+    parser.add_argument("--poor-excitation-dataset", type=Path)
+    parser.add_argument("--poor-excitation-num-scenarios", type=int)
+    parser.add_argument("--poor-excitation-num-profile-plots", type=int)
     parser.add_argument("--stages", nargs="+", choices=("all", *STAGES), default=("all",))
     parser.add_argument("--deterministic-structured-artifact-dir", type=Path)
     parser.add_argument("--deterministic-lstm-artifact-dir", type=Path)
     parser.add_argument("--probabilistic-structured-artifact-dir", type=Path)
     parser.add_argument("--probabilistic-lstm-artifact-dir", type=Path)
     return parser.parse_args(argv)
+
+
+def _apply_probabilistic_structured_hp_energy_cap_override(
+    recipe: dict[str, Any],
+    capacity_hours: float | None,
+) -> None:
+    if capacity_hours is None:
+        return
+    capacity_hours = float(capacity_hours)
+    if capacity_hours <= 0.0:
+        raise ValueError(
+            "--probabilistic-structured-hp-energy-cap-hours must be positive"
+        )
+    recipe["probabilistic_structured"]["hp_energy_cap_hours"] = capacity_hours
+    recipe["probabilistic_structured"]["hp_energy_cap_wh_m2"] = 0.0
+
+
+def _apply_probabilistic_structured_buffer_capacity_override(
+    recipe: dict[str, Any],
+    *,
+    capacity_mode: str | None,
+    delta_t_usable_init_k: float | None,
+    delta_t_min_k: float | None,
+    delta_t_max_k: float | None,
+) -> None:
+    section = recipe["probabilistic_structured"]
+    if capacity_mode is not None:
+        section["hp_buffer_capacity_mode"] = capacity_mode
+        if capacity_mode == "physical_volume":
+            section["hp_energy_cap_wh_m2"] = 0.0
+    for key, value in (
+        ("hp_buffer_delta_t_usable_init_k", delta_t_usable_init_k),
+        ("hp_buffer_delta_t_min_k", delta_t_min_k),
+        ("hp_buffer_delta_t_max_k", delta_t_max_k),
+    ):
+        if value is not None:
+            section[key] = float(value)
 
 
 def run(args: argparse.Namespace) -> Path:
@@ -2340,11 +3117,79 @@ def run(args: argparse.Namespace) -> Path:
         recipe["optimizer"]["epochs"] = args.epochs
     if args.prob_hp_training_mode is not None:
         recipe["probabilistic_structured"]["prob_hp_training_mode"] = args.prob_hp_training_mode
+    _apply_probabilistic_structured_hp_energy_cap_override(
+        recipe,
+        args.probabilistic_structured_hp_energy_cap_hours,
+    )
+    _apply_probabilistic_structured_buffer_capacity_override(
+        recipe,
+        capacity_mode=args.probabilistic_structured_buffer_capacity_mode,
+        delta_t_usable_init_k=(
+            args.probabilistic_structured_buffer_delta_t_usable_init_k
+        ),
+        delta_t_min_k=args.probabilistic_structured_buffer_delta_t_min_k,
+        delta_t_max_k=args.probabilistic_structured_buffer_delta_t_max_k,
+    )
     if args.contracting_temperature_feedback_gradient_scale is not None:
         for section in ("deterministic_structured", "probabilistic_structured"):
             recipe[section]["contracting_temperature_feedback_gradient_scale"] = (
                 args.contracting_temperature_feedback_gradient_scale
             )
+    if args.contracting_metadata_fixed_state_update is not None:
+        for section in ("deterministic_structured", "probabilistic_structured"):
+            recipe[section]["contracting_metadata_fixed_state_update"] = (
+                args.contracting_metadata_fixed_state_update
+            )
+    force_off_config = recipe.setdefault("force_off_evaluation", {})
+    if force_off_config is None:
+        force_off_config = {}
+        recipe["force_off_evaluation"] = force_off_config
+    if args.force_off_raw_only is not None:
+        force_off_config["raw_only"] = args.force_off_raw_only
+    poor_excitation_config = recipe.setdefault(
+        "poor_excitation_evaluation", {}
+    )
+    if poor_excitation_config is None:
+        poor_excitation_config = {}
+        recipe["poor_excitation_evaluation"] = poor_excitation_config
+    if args.evaluate_poor_excitation is not None:
+        poor_excitation_config["enabled"] = args.evaluate_poor_excitation
+    if args.poor_excitation_dataset is not None:
+        poor_excitation_config["dataset_path"] = str(
+            args.poor_excitation_dataset
+        )
+    if args.poor_excitation_num_scenarios is not None:
+        if args.poor_excitation_num_scenarios < 2:
+            raise ValueError("--poor-excitation-num-scenarios must be at least 2")
+        poor_excitation_config["num_scenarios"] = (
+            args.poor_excitation_num_scenarios
+        )
+    if args.poor_excitation_num_profile_plots is not None:
+        if args.poor_excitation_num_profile_plots < 0:
+            raise ValueError(
+                "--poor-excitation-num-profile-plots cannot be negative"
+            )
+        poor_excitation_config["num_profile_plots"] = (
+            args.poor_excitation_num_profile_plots
+        )
+    variance_config = recipe.setdefault("variance_decomposition", {})
+    if variance_config is None:
+        variance_config = {}
+        recipe["variance_decomposition"] = variance_config
+    if args.evaluate_variance_decomposition is not None:
+        variance_config["enabled"] = args.evaluate_variance_decomposition
+    if args.variance_xi_draws is not None:
+        if args.variance_xi_draws < 2:
+            raise ValueError("--variance-xi-draws must be at least 2")
+        variance_config["xi_draws"] = args.variance_xi_draws
+    if args.variance_fast_rollouts is not None:
+        if args.variance_fast_rollouts < 2:
+            raise ValueError("--variance-fast-rollouts must be at least 2")
+        variance_config["fast_rollouts"] = args.variance_fast_rollouts
+    if args.variance_max_profiles is not None:
+        if args.variance_max_profiles < 1:
+            raise ValueError("--variance-max-profiles must be positive")
+        variance_config["max_profiles"] = args.variance_max_profiles
     recipe["dataset_path"] = str(Path(recipe["dataset_path"]))
     if args.additional_datasets is not None:
         recipe["additional_dataset_paths"] = [
@@ -2367,30 +3212,50 @@ def run(args: argparse.Namespace) -> Path:
         split_config=recipe["split"],
         resume=args.resume,
     )
-    (args.output_dir / "resolved_recipe.json").write_text(
-        json.dumps({"source": str(args.config), "recipe": recipe, "split": asdict(split)}, indent=2, sort_keys=True) + "\n"
-    )
     print(
         f"benchmark_split train={len(split.train_ids)} validation={len(split.validation_ids)} "
         f"calibration={len(split.calibration_ids)} test={len(split.test_ids)} "
         f"fingerprint={split.fingerprint}"
     )
     if stages == {"split"}:
+        _write_resolved_recipe(
+            args.output_dir / "resolved_recipe.json",
+            source=args.config,
+            requested_recipe=recipe,
+            split=split,
+            artifact_dirs=None,
+        )
         return args.output_dir / "split_manifest.json"
     if "train" in stages:
         artifact_dirs, _ = _train_models(args, recipe, split)
     else:
         artifact_dirs = _load_artifact_paths(args)
+    recipe = _write_resolved_recipe(
+        args.output_dir / "resolved_recipe.json",
+        source=args.config,
+        requested_recipe=recipe,
+        split=split,
+        artifact_dirs=artifact_dirs,
+    )
     if "score" in stages:
         _score_models(args, recipe, split, artifact_dirs)
+    if "variance_decomposition" in stages:
+        _evaluate_kpi_variance_decomposition(
+            args,
+            recipe,
+            split,
+            artifact_dirs,
+        )
     if "lightgbm" in stages:
         _fit_lightgbm(args, recipe, split, artifact_dirs["probabilistic_structured"])
     if "force_off" in stages:
         _score_force_off_policy(args, recipe, split, artifact_dirs)
     if "calibrate" in stages:
         _calibrate(args, recipe)
+    if "poor_excitation" in stages:
+        _evaluate_poor_excitation(args, recipe)
     if "report" in stages:
-        _collect_reports(args, artifact_dirs)
+        _collect_reports(args, artifact_dirs, recipe)
     return args.output_dir / "reports" / "benchmark_dashboard.html"
 
 

@@ -4,6 +4,7 @@ from .closed_loop_hp import ClosedLoopHPEmulator
 from .causal_hybrid_hp import CausalHybridHPEmulator, CausalHybridRollout
 from .contracting_closed_loop_hp import (
     ContractingClosedLoopHPEmulator,
+    MetadataFixedStateUpdate,
     ThermalArchitecture,
     ThermalQResponseMode,
     ThermostatDemandMode,
@@ -28,6 +29,7 @@ __all__ = [
     "CausalHybridHPEmulator",
     "CausalHybridRollout",
     "ContractingClosedLoopHPEmulator",
+    "MetadataFixedStateUpdate",
     "ThermalArchitecture",
     "ThermalQResponseMode",
     "ThermostatDemandMode",
